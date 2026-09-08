@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const PLUGIN_FILENAME: &str = "agenthd-subagents.tsx";
+const PLUGIN_SPEC: &str = "./plugins/agenthd-subagents.tsx";
+const PLUGIN_SOURCE: &str = include_str!("../assets/agenthd-subagents.tsx");
+
 /// Resolved paths used by the binary.
 ///
 /// `agenthd_root` is always `$HOME/.agenthd` regardless of `XDG_CONFIG_HOME`,
@@ -22,6 +26,8 @@ pub struct Paths {
     pub canonical_dir: PathBuf,
     pub state_file: PathBuf,
     pub target_dir: PathBuf,
+    pub plugin_file: PathBuf,
+    pub plugin_config: PathBuf,
 }
 
 impl Paths {
@@ -41,10 +47,13 @@ impl Paths {
         } else {
             home_path.join(".config")
         };
+        let opencode_root = target_root.join("opencode");
         Ok(Self {
             canonical_dir: agenthd_root.join("agents"),
             state_file: agenthd_root.join("state.json"),
-            target_dir: target_root.join("opencode").join("agents"),
+            target_dir: opencode_root.join("agents"),
+            plugin_file: opencode_root.join("plugins").join(PLUGIN_FILENAME),
+            plugin_config: opencode_root.join("tui.json"),
             agenthd_root,
         })
     }
@@ -146,12 +155,14 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// On-disk ownership manifest.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
     pub starters_seeded: bool,
     #[serde(default)]
     pub installed: BTreeMap<String, String>,
+    #[serde(default)]
+    pub plugin_hash: Option<String>,
 }
 
 impl State {
@@ -275,6 +286,160 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginStatus {
+    NotInstalled,
+    NotEnabled,
+    UpToDate,
+    UpdateAvailable,
+    Conflict,
+}
+
+impl PluginStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            PluginStatus::NotInstalled => "not installed",
+            PluginStatus::NotEnabled => "installed, not enabled",
+            PluginStatus::UpToDate => "up to date",
+            PluginStatus::UpdateAvailable => "update available",
+            PluginStatus::Conflict => "conflict",
+        }
+    }
+}
+
+fn plugin_enabled(path: &Path) -> Result<bool> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(anyhow!("read {}: {}", path.display(), e)),
+    };
+    let config: serde_json::Value = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "parse {}; agenthd only updates JSON config without comments",
+            path.display()
+        )
+    })?;
+    Ok(config
+        .get("plugin")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|plugins| {
+            plugins
+                .iter()
+                .any(|plugin| plugin.as_str() == Some(PLUGIN_SPEC))
+        }))
+}
+
+fn set_plugin_enabled(path: &Path, enabled: bool) -> Result<()> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "{}".to_string(),
+        Err(e) => return Err(anyhow!("read {}: {}", path.display(), e)),
+    };
+    let mut config: serde_json::Value = serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "parse {}; agenthd only updates JSON config without comments",
+            path.display()
+        )
+    })?;
+    let object = config
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))?;
+    let plugins = object
+        .entry("plugin")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("{}.plugin must be an array", path.display()))?;
+    let present = plugins
+        .iter()
+        .any(|plugin| plugin.as_str() == Some(PLUGIN_SPEC));
+    if enabled && !present {
+        plugins.push(serde_json::Value::String(PLUGIN_SPEC.to_string()));
+    } else if !enabled && present {
+        plugins.retain(|plugin| plugin.as_str() != Some(PLUGIN_SPEC));
+        if plugins.is_empty() {
+            object.remove("plugin");
+        }
+    } else {
+        return Ok(());
+    }
+    write_target(path, &serde_json::to_vec_pretty(&config)?)
+}
+
+pub fn plugin_status(paths: &Paths, state: &State) -> Result<PluginStatus> {
+    let source_hash = sha256_hex(PLUGIN_SOURCE.as_bytes());
+    let target_hash = match fs::symlink_metadata(&paths.plugin_file) {
+        Ok(meta) if meta.file_type().is_file() => hash_file(&paths.plugin_file)?,
+        Ok(_) => bail!(
+            "plugin {} is not a regular file",
+            paths.plugin_file.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(anyhow!("stat {}: {}", paths.plugin_file.display(), e)),
+    };
+    match target_hash {
+        None => Ok(PluginStatus::NotInstalled),
+        Some(hash) if hash == source_hash && plugin_enabled(&paths.plugin_config)? => {
+            Ok(PluginStatus::UpToDate)
+        }
+        Some(hash) if hash == source_hash => Ok(PluginStatus::NotEnabled),
+        Some(hash) if state.plugin_hash.as_deref() == Some(hash.as_str()) => {
+            Ok(PluginStatus::UpdateAvailable)
+        }
+        Some(_) => Ok(PluginStatus::Conflict),
+    }
+}
+
+pub fn install_plugin(paths: &Paths, mut state: State) -> Result<(State, PluginStatus)> {
+    let status = plugin_status(paths, &state)?;
+    if status == PluginStatus::Conflict {
+        bail!(
+            "plugin {} is unowned or changed externally; resolve it manually",
+            paths.plugin_file.display()
+        );
+    }
+    let source_hash = sha256_hex(PLUGIN_SOURCE.as_bytes());
+    if !matches!(status, PluginStatus::UpToDate | PluginStatus::NotEnabled) {
+        write_target(&paths.plugin_file, PLUGIN_SOURCE.as_bytes())?;
+    }
+    set_plugin_enabled(&paths.plugin_config, true)?;
+    if state.plugin_hash.as_deref() != Some(source_hash.as_str()) {
+        state.plugin_hash = Some(source_hash);
+        write_state(&paths.state_file, &state)?;
+    }
+    Ok((state, status))
+}
+
+pub fn uninstall_plugin(paths: &Paths, mut state: State) -> Result<State> {
+    let target_hash = match fs::symlink_metadata(&paths.plugin_file) {
+        Ok(meta) if meta.file_type().is_file() => hash_file(&paths.plugin_file)?,
+        Ok(_) => bail!(
+            "plugin {} is not a regular file",
+            paths.plugin_file.display()
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(anyhow!("stat {}: {}", paths.plugin_file.display(), e)),
+    };
+    let Some(target_hash) = target_hash else {
+        set_plugin_enabled(&paths.plugin_config, false)?;
+        if state.plugin_hash.take().is_some() {
+            write_state(&paths.state_file, &state)?;
+        }
+        return Ok(state);
+    };
+    if state.plugin_hash.as_deref() != Some(target_hash.as_str()) {
+        bail!(
+            "plugin {} is unowned or changed externally; refusing to remove it",
+            paths.plugin_file.display()
+        );
+    }
+    set_plugin_enabled(&paths.plugin_config, false)?;
+    fs::remove_file(&paths.plugin_file)
+        .with_context(|| format!("remove {}", paths.plugin_file.display()))?;
+    state.plugin_hash = None;
+    write_state(&paths.state_file, &state)?;
+    Ok(state)
+}
+
 /// Hash either the on-disk source or its parsed/rendered canonical form.
 #[allow(dead_code)]
 fn source_hash(agent: &Agent) -> String {
@@ -283,7 +448,8 @@ fn source_hash(agent: &Agent) -> String {
 
 /// Compute the sync plan.
 pub fn compute_plan(paths: &Paths, state: &State) -> Result<Vec<SyncItem>> {
-    paths.ensure_dirs()?;
+    // Planning is read-only: refreshing the Install/Update screen must not
+    // create directories. Mutations create their own parent directories.
     let canonical_names = read_md_filenames(&paths.canonical_dir)?;
     let target_names = read_md_filenames(&paths.target_dir)?;
     let mut all_names: BTreeSet<String> = BTreeSet::new();
@@ -375,6 +541,7 @@ pub fn apply_safe(
     mut state: State,
     items: Vec<SyncItem>,
 ) -> Result<(State, Vec<ApplyOutcome>)> {
+    let original_state = state.clone();
     let mut outcomes = Vec::new();
     for item in items {
         // Release ownership for modified orphans even when the target is
@@ -460,7 +627,9 @@ pub fn apply_safe(
         let canonical_exists = paths.canonical_dir.join(name).exists();
         target_exists || canonical_exists
     });
-    write_state(&paths.state_file, &state)?;
+    if state != original_state {
+        write_state(&paths.state_file, &state)?;
+    }
     Ok((state, outcomes))
 }
 
@@ -660,6 +829,7 @@ pub fn load_canonical(paths: &Paths) -> Result<BTreeMap<String, (Agent, PathBuf)
 /// whether any canonical file was written.
 pub fn seed_starters(paths: &Paths, mut state: State) -> Result<(bool, State)> {
     paths.ensure_dirs()?;
+    let original_state = state.clone();
     let mut wrote_anything = false;
     for starter in STARTERS {
         let path = canonical_path(&paths.canonical_dir, starter.name)?;
@@ -681,7 +851,9 @@ pub fn seed_starters(paths: &Paths, mut state: State) -> Result<(bool, State)> {
         }
     }
     state.starters_seeded = true;
-    write_state(&paths.state_file, &state)?;
+    if state != original_state {
+        write_state(&paths.state_file, &state)?;
+    }
     Ok((wrote_anything, state))
 }
 
@@ -753,7 +925,7 @@ pub struct UpdatePromptOutcome {
 /// prompt body).
 ///
 /// Semantics:
-/// - Only the seven bundled subagent names in `STARTERS` are touched. Any
+/// - Only the eight bundled names in `STARTERS` are touched. Any
 ///   other file in the canonical directory — user-created agents or
 ///   anything else — is left byte-for-byte unchanged.
 /// - Missing canonical files are reported as `"skipped"` rather than
@@ -804,7 +976,7 @@ pub fn update_bundled_prompts(paths: &Paths) -> Result<Vec<UpdatePromptOutcome>>
             }
         };
         // Skip the write when the prompt is already current. A single user
-        // confirmation should not produce seven no-op writes that still bump
+        // confirmation should not produce eight no-op writes that still bump
         // mtime on disk.
         if agent.prompt == starter.prompt {
             outcomes.push(UpdatePromptOutcome {
@@ -863,6 +1035,13 @@ mod tests {
             canonical_dir: dir.path().join(".agenthd").join("agents"),
             state_file: dir.path().join(".agenthd").join("state.json"),
             target_dir: dir.path().join(".config").join("opencode").join("agents"),
+            plugin_file: dir
+                .path()
+                .join(".config")
+                .join("opencode")
+                .join("plugins")
+                .join(PLUGIN_FILENAME),
+            plugin_config: dir.path().join(".config").join("opencode").join("tui.json"),
         };
         paths.ensure_dirs().unwrap();
         paths
@@ -1022,6 +1201,49 @@ mod tests {
     }
 
     #[test]
+    fn compute_plan_is_read_only() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let paths = Paths::resolve(None, Some(home)).unwrap();
+
+        assert!(compute_plan(&paths, &State::default()).unwrap().is_empty());
+        assert!(!paths.canonical_dir.exists());
+        assert!(!paths.target_dir.exists());
+    }
+
+    #[test]
+    fn plugin_install_and_uninstall_are_owned_and_safe() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = seed_starters(&paths, State::default()).unwrap();
+
+        assert_eq!(
+            plugin_status(&paths, &state).unwrap(),
+            PluginStatus::NotInstalled
+        );
+        let (state, prior) = install_plugin(&paths, state).unwrap();
+        assert_eq!(prior, PluginStatus::NotInstalled);
+        assert_eq!(
+            plugin_status(&paths, &state).unwrap(),
+            PluginStatus::UpToDate
+        );
+        assert_eq!(
+            fs::read_to_string(&paths.plugin_file).unwrap(),
+            PLUGIN_SOURCE
+        );
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&paths.plugin_config).unwrap()).unwrap();
+        assert_eq!(config["plugin"][0], PLUGIN_SPEC);
+
+        let state = uninstall_plugin(&paths, state).unwrap();
+        assert!(!paths.plugin_file.exists());
+        let config: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&paths.plugin_config).unwrap()).unwrap();
+        assert!(config.get("plugin").is_none());
+        assert!(state.plugin_hash.is_none());
+    }
+
+    #[test]
     fn seed_starters_is_idempotent_and_preserves_existing() {
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
@@ -1046,11 +1268,10 @@ mod tests {
 
     #[test]
     fn seed_starters_adds_new_roles_without_overwriting_user_files() {
-        // Simulates an "old canonical directory" from before delegate/oracle/
-        // planner/researcher existed: only scout, reviewer, worker files are
-        // present, each with user-modified sentinel bytes. seed_starters
-        // must add the four new starters and leave the existing files
-        // byte-for-byte intact.
+        // Simulates an old canonical directory from before delegate, oracle,
+        // orchestrator, planner, and researcher existed: only scout, reviewer,
+        // and worker are present with user-modified sentinel bytes. Seeding
+        // must add the five new starters and preserve existing bytes.
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
 
@@ -1064,7 +1285,7 @@ mod tests {
         }
 
         let (wrote, state) = seed_starters(&paths, State::default()).unwrap();
-        assert!(wrote, "expected the four new starters to be written");
+        assert!(wrote, "expected the five new starters to be written");
         assert!(state.starters_seeded);
 
         // Existing user-edited files are not overwritten.
@@ -1077,14 +1298,27 @@ mod tests {
             );
         }
 
-        // The four new starters are seeded with parseable canonical content.
-        for name in ["delegate", "oracle", "planner", "researcher"] {
+        // The five new starters are seeded with parseable canonical content.
+        for name in [
+            "delegate",
+            "oracle",
+            "orchestrator",
+            "planner",
+            "researcher",
+        ] {
             let path = paths.canonical_dir.join(format!("{}.md", name));
             assert!(path.exists(), "missing seeded file `{}`", name);
             let agent = Agent::read(&path).unwrap_or_else(|e| {
                 panic!("seeded `{}` does not parse as a valid agent: {}", name, e)
             });
-            assert_eq!(agent.mode, Mode::subagent);
+            assert_eq!(
+                agent.mode,
+                if name == "orchestrator" {
+                    Mode::primary
+                } else {
+                    Mode::subagent
+                }
+            );
             assert!(agent.model.is_none());
             assert!(!agent.description.trim().is_empty());
             assert!(!agent.prompt.trim().is_empty());
@@ -1112,9 +1346,9 @@ mod tests {
         fs::write(paths.canonical_dir.join("planner.md"), planner_body).unwrap();
 
         let (wrote, _) = seed_starters(&paths, State::default()).unwrap();
-        // The other six starters were missing, so they were written. The
+        // The other seven starters were missing, so they were written. The
         // user's planner.md must remain untouched regardless.
-        assert!(wrote, "the six missing starters should be seeded");
+        assert!(wrote, "the seven missing starters should be seeded");
         assert_eq!(
             fs::read(paths.canonical_dir.join("planner.md")).unwrap(),
             planner_body,
@@ -1125,6 +1359,7 @@ mod tests {
         for name in [
             "delegate",
             "oracle",
+            "orchestrator",
             "researcher",
             "reviewer",
             "scout",
@@ -1166,6 +1401,22 @@ mod tests {
         let (state, outcomes) = apply_safe(&paths, state, second).unwrap();
         assert!(outcomes.iter().all(|o| o.action == "kept"));
         assert_eq!(state.installed.len(), STARTERS.len());
+    }
+
+    #[test]
+    fn apply_safe_noop_preserves_manifest_bytes() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = seed_starters(&paths, State::default()).unwrap();
+        let install_plan = compute_plan(&paths, &state).unwrap();
+        let (state, _) = apply_safe(&paths, state, install_plan).unwrap();
+        let compact_manifest = serde_json::to_vec(&state).unwrap();
+        fs::write(&paths.state_file, &compact_manifest).unwrap();
+
+        let noop_plan = compute_plan(&paths, &state).unwrap();
+        let (_, outcomes) = apply_safe(&paths, state.clone(), noop_plan).unwrap();
+        assert!(outcomes.iter().all(|o| o.action == "kept"));
+        assert_eq!(fs::read(&paths.state_file).unwrap(), compact_manifest);
     }
 
     #[test]

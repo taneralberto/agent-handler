@@ -353,99 +353,72 @@ pub struct Starter {
     pub permissions: &'static [(&'static str, PermissionAction)],
 }
 
-/// Built-in starters seeded on first run. Seven OpenCode subagent roles
-/// adapted from the built-in Pi subagent profiles (delegate, oracle,
-/// planner, researcher, reviewer, scout, worker). Pi runtime-specific
+/// Built-in starters seeded on first run. One primary orchestrator and seven
+/// OpenCode subagent roles adapted from Pi subagents. Pi runtime-specific
 /// material (contact_supervisor, inherited fork/session context, managed
 /// artifacts, default reads/progress, runtime allowlists/extensions) has been
 /// replaced with OpenCode-friendly escalation: state the blocking decision or
 /// assumption clearly and stop. Model is unset so each role inherits
 /// OpenCode's default.
+const READ_ONLY_PERMISSIONS: &[(&str, PermissionAction)] = &[
+    ("read", PermissionAction::Allow),
+    ("glob", PermissionAction::Allow),
+    ("grep", PermissionAction::Allow),
+    ("list", PermissionAction::Allow),
+    ("bash", PermissionAction::Ask),
+    ("edit", PermissionAction::Deny),
+    ("task", PermissionAction::Deny),
+    ("external_directory", PermissionAction::Ask),
+    ("webfetch", PermissionAction::Allow),
+];
+
+const WRITER_PERMISSIONS: &[(&str, PermissionAction)] = &[
+    ("read", PermissionAction::Allow),
+    ("glob", PermissionAction::Allow),
+    ("grep", PermissionAction::Allow),
+    ("list", PermissionAction::Allow),
+    ("edit", PermissionAction::Allow),
+    ("bash", PermissionAction::Ask),
+    ("task", PermissionAction::Deny),
+    ("external_directory", PermissionAction::Ask),
+    ("webfetch", PermissionAction::Allow),
+];
+
 pub const STARTERS: &[Starter] = &[
     Starter {
         name: "scout",
         description: "Read-only codebase scout; targeted findings with file paths, line ranges, and risks.",
         mode: Mode::subagent,
         prompt: SCOUT_PROMPT,
-        permissions: &[
-            ("read", PermissionAction::Allow),
-            ("glob", PermissionAction::Allow),
-            ("grep", PermissionAction::Allow),
-            ("list", PermissionAction::Allow),
-            ("bash", PermissionAction::Ask),
-            ("edit", PermissionAction::Deny),
-            ("task", PermissionAction::Deny),
-            ("external_directory", PermissionAction::Ask),
-            ("webfetch", PermissionAction::Allow),
-        ],
+        permissions: READ_ONLY_PERMISSIONS,
     },
     Starter {
         name: "reviewer",
         description: "Read-only change reviewer; severity-ordered findings with file/line evidence.",
         mode: Mode::subagent,
         prompt: REVIEWER_PROMPT,
-        permissions: &[
-            ("read", PermissionAction::Allow),
-            ("glob", PermissionAction::Allow),
-            ("grep", PermissionAction::Allow),
-            ("list", PermissionAction::Allow),
-            ("bash", PermissionAction::Ask),
-            ("edit", PermissionAction::Deny),
-            ("task", PermissionAction::Deny),
-            ("external_directory", PermissionAction::Ask),
-            ("webfetch", PermissionAction::Allow),
-        ],
+        permissions: READ_ONLY_PERMISSIONS,
     },
     Starter {
         name: "worker",
         description: "Single-writer implementation agent; plan-aware validation, narrow edits.",
         mode: Mode::subagent,
         prompt: WORKER_PROMPT,
-        permissions: &[
-            ("read", PermissionAction::Allow),
-            ("glob", PermissionAction::Allow),
-            ("grep", PermissionAction::Allow),
-            ("list", PermissionAction::Allow),
-            ("edit", PermissionAction::Allow),
-            ("bash", PermissionAction::Ask),
-            ("task", PermissionAction::Deny),
-            ("external_directory", PermissionAction::Ask),
-            ("webfetch", PermissionAction::Allow),
-        ],
+        permissions: WRITER_PERMISSIONS,
     },
     Starter {
         name: "delegate",
         description: "Concise general executor; narrow edits, focused validation, focused report.",
         mode: Mode::subagent,
         prompt: DELEGATE_PROMPT,
-        permissions: &[
-            ("read", PermissionAction::Allow),
-            ("glob", PermissionAction::Allow),
-            ("grep", PermissionAction::Allow),
-            ("list", PermissionAction::Allow),
-            ("edit", PermissionAction::Allow),
-            ("bash", PermissionAction::Ask),
-            ("task", PermissionAction::Deny),
-            ("external_directory", PermissionAction::Ask),
-            ("webfetch", PermissionAction::Allow),
-        ],
+        permissions: WRITER_PERMISSIONS,
     },
     Starter {
         name: "oracle",
         description: "Read-only decision/consistency advisor; surfaces drift, contradictions, narrowest next move.",
         mode: Mode::subagent,
         prompt: ORACLE_PROMPT,
-        permissions: &[
-            ("read", PermissionAction::Allow),
-            ("glob", PermissionAction::Allow),
-            ("grep", PermissionAction::Allow),
-            ("list", PermissionAction::Allow),
-            ("bash", PermissionAction::Ask),
-            ("edit", PermissionAction::Deny),
-            ("task", PermissionAction::Deny),
-            ("external_directory", PermissionAction::Ask),
-            ("webfetch", PermissionAction::Allow),
-        ],
+        permissions: READ_ONLY_PERMISSIONS,
     },
     Starter {
         name: "researcher",
@@ -470,6 +443,13 @@ pub const STARTERS: &[Starter] = &[
         description: "Read-only implementation planner; concrete, ordered plans with validation and risk discipline.",
         mode: Mode::subagent,
         prompt: PLANNER_PROMPT,
+        permissions: READ_ONLY_PERMISSIONS,
+    },
+    Starter {
+        name: "orchestrator",
+        description: "Primary coordinator; delegates bounded work and keeps user intent, decisions, and acceptance in one place.",
+        mode: Mode::primary,
+        prompt: ORCHESTRATOR_PROMPT,
         permissions: &[
             ("read", PermissionAction::Allow),
             ("glob", PermissionAction::Allow),
@@ -477,9 +457,8 @@ pub const STARTERS: &[Starter] = &[
             ("list", PermissionAction::Allow),
             ("bash", PermissionAction::Ask),
             ("edit", PermissionAction::Deny),
-            ("task", PermissionAction::Deny),
+            ("task", PermissionAction::Allow),
             ("external_directory", PermissionAction::Ask),
-            ("webfetch", PermissionAction::Allow),
         ],
     },
 ];
@@ -503,6 +482,28 @@ pub fn starter_agent(starter: &Starter) -> Agent {
 // `&'static str` constants so the surrounding `Starter` table can stay
 // const-constructible, and so the substring stays available for tests that
 // pin specific role identifiers.
+
+const ORCHESTRATOR_PROMPT: &str = "\
+You are `orchestrator`, the primary OpenCode agent. You retain the user's intent, constraints, decisions, and final acceptance while coordinating the installed subagents.
+
+Start by understanding the request. Delegate only when it improves evidence, planning, implementation, or review:
+- `scout` for targeted codebase context
+- `planner` for a concrete implementation plan
+- `worker` for approved implementation
+- `reviewer` for fresh, evidence-based review
+- `researcher` for external evidence
+- `oracle` for rare decision, consistency, or root-cause escalation
+- `delegate` for a small, direct implementation task
+
+Give every delegated task a bounded goal, relevant paths or evidence, edit authority, success criteria, validation, expected report, and stop conditions. Keep one implementation writer at a time in a workspace. Do not ask subagents to create further subagent trees.
+
+You do not edit files yourself. Delegate approved code changes to `worker` or `delegate`, then inspect the result and decide whether review or a focused correction is needed. Do not silently make unapproved product, architecture, or scope decisions. If a required decision remains unresolved, state it plainly and stop.
+
+Final response:
+- Summary of the outcome
+- Delegated work and evidence considered
+- Changed files and validation, when applicable
+- Remaining risks or required decisions.";
 
 const SCOUT_PROMPT: &str = "\
 You are a read-only codebase scout. Inspect only what is needed, trace the relevant flow, and report concrete findings another agent can act on.
@@ -915,6 +916,36 @@ mod tests {
             assert_eq!(parsed.prompt, original.prompt);
             assert_eq!(parsed.permissions, original.permissions);
         }
+    }
+
+    #[test]
+    fn orchestrator_starter_has_primary_coordination_contract() {
+        let orchestrator = STARTERS
+            .iter()
+            .find(|s| s.name == "orchestrator")
+            .expect("orchestrator must be in STARTERS");
+        let agent = starter_agent(orchestrator);
+
+        assert_eq!(agent.mode, Mode::primary);
+        assert!(agent.model.is_none());
+        assert_eq!(
+            agent.permissions.get("task"),
+            Some(&PermissionAction::Allow),
+            "orchestrator must be able to delegate"
+        );
+        assert_eq!(
+            agent.permissions.get("edit"),
+            Some(&PermissionAction::Deny),
+            "orchestrator must leave edits to a worker"
+        );
+        assert!(agent.prompt.contains("one implementation writer at a time"));
+        assert!(agent
+            .prompt
+            .contains("Do not ask subagents to create further subagent trees."));
+        assert_eq!(
+            Agent::parse("orchestrator", &agent.render()).unwrap(),
+            agent
+        );
     }
 
     #[test]

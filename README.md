@@ -7,10 +7,11 @@ agents from.
 
 ## Bundled starter roles
 
-`agenthd` ships seven OpenCode subagent starters in `src/agent.rs`:
+`agenthd` ships one primary coordinator and seven OpenCode subagent starters in `src/agent.rs`:
 
 | Role | Purpose | Edits? |
 | --- | --- | --- |
+| `orchestrator` | Primary coordinator; delegates work and keeps decisions and acceptance centralized. | No |
 | `scout` | Read-only codebase recon; targeted findings and risks. | No |
 | `oracle` | Read-only advisor; surface drift, contradictions, narrowest next move. | No |
 | `planner` | Read-only implementation planner; concrete, ordered plans with validation and risk discipline. | No |
@@ -19,7 +20,7 @@ agents from.
 | `delegate` | Lightweight implementation agent that executes an assigned task directly. | Yes |
 | `worker` | Default implementation agent with plan-aware validation. | Yes |
 
-All seven are `mode: subagent` with model unset (inherits OpenCode's default).
+`orchestrator` is `mode: primary`; the other seven are `mode: subagent`. All inherit OpenCode's default model.
 The starter files in `$HOME/.agenthd/agents/` are yours: edit them freely, and
 `Install/Update` will only fill in roles that are still missing — existing files
 are never overwritten.
@@ -41,7 +42,8 @@ if it is not.
 | --- | --- |
 | Canonical agents | `$HOME/.agenthd/agents/*.md` |
 | Ownership manifest | `$HOME/.agenthd/state.json` |
-| OpenCode output | `$XDG_CONFIG_HOME/opencode/agents/*.md` (falls back to `$HOME/.config/opencode/agents/*.md`) |
+| OpenCode agents | `$XDG_CONFIG_HOME/opencode/agents/*.md` (falls back to `$HOME/.config/opencode/agents/*.md`) |
+| Subagent panel plugin | `$XDG_CONFIG_HOME/opencode/plugins/agenthd-subagents.tsx`, registered as `./plugins/agenthd-subagents.tsx` in `tui.json` |
 
 `agenthd`-owned state always lives under `$HOME/.agenthd`, independent of
 `XDG_CONFIG_HOME`. Only the OpenCode output directory follows the XDG layout,
@@ -60,8 +62,8 @@ Main menu: `Up/Down` or `j/k`, `Enter`, `q` / `Esc` exit.
 Agents: `n` create, `Enter`/`e` edit, `d` delete (confirm), `u` update bundled prompts (confirm), `Esc` back.
 
 `u` refreshes the prompt body of every bundled canonical agent that
-already exists on disk (`delegate`, `oracle`, `planner`, `researcher`,
-`reviewer`, `scout`, `worker`). The command arms a confirmation popup
+already exists on disk (`delegate`, `oracle`, `orchestrator`, `planner`,
+`researcher`, `reviewer`, `scout`, `worker`). The command arms a confirmation popup
 first; press `y`/`Y` to apply or `n`/`N`/`Esc` to cancel. On apply,
 only the prompt body is rewritten — each file's existing description,
 mode, model, and permissions are read back and preserved. Missing
@@ -81,9 +83,10 @@ fields as `[ NORMAL ]` or `[ INSERT ]`.
 - `i`: enter `INSERT` on a text field (Name, Description, Prompt). No-op on
   Mode, Model, and the permission list.
 - `Enter` on Model: open the model picker.
+- `e` on Prompt: edit the whole prompt in `$VISUAL`/`$EDITOR` (Windows fallback: Notepad); save and close it to return the edited text.
 - `Space` on a permission row: cycle `inherit → allow → ask → deny → inherit`.
 - `w` or `Ctrl+S`: save using the existing validation path.
-- `q` or `Esc`: return/discard using the existing dirty-confirmation path
+- `q` or `Esc`: return to Agents using the existing dirty-confirmation path
   (clean draft discards immediately; dirty draft arms the confirmation popup).
 
 `INSERT` (text fields only):
@@ -102,6 +105,11 @@ refresh, `Esc` cancel.
 Install/Update: `i` apply all safe actions, `o` overwrite the selected conflict
 (confirm), `r` refresh, `Esc` back.
 
+Subagent panel: `i` install/update the managed OpenCode sidebar plugin and its
+single `tui.json` entry, `u` uninstall both (confirm), `r` refresh, `Esc` back.
+The panel lists child sessions with task title, agent, model, input-context
+tokens, and live status. It never shows the delegated prompt body.
+
 ## Synchronization safeguards
 
 - Safe sync never touches `Conflict`, `Unowned`, or modified orphan targets.
@@ -112,5 +120,5 @@ Install/Update: `i` apply all safe actions, `o` overwrite the selected conflict
 ## Out of scope
 
 Database, daemon, agent runner, versioning, remote catalog, project-local
-targets, plugin interface, nested/pattern permission rules, mouse interaction,
+targets, nested/pattern permission rules, mouse interaction,
 themes, localization, or background file watching.

@@ -1,36 +1,68 @@
 use crate::agent::{Agent, Mode, PermissionAction, PERMISSION_KEYS};
 use crate::models::{self, Discovery};
 use crate::store::{
-    apply_safe, compute_plan, delete_canonical, force_install, load_canonical, rename_canonical,
-    save_canonical, update_bundled_prompts, ApplyOutcome, Paths, State, SyncItem, SyncStatus,
-    UpdatePromptOutcome,
+    apply_safe, compute_plan, delete_canonical, force_install,
+    install_plugin as install_plugin_file, load_canonical, plugin_status, rename_canonical,
+    save_canonical, uninstall_plugin as uninstall_plugin_file, update_bundled_prompts,
+    ApplyOutcome, Paths, PluginStatus, State, SyncItem, SyncStatus, UpdatePromptOutcome,
 };
 use anyhow::{anyhow, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::{DefaultTerminal, Frame};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const ACCENT: Color = Color::Rgb(94, 234, 212);
+const SURFACE: Color = Color::Rgb(24, 29, 42);
+const SURFACE_RAISED: Color = Color::Rgb(36, 44, 60);
+const TEXT: Color = Color::Rgb(226, 232, 240);
+const MUTED: Color = Color::Rgb(148, 163, 184);
+const SUCCESS: Color = Color::Rgb(74, 222, 128);
+const WARNING: Color = Color::Rgb(250, 204, 21);
+const DANGER: Color = Color::Rgb(251, 113, 133);
 
 /// Top-level menu options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MainItem {
     Agents,
     InstallUpdate,
+    Plugin,
     Exit,
 }
 
 impl MainItem {
     fn all() -> &'static [MainItem] {
-        &[MainItem::Agents, MainItem::InstallUpdate, MainItem::Exit]
+        &[
+            MainItem::Agents,
+            MainItem::InstallUpdate,
+            MainItem::Plugin,
+            MainItem::Exit,
+        ]
     }
 
     fn label(self) -> &'static str {
         match self {
             MainItem::Agents => "Agents",
             MainItem::InstallUpdate => "Install/Update",
+            MainItem::Plugin => "Subagent panel",
             MainItem::Exit => "Exit",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            MainItem::Agents => "Create and tune OpenCode roles",
+            MainItem::InstallUpdate => "Review safe synchronization changes",
+            MainItem::Plugin => "Manage the OpenCode task sidebar",
+            MainItem::Exit => "Close agenthd",
         }
     }
 }
@@ -66,6 +98,11 @@ enum Screen {
         last_outcomes: Vec<ApplyOutcome>,
         status: Option<String>,
         confirm_overwrite: Option<String>,
+    },
+    Plugin {
+        status: PluginStatus,
+        message: Option<String>,
+        confirm_uninstall: bool,
     },
 }
 
@@ -265,20 +302,22 @@ impl App {
 
     fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
-        // Body, then status (transient; blank when no message), then the
-        // persistent contextual footer. Two fixed lines at the bottom keeps
-        // the layout stable whether or not a status message is set.
+        // The header, transient status, and contextual footer have fixed
+        // height so every screen keeps the same visual frame.
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(3),
                 Constraint::Min(1),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
             .split(area);
-        let body = chunks[0];
-        let status_area = chunks[1];
-        let footer_area = chunks[2];
+        let header_area = chunks[0];
+        let body = chunks[1];
+        let status_area = chunks[2];
+        let footer_area = chunks[3];
+        self.render_header(frame, header_area);
         match &self.screen {
             Screen::Main { selected } => self.render_main(frame, body, *selected),
             Screen::Agents {
@@ -344,25 +383,60 @@ impl App {
                 status.as_deref(),
                 confirm_overwrite.as_deref(),
             ),
+            Screen::Plugin {
+                status,
+                message,
+                confirm_uninstall,
+            } => self.render_plugin(frame, body, *status, message.as_deref(), *confirm_uninstall),
         }
         self.render_status_line(frame, status_area);
         self.render_footer(frame, footer_area);
     }
 
+    fn render_header(&self, frame: &mut Frame, area: Rect) {
+        let screen = match &self.screen {
+            Screen::Main { .. } => "Workspace",
+            Screen::Agents { .. } => "Agents",
+            Screen::Editor { .. } => "Agent editor",
+            Screen::ModelPicker { .. } => "Model picker",
+            Screen::InstallUpdate { .. } => "Install / Update",
+            Screen::Plugin { .. } => "Subagent panel",
+        };
+        let title = Line::from(vec![
+            Span::styled(
+                "  ◆ AGENTHD  ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("OPEN CODE / ", Style::default().fg(MUTED)),
+            Span::styled(
+                screen.to_uppercase(),
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        let subtitle = Line::from("  Agent definitions and OpenCode synchronization")
+            .style(Style::default().fg(MUTED));
+        frame.render_widget(
+            Paragraph::new(vec![title, subtitle]).style(Style::default().bg(SURFACE_RAISED)),
+            area,
+        );
+    }
+
     fn render_main(&self, frame: &mut Frame, area: Rect, selected: usize) {
         let items: Vec<ListItem> = MainItem::all()
             .iter()
-            .map(|item| ListItem::new(Line::from(item.label())))
+            .map(|item| {
+                ListItem::new(vec![
+                    Line::from(item.label()).style(Style::default().add_modifier(Modifier::BOLD)),
+                    Line::from(item.detail()).style(Style::default().fg(MUTED)),
+                ])
+            })
             .collect();
         let mut state = ListState::default();
         state.select(Some(selected));
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(Line::from("agenthd").style(title_style()))
-                    .borders(Borders::ALL),
-            )
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+            .block(panel("Workspace"))
+            .highlight_style(selected_style())
+            .highlight_symbol("▌ ");
         frame.render_stateful_widget(list, area, &mut state);
     }
 
@@ -377,7 +451,7 @@ impl App {
     ) {
         let header = format!(
             "{:<20} {:<10} {:<14} {}",
-            "name", "mode", "model", "description"
+            "NAME", "MODE", "MODEL", "DESCRIPTION"
         );
         let mut items: Vec<ListItem> = Vec::new();
         items.push(ListItem::new(Line::from(header.bold())));
@@ -390,25 +464,14 @@ impl App {
                 truncate(&agent.description, 60),
             ));
             let item = if idx == selected {
-                ListItem::new(line).style(Style::default().add_modifier(Modifier::REVERSED))
+                ListItem::new(line).style(selected_style())
             } else {
                 ListItem::new(line)
             };
             items.push(item);
         }
-        let mut state = ListState::default();
-        state.select(if agents.is_empty() {
-            None
-        } else {
-            Some(selected)
-        });
-        let title = "Agents";
-        let list = List::new(items).block(
-            Block::default()
-                .title(Line::from(title).style(title_style()))
-                .borders(Borders::ALL),
-        );
-        frame.render_stateful_widget(list, area, &mut state);
+        let list = List::new(items).block(panel("Agents"));
+        frame.render_widget(list, area);
         // The update confirmation takes precedence over a transient status
         // message: while the gate is armed, the screen should describe the
         // pending action instead of any older notice.
@@ -473,10 +536,8 @@ impl App {
             field == EditorField::Model,
         );
 
-        let prompt_block = Block::default()
-            .title(Line::from("Prompt").style(title_style()))
-            .borders(Borders::ALL)
-            .border_style(border_style_for(field == EditorField::Prompt));
+        let prompt_block =
+            panel("Prompt").border_style(border_style_for(field == EditorField::Prompt));
         let prompt = Paragraph::new(draft.prompt.as_str())
             .block(prompt_block)
             .wrap(Wrap { trim: false });
@@ -497,24 +558,22 @@ impl App {
         }
     }
 
-    fn render_mode_bar(&self, frame: &mut Frame, area: Rect, field: EditorField, mode: EditorMode) {
-        // Field-local reminder of what's possible in the current mode. The
-        // persistent save/quit and field-navigation keys live in the bottom
-        // footer; repeating them here would contradict or duplicate the
-        // footer. The mode name itself stays prominent so the Vim-style
-        // mode is always obvious.
-        let mode_label = mode.label();
-        let hint = match mode {
-            EditorMode::Normal => match field {
-                EditorField::Mode => "h/l or ←/→: cycle mode",
-                EditorField::Model => "Enter: open model picker",
-                EditorField::Permissions(_) => "h/l or ←/→: row · Space: cycle",
-                _ => "i: insert on this field",
-            },
-            EditorMode::Insert => "type · Backspace · Esc: NORMAL",
-        };
-        let line = Line::from(format!("[ {} ]  {}", mode_label, hint))
-            .style(Style::default().add_modifier(Modifier::BOLD));
+    fn render_mode_bar(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        _field: EditorField,
+        mode: EditorMode,
+    ) {
+        // The footer is the sole shortcut reference. This row only keeps the
+        // current Vim-style mode visible while editing.
+        let line = Line::from(Span::styled(
+            format!(" {} ", mode.label()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
         frame.render_widget(Paragraph::new(line), area);
     }
 
@@ -527,10 +586,7 @@ impl App {
         active: bool,
     ) {
         let style = border_style_for(active);
-        let block = Block::default()
-            .title(Line::from(title).style(title_style()))
-            .borders(Borders::ALL)
-            .border_style(style);
+        let block = panel(title).border_style(style);
         let paragraph = Paragraph::new(value).block(block);
         frame.render_widget(paragraph, area);
     }
@@ -543,10 +599,7 @@ impl App {
         field: EditorField,
     ) {
         let active = matches!(field, EditorField::Permissions(_));
-        let block = Block::default()
-            .title(Line::from("Permissions").style(title_style()))
-            .borders(Borders::ALL)
-            .border_style(border_style_for(active));
+        let block = panel("Permissions").border_style(border_style_for(active));
         let inner = block.inner(area);
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -567,7 +620,7 @@ impl App {
                 value.map(|a| a.as_str()).unwrap_or("inherit")
             );
             let line = if active_idx == Some(i) {
-                Line::from(text).style(Style::default().add_modifier(Modifier::REVERSED))
+                Line::from(text).style(selected_style())
             } else {
                 Line::from(text)
             };
@@ -588,12 +641,19 @@ impl App {
         status: Option<&str>,
     ) {
         let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(format!("Status: {}", discovery.status_text())));
+        lines.push(
+            Line::from(format!("Status · {}", discovery.status_text()))
+                .style(Style::default().fg(MUTED)),
+        );
         lines.push(Line::from(""));
         if let Discovery::Found(models) = discovery {
             for (i, m) in models.iter().enumerate() {
-                let marker = if i == selected { "> " } else { "  " };
-                lines.push(Line::from(format!("{}{}", marker, m)));
+                let line = Line::from(format!("  {}", m));
+                lines.push(if i == selected {
+                    line.style(selected_style())
+                } else {
+                    line
+                });
             }
         }
         let title = if manual_open {
@@ -601,9 +661,7 @@ impl App {
         } else {
             "Model picker"
         };
-        let block = Block::default()
-            .title(Line::from(title).style(title_style()))
-            .borders(Borders::ALL);
+        let block = panel(title);
         let para = Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false });
@@ -616,9 +674,7 @@ impl App {
                 Line::from(""),
                 Line::from(manual),
             ];
-            let manual_block = Block::default()
-                .title(Line::from("Manual").style(title_style()))
-                .borders(Borders::ALL);
+            let manual_block = panel("Manual model");
             let manual_para = Paragraph::new(manual_lines)
                 .block(manual_block)
                 .wrap(Wrap { trim: false });
@@ -657,28 +713,18 @@ impl App {
                 truncate(&item.reason(), 60),
             ));
             let style = if idx == selected {
-                Style::default().add_modifier(Modifier::REVERSED)
+                selected_style()
             } else if matches!(item.status, SyncStatus::Conflict) {
-                Style::default().fg(Color::Red)
+                Style::default().fg(DANGER)
             } else if item.status.is_safe_action() {
-                Style::default().fg(Color::Green)
+                Style::default().fg(SUCCESS)
             } else {
                 Style::default()
             };
             list_items.push(ListItem::new(line).style(style));
         }
-        let mut state = ListState::default();
-        state.select(if items.is_empty() {
-            None
-        } else {
-            Some(selected)
-        });
-        let list = List::new(list_items).block(
-            Block::default()
-                .title(Line::from("Install/Update").style(title_style()))
-                .borders(Borders::ALL),
-        );
-        frame.render_stateful_widget(list, chunks[0], &mut state);
+        let list = List::new(list_items).block(panel("Install / Update"));
+        frame.render_widget(list, chunks[0]);
 
         if !last_outcomes.is_empty() {
             let mut lines: Vec<Line> = Vec::new();
@@ -690,19 +736,45 @@ impl App {
                 let style = if outcome.ok {
                     Style::default()
                 } else {
-                    Style::default().fg(Color::Red)
+                    Style::default().fg(DANGER)
                 };
                 lines.push(Line::from(line).style(style));
             }
-            let block = Block::default()
-                .title(Line::from("Last action").style(title_style()))
-                .borders(Borders::ALL);
+            let block = panel("Last action");
             frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
         }
         if let Some(text) = confirm_overwrite {
             render_popup(frame, area, "Overwrite?", text);
         }
         if let Some(text) = status {
+            render_popup(frame, area, "Notice", text);
+        }
+    }
+
+    fn render_plugin(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        status: PluginStatus,
+        message: Option<&str>,
+        confirm_uninstall: bool,
+    ) {
+        let text = format!(
+            "OpenCode sidebar plugin\n\nStatus: {}\n\nShows each subagent task with its title, role, model, input-context tokens, and status.\n\nInstall/Update copies only agenthd-subagents.tsx into OpenCode's global plugins directory. Uninstall removes it only when its last-installed hash still matches.",
+            status.label()
+        );
+        let panel = Paragraph::new(text)
+            .block(panel("Subagent panel"))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(panel, area);
+        if confirm_uninstall {
+            render_popup(
+                frame,
+                area,
+                "Uninstall subagent panel?",
+                "Remove the agenthd-owned OpenCode plugin? Press Y to confirm, N/Esc to cancel.",
+            );
+        } else if let Some(text) = message {
             render_popup(frame, area, "Notice", text);
         }
     }
@@ -732,7 +804,7 @@ impl App {
         }
         let text = self.footer_text();
         let truncated = truncate(&text, area.width as usize);
-        let style = Style::default().fg(Color::White).bg(Color::DarkGray);
+        let style = Style::default().fg(TEXT).bg(SURFACE_RAISED);
         let para = Paragraph::new(truncated).style(style);
         frame.render_widget(para, area);
     }
@@ -755,6 +827,7 @@ impl App {
                     .to_string()
             }
             Screen::Editor {
+                field,
                 mode,
                 confirm_discard,
                 ..
@@ -763,8 +836,26 @@ impl App {
                     return "Esc: discard changes · any other key: cancel".to_string();
                 }
                 match mode {
-                    EditorMode::Normal => {
-                        "↑/↓ or j/k: field · w / Ctrl+S: save · q / Esc: back".to_string()
+                    EditorMode::Normal => match field {
+                        EditorField::Prompt => {
+                            "e: edit prompt · i: inline edit · ↑/↓: field · w / Ctrl+S: save · q / Esc: back"
+                                .to_string()
+                        }
+                        EditorField::Permissions(_) => {
+                            "Space: cycle permission · h/l: row · ↑/↓: field · w / Ctrl+S: save · q / Esc: back"
+                                .to_string()
+                        }
+                        EditorField::Mode => {
+                            "h/l or ←/→: cycle mode · ↑/↓: field · w / Ctrl+S: save · q / Esc: back"
+                                .to_string()
+                        }
+                        EditorField::Model => {
+                            "Enter: choose model · ↑/↓: field · w / Ctrl+S: save · q / Esc: back"
+                                .to_string()
+                        }
+                        EditorField::Name | EditorField::Description => {
+                            "i: edit · ↑/↓: field · w / Ctrl+S: save · q / Esc: back".to_string()
+                        }
                     }
                     EditorMode::Insert => {
                         "type to edit · Backspace: delete · Esc: NORMAL".to_string()
@@ -787,6 +878,15 @@ impl App {
                 }
                 "↑/↓ or j/k: select · i: install safe · o: overwrite conflict · r: refresh · Esc: back"
                     .to_string()
+            }
+            Screen::Plugin {
+                confirm_uninstall, ..
+            } => {
+                if *confirm_uninstall {
+                    "Y: uninstall · N / Esc: cancel".to_string()
+                } else {
+                    "i: install/update · u: uninstall · r: refresh · Esc: back".to_string()
+                }
             }
         }
     }
@@ -815,6 +915,7 @@ impl App {
             Screen::Editor { .. } => self.handle_editor_key(key, &paths),
             Screen::ModelPicker { .. } => self.handle_model_picker_key(key),
             Screen::InstallUpdate { .. } => self.handle_install_update_key(key),
+            Screen::Plugin { .. } => self.handle_plugin_key(key),
         }
         Ok(())
     }
@@ -835,6 +936,7 @@ impl App {
                     match item {
                         MainItem::Agents => self.open_agents(),
                         MainItem::InstallUpdate => self.open_install_update(),
+                        MainItem::Plugin => self.open_plugin(),
                         MainItem::Exit => self.quit = true,
                     }
                 }
@@ -872,6 +974,28 @@ impl App {
 
     fn open_install_update(&mut self) {
         self.refresh_install_update();
+    }
+
+    fn open_plugin(&mut self) {
+        self.refresh_plugin();
+    }
+
+    fn refresh_plugin(&mut self) {
+        match State::load(&self.paths.state_file).and_then(|state| {
+            let status = plugin_status(&self.paths, &state)?;
+            Ok((state, status))
+        }) {
+            Ok((state, status)) => {
+                self.state = state;
+                self.status_bar = None;
+                self.screen = Screen::Plugin {
+                    status,
+                    message: None,
+                    confirm_uninstall: false,
+                };
+            }
+            Err(e) => self.status_bar = Some(format!("error: {}", e)),
+        }
     }
 
     fn refresh_install_update(&mut self) {
@@ -1257,7 +1381,9 @@ impl App {
                 }
             }
             EditorField::Prompt => {
-                if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
+                if key.code == KeyCode::Char('e') {
+                    self.edit_prompt_in_system_editor();
+                } else if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
                     let mut field = EditorField::Prompt;
                     let perm_len = self
                         .editor_draft
@@ -1315,6 +1441,27 @@ impl App {
             EditorField::Mode => {
                 // Already handled above via editor_apply_horizontal (h/l/Left/Right).
             }
+        }
+    }
+
+    /// Open the full prompt in the user's editor and replace the draft only
+    /// after that editor exits successfully.
+    fn edit_prompt_in_system_editor(&mut self) {
+        let prompt = self
+            .editor_draft
+            .as_ref()
+            .expect("editor screen implies draft")
+            .prompt
+            .clone();
+        match edit_prompt_externally(&prompt) {
+            Ok(edited) => {
+                self.editor_draft
+                    .as_mut()
+                    .expect("editor screen implies draft")
+                    .prompt = edited;
+                self.status_bar = Some("prompt returned from system editor".to_string());
+            }
+            Err(e) => self.status_bar = Some(format!("error: prompt editor: {}", e)),
         }
     }
 
@@ -1445,11 +1592,10 @@ impl App {
     fn apply_editor_op(&mut self, op: EditorOp) {
         match op {
             EditorOp::Discard => {
-                self.screen = Screen::Main { selected: 0 };
-                self.status_bar = None;
                 self.editor_draft = None;
                 self.editor_original_name = None;
                 self.editor_prior_hash = None;
+                self.open_agents();
             }
             EditorOp::RequestDiscard => {
                 self.status_bar = Some("Unsaved changes. Press Esc again to discard.".to_string());
@@ -1779,6 +1925,90 @@ impl App {
         }
     }
 
+    fn handle_plugin_key(&mut self, key: KeyEvent) {
+        let confirmed = matches!(
+            self.screen,
+            Screen::Plugin {
+                confirm_uninstall: true,
+                ..
+            }
+        );
+        if confirmed {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => self.uninstall_plugin(),
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    if let Screen::Plugin {
+                        confirm_uninstall, ..
+                    } = &mut self.screen
+                    {
+                        *confirm_uninstall = false;
+                    }
+                    self.status_bar = Some("plugin uninstall cancelled".to_string());
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.screen = Screen::Main { selected: 0 };
+                self.status_bar = None;
+            }
+            KeyCode::Char('r') => self.refresh_plugin(),
+            KeyCode::Char('i') => self.install_plugin(),
+            KeyCode::Char('u') => {
+                if let Screen::Plugin {
+                    confirm_uninstall, ..
+                } = &mut self.screen
+                {
+                    *confirm_uninstall = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn install_plugin(&mut self) {
+        let state = match State::load(&self.paths.state_file) {
+            Ok(state) => state,
+            Err(e) => {
+                self.status_bar = Some(format!("error: {}", e));
+                return;
+            }
+        };
+        match install_plugin_file(&self.paths, state) {
+            Ok((state, prior_status)) => {
+                self.state = state;
+                let message = format!("plugin {}", prior_status.label());
+                self.refresh_plugin();
+                if let Screen::Plugin { message: slot, .. } = &mut self.screen {
+                    *slot = Some(message);
+                }
+            }
+            Err(e) => self.status_bar = Some(format!("error: {}", e)),
+        }
+    }
+
+    fn uninstall_plugin(&mut self) {
+        let state = match State::load(&self.paths.state_file) {
+            Ok(state) => state,
+            Err(e) => {
+                self.status_bar = Some(format!("error: {}", e));
+                return;
+            }
+        };
+        match uninstall_plugin_file(&self.paths, state) {
+            Ok(state) => {
+                self.state = state;
+                self.refresh_plugin();
+                if let Screen::Plugin { message, .. } = &mut self.screen {
+                    *message = Some("plugin uninstalled".to_string());
+                }
+            }
+            Err(e) => self.status_bar = Some(format!("error: {}", e)),
+        }
+    }
+
     fn force_overwrite(&mut self, filename: &str) {
         let state = match State::load(&self.paths.state_file) {
             Ok(s) => s,
@@ -1833,6 +2063,48 @@ fn save_agent(
     Ok(target_name)
 }
 
+fn edit_prompt_externally(prompt: &str) -> Result<String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "agenthd-prompt-{}-{}.md",
+        std::process::id(),
+        stamp
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| anyhow!("create temporary file: {}", e))?;
+        file.write_all(prompt.as_bytes())
+            .map_err(|e| anyhow!("write temporary file: {}", e))?;
+        drop(file);
+
+        let editor = std::env::var_os("VISUAL")
+            .or_else(|| std::env::var_os("EDITOR"))
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "notepad.exe".into()
+                } else {
+                    "vi".into()
+                }
+            });
+        let status = Command::new(editor)
+            .arg(&path)
+            .status()
+            .map_err(|e| anyhow!("start editor: {}", e))?;
+        if !status.success() {
+            return Err(anyhow!("editor exited with {}", status));
+        }
+        fs::read_to_string(&path).map_err(|e| anyhow!("read edited prompt: {}", e))
+    })();
+    let _ = fs::remove_file(&path);
+    result
+}
+
 fn edit_text_field(key: KeyEvent, value: &mut String) {
     match key.code {
         KeyCode::Backspace => {
@@ -1880,39 +2152,52 @@ fn prev_field(field: &mut EditorField, perm_len: usize) {
     };
 }
 
+fn panel(title: &str) -> Block<'static> {
+    Block::default()
+        .title(Line::from(format!(" {} ", title)).style(title_style()))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style_for(false))
+        .style(Style::default().fg(TEXT).bg(SURFACE))
+}
+
 fn border_style_for(active: bool) -> Style {
     if active {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
+        Style::default().fg(MUTED)
     }
 }
 
-/// Style for screen/popup block titles: cyan + bold so the active context
-/// is unmistakable without crowding the body.
 fn title_style() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+fn selected_style() -> Style {
     Style::default()
-        .fg(Color::Cyan)
+        .fg(Color::Black)
+        .bg(ACCENT)
         .add_modifier(Modifier::BOLD)
 }
 
 /// Semantic color for a status-bar message. Errors go red, successes go
 /// green, the unsaved-changes warning goes yellow, everything else stays
-/// default so the line never disappears.
+/// visible on the shared surface.
 fn status_style_for(text: &str) -> Style {
-    if text.starts_with("error: ") {
-        Style::default().fg(Color::Red)
+    let color = if text.starts_with("error: ") {
+        DANGER
     } else if text.starts_with("saved ")
         || text.starts_with("force installed ")
         || text.starts_with("deleted canonical ")
         || text.starts_with("updated bundled prompts")
     {
-        Style::default().fg(Color::Green)
+        SUCCESS
     } else if text.starts_with("Unsaved") {
-        Style::default().fg(Color::Yellow)
+        WARNING
     } else {
-        Style::default()
-    }
+        TEXT
+    };
+    Style::default().fg(color).bg(SURFACE)
 }
 
 /// Summarize a `update_bundled_prompts` run into a single status-bar
@@ -1965,9 +2250,7 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn render_popup(frame: &mut Frame, area: Rect, title: &str, body: &str) {
     let popup_area = centered_rect(60, 30, area);
-    let block = Block::default()
-        .title(Line::from(title).style(title_style()))
-        .borders(Borders::ALL);
+    let block = panel(title);
     let paragraph = Paragraph::new(body.to_string())
         .block(block)
         .wrap(Wrap { trim: false });
@@ -2017,6 +2300,13 @@ mod tests {
             canonical_dir: dir.path().join(".agenthd").join("agents"),
             state_file: dir.path().join(".agenthd").join("state.json"),
             target_dir: dir.path().join(".config").join("opencode").join("agents"),
+            plugin_file: dir
+                .path()
+                .join(".config")
+                .join("opencode")
+                .join("plugins")
+                .join("agenthd-subagents.tsx"),
+            plugin_config: dir.path().join(".config").join("opencode").join("tui.json"),
         };
         paths.ensure_dirs().unwrap();
         paths
@@ -2712,7 +3002,7 @@ mod tests {
     fn editor_q_in_normal_does_not_change_text_and_triggers_discard() {
         // `q` in NORMAL is the dirty-confirmation discard path. The buffer
         // must NOT receive a literal 'q', and a clean draft discards
-        // immediately (transitions to Main), while a dirty draft arms the
+        // immediately (returns to Agents), while a dirty draft arms the
         // confirmation popup without leaving the editor.
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
@@ -2727,8 +3017,8 @@ mod tests {
             &paths,
         );
         assert!(
-            matches!(app.screen, Screen::Main { .. }),
-            "clean `q` should leave the editor: {:?}",
+            matches!(app.screen, Screen::Agents { .. }),
+            "clean `q` should return to Agents: {:?}",
             app.screen
         );
         assert!(app.editor_draft.is_none());
@@ -2771,6 +3061,12 @@ mod tests {
                 .description
                 .contains('q'),
             "description must not have consumed a literal 'q' from the keystroke"
+        );
+        app.handle_editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &paths);
+        assert!(
+            matches!(app.screen, Screen::Agents { .. }),
+            "confirmed discard should return to Agents: {:?}",
+            app.screen
         );
     }
 
@@ -3169,6 +3465,12 @@ mod tests {
                 ),
                 target_dir: std::path::PathBuf::from(
                     "/tmp/agenthd-footer-test/.config/opencode/agents",
+                ),
+                plugin_file: std::path::PathBuf::from(
+                    "/tmp/agenthd-footer-test/.config/opencode/plugins/agenthd-subagents.tsx",
+                ),
+                plugin_config: std::path::PathBuf::from(
+                    "/tmp/agenthd-footer-test/.config/opencode/tui.json",
                 ),
             },
             State::default(),
@@ -3622,6 +3924,47 @@ mod tests {
             text.contains("Esc"),
             "editor NORMAL footer mentions Esc: {text:?}"
         );
+        assert!(
+            text.contains("i: edit"),
+            "Name footer mentions inline edit: {text:?}"
+        );
+    }
+
+    #[test]
+    fn footer_editor_surfaces_prompt_and_permission_shortcuts() {
+        let mut app = fresh_app();
+        app.screen = Screen::Editor {
+            field: EditorField::Prompt,
+            mode: EditorMode::Normal,
+            status: None,
+            confirm_discard: false,
+        };
+        assert!(app.footer_text().contains("e: edit prompt"));
+
+        app.screen = Screen::Editor {
+            field: EditorField::Permissions(0),
+            mode: EditorMode::Normal,
+            status: None,
+            confirm_discard: false,
+        };
+        assert!(app.footer_text().contains("Space: cycle permission"));
+        assert!(app.footer_text().contains("h/l: row"));
+
+        app.screen = Screen::Editor {
+            field: EditorField::Mode,
+            mode: EditorMode::Normal,
+            status: None,
+            confirm_discard: false,
+        };
+        assert!(app.footer_text().contains("cycle mode"));
+
+        app.screen = Screen::Editor {
+            field: EditorField::Model,
+            mode: EditorMode::Normal,
+            status: None,
+            confirm_discard: false,
+        };
+        assert!(app.footer_text().contains("choose model"));
     }
 
     #[test]
@@ -3896,14 +4239,13 @@ mod tests {
     #[test]
     fn render_footer_uses_bright_fg_and_accent_bg_no_dim() {
         use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 3);
+        let backend = TestBackend::new(80, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = fresh_app();
         app.screen = Screen::Main { selected: 0 };
         terminal.draw(|frame| app.render(frame)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        // Footer is the last row in the 3-tall layout (rows: body, status,
-        // footer). 80 cols wide.
+        // Footer is always the last row. 80 cols wide.
         let last_row_idx = buffer.area.height as usize - 1;
         let footer_cells: Vec<_> = buffer
             .content()
@@ -3943,7 +4285,7 @@ mod tests {
     #[test]
     fn footer_remains_visible_when_status_is_set() {
         use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 4);
+        let backend = TestBackend::new(80, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = fresh_app();
         app.screen = Screen::Agents {
@@ -3981,12 +4323,11 @@ mod tests {
         );
     }
 
-    /// `status: "error: ..."` must render the status row in red so it is
-    /// distinguishable from informational messages.
+    /// `status: "error: ..."` must render in the semantic error color.
     #[test]
-    fn status_line_applies_red_for_error_prefix() {
+    fn status_line_applies_error_color_for_error_prefix() {
         use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 4);
+        let backend = TestBackend::new(80, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = fresh_app();
         app.screen = Screen::Main { selected: 0 };
@@ -4006,19 +4347,17 @@ mod tests {
             .find(|c| !c.symbol().chars().all(char::is_whitespace))
             .expect("status row must contain at least one non-blank cell");
         assert_eq!(
-            cell.fg,
-            Color::Red,
-            "error status must use Red foreground: {:?}",
+            cell.fg, DANGER,
+            "error status must use the error foreground: {:?}",
             cell.fg
         );
     }
 
-    /// `status: "saved ..."` / `"force installed ..."` / `"deleted canonical ..."`
-    /// must render in green so successful actions stay distinguishable.
+    /// Successful status prefixes must render in the semantic success color.
     #[test]
-    fn status_line_applies_green_for_success_prefixes() {
+    fn status_line_applies_success_color_for_success_prefixes() {
         use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 4);
+        let backend = TestBackend::new(80, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = fresh_app();
         app.screen = Screen::Main { selected: 0 };
@@ -4037,19 +4376,17 @@ mod tests {
             .find(|c| !c.symbol().chars().all(char::is_whitespace))
             .expect("status row must contain at least one non-blank cell");
         assert_eq!(
-            cell.fg,
-            Color::Green,
-            "success status must use Green foreground: {:?}",
+            cell.fg, SUCCESS,
+            "success status must use the success foreground: {:?}",
             cell.fg
         );
     }
 
-    /// Status messages that match no semantic prefix render with the
-    /// terminal default — they remain visible rather than hidden.
+    /// Neutral status messages remain readable on the shared surface.
     #[test]
-    fn status_line_default_prefix_keeps_terminal_default_color() {
+    fn status_line_default_prefix_uses_body_color() {
         use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 4);
+        let backend = TestBackend::new(80, 8);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         let mut app = fresh_app();
         app.screen = Screen::Main { selected: 0 };
@@ -4068,15 +4405,13 @@ mod tests {
             .find(|c| !c.symbol().chars().all(char::is_whitespace))
             .expect("status row must contain at least one non-blank cell");
         assert_eq!(
-            cell.fg,
-            Color::Reset,
-            "neutral status must use terminal default (Reset), got {:?}",
+            cell.fg, TEXT,
+            "neutral status must use the body foreground, got {:?}",
             cell.fg
         );
     }
 
-    /// The Main screen title ("agenthd") must use the cohesive accent
-    /// (Cyan + BOLD) so screen context reads at a glance.
+    /// The global AGENTHD brand must use the accent color and bold weight.
     #[test]
     fn screen_title_uses_accent_color_and_bold() {
         use ratatui::backend::TestBackend;
@@ -4086,18 +4421,15 @@ mod tests {
         app.screen = Screen::Main { selected: 0 };
         terminal.draw(|frame| app.render(frame)).unwrap();
         let buffer = terminal.backend().buffer().clone();
-        // The Main block's title sits on the top row, left-aligned after
-        // the border. Scan the top row for the first letter of "agenthd".
         let width = buffer.area.width as usize;
         let top_row: Vec<_> = buffer.content().iter().take(width).collect();
         let title_cell = top_row
             .iter()
-            .find(|c| c.symbol() == "a")
-            .expect("agenthd title cell must be on the top row");
+            .find(|c| c.symbol() == "◆")
+            .expect("agenthd brand mark must be on the top row");
         assert_eq!(
-            title_cell.fg,
-            Color::Cyan,
-            "screen title must use cyan accent: {:?}",
+            title_cell.fg, ACCENT,
+            "screen title must use accent color: {:?}",
             title_cell.fg
         );
         assert!(
@@ -4128,13 +4460,12 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let buffer = terminal.backend().buffer().clone();
         let width = buffer.area.width as usize;
-        // Find the "name" cell from the table header on the first body
-        // row. The Agents block has a top border row and a header row
-        // below it; scanning a few rows for "name" is robust.
+        // Find the uppercase NAME header; scanning the buffer is robust to
+        // the global header and rounded panel border.
         let header_cell = buffer
             .content()
             .iter()
-            .find(|c| c.symbol() == "n")
+            .find(|c| c.symbol() == "N")
             .expect("table header cell must be present");
         assert!(
             header_cell.modifier.contains(Modifier::BOLD),
