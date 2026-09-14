@@ -4,9 +4,10 @@ use crate::store::{
     apply_safe, compute_plan, delete_canonical, force_install,
     install_plugin as install_plugin_file, load_canonical, plugin_status, rename_canonical,
     save_canonical, uninstall_plugin as uninstall_plugin_file, update_bundled_prompts,
-    ApplyOutcome, Paths, PluginStatus, State, SyncItem, SyncStatus, UpdatePromptOutcome,
+    ApplyOutcome, Paths, PluginStatus, State, SyncItem, SyncStatus, SyncTarget,
+    UpdatePromptOutcome,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -97,7 +98,7 @@ enum Screen {
         selected: usize,
         last_outcomes: Vec<ApplyOutcome>,
         status: Option<String>,
-        confirm_overwrite: Option<String>,
+        confirm_overwrite: Option<(SyncTarget, String)>,
     },
     Plugin {
         status: PluginStatus,
@@ -381,7 +382,7 @@ impl App {
                 *selected,
                 last_outcomes,
                 status.as_deref(),
-                confirm_overwrite.as_deref(),
+                confirm_overwrite.as_ref(),
             ),
             Screen::Plugin {
                 status,
@@ -695,22 +696,26 @@ impl App {
         selected: usize,
         last_outcomes: &[ApplyOutcome],
         status: Option<&str>,
-        confirm_overwrite: Option<&str>,
+        confirm_overwrite: Option<&(SyncTarget, String)>,
     ) {
         let outcome_height = if last_outcomes.is_empty() { 0 } else { 8 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(5), Constraint::Length(outcome_height)])
             .split(area);
-        let header = format!("{:<22} {:<20} {}", "file", "status", "reason");
+        let header = format!(
+            "{:<10} {:<22} {:<20} {}",
+            "target", "file", "status", "reason"
+        );
         let mut list_items: Vec<ListItem> = Vec::new();
         list_items.push(ListItem::new(Line::from(header.bold())));
         for (idx, item) in items.iter().enumerate() {
             let line = Line::from(format!(
-                "{:<22} {:<20} {}",
+                "{:<10} {:<22} {:<20} {}",
+                item.target.label(),
                 truncate(&item.filename, 22),
                 item.status.label(),
-                truncate(&item.reason(), 60),
+                truncate(&item.reason(), 50),
             ));
             let style = if idx == selected {
                 selected_style()
@@ -743,8 +748,16 @@ impl App {
             let block = panel("Last action");
             frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
         }
-        if let Some(text) = confirm_overwrite {
-            render_popup(frame, area, "Overwrite?", text);
+        if let Some((_, filename)) = confirm_overwrite {
+            render_popup(
+                frame,
+                area,
+                "Overwrite?",
+                &format!(
+                    "Overwrite `{}` with current canonical? Press Y to confirm, N/Esc to cancel.",
+                    filename
+                ),
+            );
         }
         if let Some(text) = status {
             render_popup(frame, area, "Notice", text);
@@ -1704,14 +1717,12 @@ impl App {
                     KeyCode::Char('m') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Action::ToggleManual
                     }
-                    KeyCode::Tab => Action::ApplyManual(manual.clone()),
-                    KeyCode::Backspace => Action::Backspace,
-                    KeyCode::Char(c) => {
-                        if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                            Action::Type(c)
-                        } else {
-                            Action::None
-                        }
+                    KeyCode::Tab if *manual_open => Action::ApplyManual(manual.clone()),
+                    KeyCode::Backspace if *manual_open => Action::Backspace,
+                    KeyCode::Char(c)
+                        if *manual_open && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        Action::Type(c)
                     }
                     _ => Action::None,
                 }
@@ -1785,7 +1796,7 @@ impl App {
 
     fn handle_install_update_key(&mut self, key: KeyEvent) {
         enum Op {
-            ConfirmForce(String),
+            ConfirmForce(SyncTarget, String),
             CancelConfirm,
             Refresh,
             Install,
@@ -1805,8 +1816,8 @@ impl App {
             if confirm_overwrite.is_some() {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        let filename = confirm_overwrite.take().unwrap();
-                        op = Op::ConfirmForce(filename);
+                        let (target, filename) = confirm_overwrite.take().unwrap();
+                        op = Op::ConfirmForce(target, filename);
                     }
                     KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                         *confirm_overwrite = None;
@@ -1839,20 +1850,16 @@ impl App {
             return;
         }
         match op {
-            Op::ConfirmForce(filename) => self.force_overwrite(&filename),
+            Op::ConfirmForce(target, filename) => self.force_overwrite(target, &filename),
             Op::CancelConfirm => self.status_bar = Some("overwrite cancelled".to_string()),
             Op::Refresh => self.refresh_install_update(),
             Op::Install => self.apply_safe_install(),
             Op::BeginForce(item) => {
-                let path = item.target_path.display().to_string();
                 if let Screen::InstallUpdate {
                     confirm_overwrite, ..
                 } = &mut self.screen
                 {
-                    *confirm_overwrite = Some(format!(
-                        "Overwrite {} with current canonical? Press Y to confirm, N/Esc to cancel.",
-                        path
-                    ));
+                    *confirm_overwrite = Some((item.target, item.filename));
                 }
             }
             Op::MoveSelection(delta) => {
@@ -2009,7 +2016,7 @@ impl App {
         }
     }
 
-    fn force_overwrite(&mut self, filename: &str) {
+    fn force_overwrite(&mut self, target: SyncTarget, filename: &str) {
         let state = match State::load(&self.paths.state_file) {
             Ok(s) => s,
             Err(e) => {
@@ -2018,7 +2025,7 @@ impl App {
             }
         };
         self.state = state;
-        match force_install(&self.paths, self.state.clone(), filename) {
+        match force_install(&self.paths, self.state.clone(), target, filename) {
             Ok((state, outcome)) => {
                 self.state = state;
                 if let Screen::InstallUpdate {
@@ -2030,7 +2037,8 @@ impl App {
                     last_outcomes.push(outcome.clone());
                     *status = Some(format!("{}: {}", outcome.filename, outcome.action));
                 }
-                self.status_bar = Some(format!("force installed `{}`", filename));
+                self.status_bar =
+                    Some(format!("force installed {} `{}`", target.label(), filename));
                 self.refresh_install_update();
             }
             Err(e) => self.status_bar = Some(format!("error: {}", e)),
@@ -2057,6 +2065,14 @@ fn save_agent(
         .unwrap_or(false);
     if needs_rename {
         let old = original_name.clone().unwrap();
+        let source_path = paths.canonical_dir.join(format!("{}.md", old));
+        let current_hash = crate::store::hash_file(&source_path)?;
+        if current_hash.as_deref() != prior_hash.as_deref() {
+            bail!(
+                "`{}` changed on disk since this edit started; reload to pick up the latest version",
+                source_path.display()
+            );
+        }
         rename_canonical(paths, &old, &target_name).map_err(|e| anyhow!("rename: {}", e))?;
     }
     save_canonical(paths, &material, prior_hash.as_deref()).map_err(|e| anyhow!("save: {}", e))?;
@@ -2300,6 +2316,7 @@ mod tests {
             canonical_dir: dir.path().join(".agenthd").join("agents"),
             state_file: dir.path().join(".agenthd").join("state.json"),
             target_dir: dir.path().join(".config").join("opencode").join("agents"),
+            pi_target_dir: dir.path().join(".pi").join("agent").join("agents"),
             plugin_file: dir
                 .path()
                 .join(".config")
@@ -2465,6 +2482,47 @@ mod tests {
     }
 
     #[test]
+    fn save_rename_rejects_stale_source_without_moving_it() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths.clone(), state);
+        app.open_agents();
+        let summary = match &app.screen {
+            Screen::Agents { agents, .. } => agents
+                .iter()
+                .find(|agent| agent.name == "scout")
+                .cloned()
+                .expect("scout present"),
+            _ => panic!("expected agents screen"),
+        };
+        app.open_editor_existing(&summary);
+
+        let source = paths.canonical_dir.join("scout.md");
+        let external = std::fs::read_to_string(&source)
+            .unwrap()
+            .replace("read-only codebase scout", "externally rewritten");
+        std::fs::write(&source, &external).unwrap();
+        let material = {
+            let draft = app.editor_draft.as_mut().expect("draft present");
+            draft.agent.name = "renamed-scout".to_string();
+            draft.materialize()
+        };
+        app.apply_editor_op(EditorOp::Save {
+            original_name: app.editor_original_name.clone(),
+            material,
+        });
+
+        assert!(app
+            .status_bar
+            .as_deref()
+            .unwrap_or_default()
+            .contains("changed on disk"));
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), external);
+        assert!(!paths.canonical_dir.join("renamed-scout.md").exists());
+    }
+
+    #[test]
     fn save_rename_into_existing_destination_is_rejected() {
         // Rename collision semantics: do not overwrite a differing
         // destination. The existing `rename_canonical` already enforces this;
@@ -2593,6 +2651,33 @@ mod tests {
         assert!(matches!(app.screen, Screen::Editor { .. }));
         let draft = app.editor_draft.as_ref().expect("draft preserved");
         assert_eq!(draft.agent.model.as_deref(), Some("openai/gpt-5.4"));
+    }
+
+    #[test]
+    fn model_picker_ignores_manual_input_while_browsing() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths, state);
+        app.editor_draft = Some(AgentDraft::from_agent(starter_agent(&STARTERS[0])));
+        app.editor_original_name = Some(STARTERS[0].name.to_string());
+        app.open_model_picker(Some("openai/gpt-5.4".to_string()));
+
+        for key in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Tab] {
+            app.handle_model_picker_key(KeyEvent::new(key, KeyModifiers::empty()));
+        }
+
+        match &app.screen {
+            Screen::ModelPicker {
+                manual,
+                manual_open,
+                ..
+            } => {
+                assert!(!manual_open);
+                assert_eq!(manual, "openai/gpt-5.4");
+            }
+            screen => panic!("unexpected screen: {screen:?}"),
+        }
     }
 
     #[test]
@@ -3466,6 +3551,9 @@ mod tests {
                 target_dir: std::path::PathBuf::from(
                     "/tmp/agenthd-footer-test/.config/opencode/agents",
                 ),
+                pi_target_dir: std::path::PathBuf::from(
+                    "/tmp/agenthd-footer-test/.pi/agent/agents",
+                ),
                 plugin_file: std::path::PathBuf::from(
                     "/tmp/agenthd-footer-test/.config/opencode/plugins/agenthd-subagents.tsx",
                 ),
@@ -4096,7 +4184,7 @@ mod tests {
             selected: 0,
             last_outcomes: Vec::new(),
             status: None,
-            confirm_overwrite: Some("overwrite?".to_string()),
+            confirm_overwrite: Some((SyncTarget::OpenCode, "overwrite?".to_string())),
         };
         let text = app.footer_text();
         assert!(

@@ -26,6 +26,7 @@ pub struct Paths {
     pub canonical_dir: PathBuf,
     pub state_file: PathBuf,
     pub target_dir: PathBuf,
+    pub pi_target_dir: PathBuf,
     pub plugin_file: PathBuf,
     pub plugin_config: PathBuf,
 }
@@ -52,6 +53,7 @@ impl Paths {
             canonical_dir: agenthd_root.join("agents"),
             state_file: agenthd_root.join("state.json"),
             target_dir: opencode_root.join("agents"),
+            pi_target_dir: home_path.join(".pi").join("agent").join("agents"),
             plugin_file: opencode_root.join("plugins").join(PLUGIN_FILENAME),
             plugin_config: opencode_root.join("tui.json"),
             agenthd_root,
@@ -71,6 +73,8 @@ impl Paths {
             .with_context(|| format!("create {}", self.canonical_dir.display()))?;
         fs::create_dir_all(&self.target_dir)
             .with_context(|| format!("create {}", self.target_dir.display()))?;
+        fs::create_dir_all(&self.pi_target_dir)
+            .with_context(|| format!("create {}", self.pi_target_dir.display()))?;
         Ok(())
     }
 }
@@ -162,10 +166,26 @@ pub struct State {
     #[serde(default)]
     pub installed: BTreeMap<String, String>,
     #[serde(default)]
+    pub pi_installed: BTreeMap<String, String>,
+    #[serde(default)]
     pub plugin_hash: Option<String>,
 }
 
 impl State {
+    fn installed(&self, target: SyncTarget) -> &BTreeMap<String, String> {
+        match target {
+            SyncTarget::OpenCode => &self.installed,
+            SyncTarget::Pi => &self.pi_installed,
+        }
+    }
+
+    fn installed_mut(&mut self, target: SyncTarget) -> &mut BTreeMap<String, String> {
+        match target {
+            SyncTarget::OpenCode => &mut self.installed,
+            SyncTarget::Pi => &mut self.pi_installed,
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         match fs::read(path) {
             Ok(bytes) => {
@@ -224,9 +244,32 @@ impl SyncStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncTarget {
+    OpenCode,
+    Pi,
+}
+
+impl SyncTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            SyncTarget::OpenCode => "OpenCode",
+            SyncTarget::Pi => "Pi",
+        }
+    }
+
+    fn dir(self, paths: &Paths) -> &Path {
+        match self {
+            SyncTarget::OpenCode => &paths.target_dir,
+            SyncTarget::Pi => &paths.pi_target_dir,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SyncItem {
+    pub target: SyncTarget,
     pub filename: String,
     pub status: SyncStatus,
     pub canonical_hash: Option<String>,
@@ -272,6 +315,15 @@ pub fn hash_file(path: &Path) -> Result<Option<String>> {
         Ok(bytes) => Ok(Some(sha256_hex(&bytes))),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow!("hash {}: {}", path.display(), e)),
+    }
+}
+
+fn target_bytes(target: SyncTarget, canonical_path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(canonical_path) {
+        Ok(bytes) if target == SyncTarget::OpenCode => Ok(Some(bytes)),
+        Ok(_) => Ok(Some(Agent::read(canonical_path)?.render_pi().into_bytes())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("read {}: {}", canonical_path.display(), e)),
     }
 }
 
@@ -451,46 +503,51 @@ pub fn compute_plan(paths: &Paths, state: &State) -> Result<Vec<SyncItem>> {
     // Planning is read-only: refreshing the Install/Update screen must not
     // create directories. Mutations create their own parent directories.
     let canonical_names = read_md_filenames(&paths.canonical_dir)?;
-    let target_names = read_md_filenames(&paths.target_dir)?;
-    let mut all_names: BTreeSet<String> = BTreeSet::new();
-    all_names.extend(canonical_names.iter().cloned());
-    all_names.extend(target_names.iter().cloned());
-    all_names.extend(state.installed.keys().cloned());
-
     let mut items = Vec::new();
-    for filename in all_names {
-        let canonical_path = paths.canonical_dir.join(&filename);
-        let target_path = paths.target_dir.join(&filename);
-        let canonical_hash = hash_file(&canonical_path)?;
-        let target_hash = match fs::symlink_metadata(&target_path) {
-            Ok(meta) => {
-                if !meta.file_type().is_file() {
-                    bail!(
-                        "target {} is not a regular file; refusing to plan around it",
-                        target_path.display()
-                    );
-                }
-                hash_file(&target_path)?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(anyhow!("stat {}: {}", target_path.display(), e)),
-        };
-        let last_installed_hash = state.installed.get(&filename).cloned();
+    for target in [SyncTarget::OpenCode, SyncTarget::Pi] {
+        let target_dir = target.dir(paths);
+        let target_names = read_md_filenames(target_dir)?;
+        let mut all_names: BTreeSet<String> = BTreeSet::new();
+        all_names.extend(canonical_names.iter().cloned());
+        all_names.extend(target_names.iter().cloned());
+        all_names.extend(state.installed(target).keys().cloned());
 
-        let status = classify(
-            canonical_hash.as_ref(),
-            target_hash.as_ref(),
-            last_installed_hash.as_ref(),
-        );
-        items.push(SyncItem {
-            filename,
-            status,
-            canonical_hash,
-            target_hash,
-            last_installed_hash,
-            canonical_path,
-            target_path,
-        });
+        for filename in all_names {
+            let canonical_path = paths.canonical_dir.join(&filename);
+            let target_path = target_dir.join(&filename);
+            let canonical_hash = target_bytes(target, &canonical_path)?
+                .as_deref()
+                .map(sha256_hex);
+            let target_hash = match fs::symlink_metadata(&target_path) {
+                Ok(meta) => {
+                    if !meta.file_type().is_file() {
+                        bail!(
+                            "target {} is not a regular file; refusing to plan around it",
+                            target_path.display()
+                        );
+                    }
+                    hash_file(&target_path)?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(anyhow!("stat {}: {}", target_path.display(), e)),
+            };
+            let last_installed_hash = state.installed(target).get(&filename).cloned();
+            let status = classify(
+                canonical_hash.as_ref(),
+                target_hash.as_ref(),
+                last_installed_hash.as_ref(),
+            );
+            items.push(SyncItem {
+                target,
+                filename,
+                status,
+                canonical_hash,
+                target_hash,
+                last_installed_hash,
+                canonical_path,
+                target_path,
+            });
+        }
     }
     Ok(items)
 }
@@ -547,7 +604,7 @@ pub fn apply_safe(
         // Release ownership for modified orphans even when the target is
         // preserved — the canonical was removed and the user owns the file.
         if matches!(item.status, SyncStatus::PreserveModified) {
-            state.installed.remove(&item.filename);
+            state.installed_mut(item.target).remove(&item.filename);
             outcomes.push(ApplyOutcome {
                 filename: item.filename.clone(),
                 action: "released".to_string(),
@@ -567,12 +624,14 @@ pub fn apply_safe(
         }
         match item.status {
             SyncStatus::NotInstalled | SyncStatus::UpdateAvailable => {
-                let bytes = fs::read(&item.canonical_path)
-                    .with_context(|| format!("read {}", item.canonical_path.display()))?;
+                let bytes = target_bytes(item.target, &item.canonical_path)?
+                    .expect("canonical source is present for install");
                 let hash = sha256_hex(&bytes);
                 match write_target(&item.target_path, &bytes) {
                     Ok(()) => {
-                        state.installed.insert(item.filename.clone(), hash);
+                        state
+                            .installed_mut(item.target)
+                            .insert(item.filename.clone(), hash);
                         outcomes.push(ApplyOutcome {
                             filename: item.filename.clone(),
                             action: match item.status {
@@ -593,7 +652,9 @@ pub fn apply_safe(
             }
             SyncStatus::UpToDate => {
                 if let Some(hash) = &item.canonical_hash {
-                    state.installed.insert(item.filename.clone(), hash.clone());
+                    state
+                        .installed_mut(item.target)
+                        .insert(item.filename.clone(), hash.clone());
                 }
                 outcomes.push(ApplyOutcome {
                     filename: item.filename.clone(),
@@ -604,7 +665,7 @@ pub fn apply_safe(
             }
             SyncStatus::Remove => match fs::remove_file(&item.target_path) {
                 Ok(()) => {
-                    state.installed.remove(&item.filename);
+                    state.installed_mut(item.target).remove(&item.filename);
                     outcomes.push(ApplyOutcome {
                         filename: item.filename.clone(),
                         action: "removed".to_string(),
@@ -622,11 +683,12 @@ pub fn apply_safe(
             _ => unreachable!(),
         }
     }
-    state.installed.retain(|name, _| {
-        let target_exists = paths.target_dir.join(name).exists();
-        let canonical_exists = paths.canonical_dir.join(name).exists();
-        target_exists || canonical_exists
-    });
+    for target in [SyncTarget::OpenCode, SyncTarget::Pi] {
+        let target_dir = target.dir(paths);
+        state.installed_mut(target).retain(|name, _| {
+            target_dir.join(name).exists() || paths.canonical_dir.join(name).exists()
+        });
+    }
     if state != original_state {
         write_state(&paths.state_file, &state)?;
     }
@@ -642,10 +704,11 @@ pub fn apply_safe(
 pub fn force_install(
     paths: &Paths,
     mut state: State,
+    target: SyncTarget,
     filename: &str,
 ) -> Result<(State, ApplyOutcome)> {
     let canonical_path = paths.canonical_dir.join(filename);
-    let target_path = paths.target_dir.join(filename);
+    let target_path = target.dir(paths).join(filename);
     let meta = fs::symlink_metadata(&canonical_path)
         .with_context(|| format!("stat {}", canonical_path.display()))?;
     if !meta.file_type().is_file() {
@@ -655,7 +718,7 @@ pub fn force_install(
         );
     }
     let canonical_bytes =
-        fs::read(&canonical_path).with_context(|| format!("read {}", canonical_path.display()))?;
+        target_bytes(target, &canonical_path)?.expect("canonical source exists after stat");
     let canonical_hash = sha256_hex(&canonical_bytes);
     match fs::symlink_metadata(&target_path) {
         Ok(meta) => {
@@ -672,7 +735,9 @@ pub fn force_install(
     let target_hash = hash_file(&target_path)?;
     if target_hash.as_deref() == Some(canonical_hash.as_str()) {
         // Already in sync; just adopt ownership.
-        state.installed.insert(filename.to_string(), canonical_hash);
+        state
+            .installed_mut(target)
+            .insert(filename.to_string(), canonical_hash);
         write_state(&paths.state_file, &state)?;
         return Ok((
             state,
@@ -685,7 +750,9 @@ pub fn force_install(
         ));
     }
     write_target(&target_path, &canonical_bytes)?;
-    state.installed.insert(filename.to_string(), canonical_hash);
+    state
+        .installed_mut(target)
+        .insert(filename.to_string(), canonical_hash);
     write_state(&paths.state_file, &state)?;
     Ok((
         state,
@@ -1035,6 +1102,7 @@ mod tests {
             canonical_dir: dir.path().join(".agenthd").join("agents"),
             state_file: dir.path().join(".agenthd").join("state.json"),
             target_dir: dir.path().join(".config").join("opencode").join("agents"),
+            pi_target_dir: dir.path().join(".pi").join("agent").join("agents"),
             plugin_file: dir
                 .path()
                 .join(".config")
@@ -1052,6 +1120,11 @@ mod tests {
         fs::read_to_string(&path).ok()
     }
 
+    fn read_pi_target(paths: &Paths, name: &str) -> Option<String> {
+        let path = paths.pi_target_dir.join(format!("{}.md", name));
+        fs::read_to_string(&path).ok()
+    }
+
     #[test]
     fn paths_resolve_agenthd_root_follows_home_only() {
         let p = Paths::resolve(Some("/tmp/abc"), Some("/tmp/home")).unwrap();
@@ -1059,6 +1132,7 @@ mod tests {
         assert_eq!(p.canonical_dir, PathBuf::from("/tmp/home/.agenthd/agents"));
         assert_eq!(p.state_file, PathBuf::from("/tmp/home/.agenthd/state.json"));
         assert_eq!(p.target_dir, PathBuf::from("/tmp/abc/opencode/agents"));
+        assert_eq!(p.pi_target_dir, PathBuf::from("/tmp/home/.pi/agent/agents"));
     }
 
     #[test]
@@ -1069,6 +1143,7 @@ mod tests {
             p.target_dir,
             PathBuf::from("/tmp/home/.config/opencode/agents")
         );
+        assert_eq!(p.pi_target_dir, PathBuf::from("/tmp/home/.pi/agent/agents"));
     }
 
     #[test]
@@ -1078,6 +1153,7 @@ mod tests {
         assert!(p.canonical_dir.starts_with("/home/me/.agenthd"));
         assert!(!p.canonical_dir.starts_with("/xdg/override"));
         assert_eq!(p.target_dir, PathBuf::from("/xdg/override/opencode/agents"));
+        assert_eq!(p.pi_target_dir, PathBuf::from("/home/me/.pi/agent/agents"));
     }
 
     #[test]
@@ -1391,6 +1467,30 @@ mod tests {
     }
 
     #[test]
+    fn pi_sync_renders_pi_subagents() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = seed_starters(&paths, State::default()).unwrap();
+        let plan = compute_plan(&paths, &state).unwrap();
+        assert!(plan
+            .iter()
+            .filter(|item| item.target == SyncTarget::Pi)
+            .all(|item| matches!(item.status, SyncStatus::NotInstalled)));
+
+        let (state, _) = apply_safe(&paths, state, plan).unwrap();
+        let scout = read_pi_target(&paths, "scout").unwrap();
+        assert!(scout.contains("name: scout"));
+        assert!(scout.contains("tools: read, grep, find, ls, contact_supervisor, bash"));
+        assert!(!scout.contains("mode:"));
+        assert_eq!(state.pi_installed.len(), STARTERS.len());
+        assert!(compute_plan(&paths, &state)
+            .unwrap()
+            .iter()
+            .filter(|item| item.target == SyncTarget::Pi)
+            .all(|item| matches!(item.status, SyncStatus::UpToDate)));
+    }
+
+    #[test]
     fn apply_safe_noop_when_up_to_date() {
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
@@ -1539,7 +1639,8 @@ mod tests {
         let scout = plan.iter().find(|i| i.filename == "scout.md").unwrap();
         assert_eq!(scout.status, SyncStatus::Conflict);
 
-        let (state, outcome) = force_install(&paths, state, "scout.md").unwrap();
+        let (state, outcome) =
+            force_install(&paths, state, SyncTarget::OpenCode, "scout.md").unwrap();
         assert!(outcome.ok);
         assert!(fs::read_to_string(&target).unwrap().contains("read-only"));
         assert!(state.installed.contains_key("scout.md"));
@@ -1557,6 +1658,7 @@ mod tests {
         for starter in STARTERS {
             fs::remove_file(paths.canonical_dir.join(format!("{}.md", starter.name))).unwrap();
             fs::remove_file(paths.target_dir.join(format!("{}.md", starter.name))).unwrap();
+            fs::remove_file(paths.pi_target_dir.join(format!("{}.md", starter.name))).unwrap();
         }
         let plan = compute_plan(&paths, &state).unwrap();
         assert!(plan.iter().all(|i| matches!(i.status, SyncStatus::Unowned)));
@@ -1711,7 +1813,8 @@ mod tests {
         // Someone else syncs back to the canonical before we confirm.
         fs::write(&target, &original).unwrap();
 
-        let (state, outcome) = force_install(&paths, state, "scout.md").unwrap();
+        let (state, outcome) =
+            force_install(&paths, state, SyncTarget::OpenCode, "scout.md").unwrap();
         assert_eq!(outcome.action, "kept");
         assert!(state.installed.contains_key("scout.md"));
     }

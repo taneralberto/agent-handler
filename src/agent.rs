@@ -224,6 +224,33 @@ impl Agent {
         out
     }
 
+    /// Render the Pi subagent definition derived from this canonical agent.
+    pub fn render_pi(&self) -> String {
+        let mut tools = vec!["read", "grep", "find", "ls", "contact_supervisor"];
+        if self.permissions.get("bash") != Some(&PermissionAction::Deny) {
+            tools.push("bash");
+        }
+        if self.permissions.get("edit") != Some(&PermissionAction::Deny) {
+            tools.extend(["edit", "write"]);
+        }
+        if self.permissions.get("task") == Some(&PermissionAction::Allow) {
+            tools.push("subagent");
+        }
+
+        format!(
+            "---\nname: {}\ndescription: {}\ntools: {}\nsystemPromptMode: replace\ninheritProjectContext: true\ninheritSkills: false\nacceptanceRole: {}\n---\n\n{}\n",
+            self.name,
+            yaml_scalar(&self.description),
+            tools.join(", "),
+            if self.permissions.get("edit") == Some(&PermissionAction::Allow) {
+                "writer"
+            } else {
+                "read-only"
+            },
+            self.prompt.replace("OpenCode", "Pi").trim_end(),
+        )
+    }
+
     /// Parse an agent definition from canonical Markdown bytes.
     pub fn parse(name: &str, source: &str) -> Result<Self> {
         Self::validate_name(name)?;
@@ -297,8 +324,9 @@ impl FrontmatterDto {
         let mode = Mode::parse(&self.mode)?;
         let model = match self.model {
             Some(m) if !m.trim().is_empty() => {
-                Agent::validate_model(&m)?;
-                Some(m)
+                let model = m.trim();
+                Agent::validate_model(model)?;
+                Some(model.to_string())
             }
             _ => None,
         };
@@ -322,6 +350,13 @@ impl FrontmatterDto {
 }
 
 fn split_frontmatter(source: &str) -> Result<(String, String)> {
+    // Canonical renders use LF. Normalize only CRLF inputs so files edited on
+    // Windows parse to the same in-memory agent as their LF equivalent.
+    let normalized = source
+        .contains("\r\n")
+        .then(|| source.replace("\r\n", "\n"));
+    let source = normalized.as_deref().unwrap_or(source);
+
     let trimmed = source.trim_start_matches('\u{feff}');
     let rest = trimmed
         .strip_prefix("---\n")
@@ -904,6 +939,26 @@ mod tests {
     }
 
     #[test]
+    fn render_pi_uses_pi_frontmatter_and_tools() {
+        let scout = starter_agent(&STARTERS[0]);
+        let text = scout.render_pi();
+        assert!(text.contains("name: scout"));
+        assert!(text.contains("tools: read, grep, find, ls, contact_supervisor, bash"));
+        assert!(text.contains("acceptanceRole: read-only"));
+        assert!(text.contains("You are"));
+        assert!(!text.contains("OpenCode"));
+        assert!(!text.contains("mode:"));
+
+        let orchestrator = starter_agent(
+            STARTERS
+                .iter()
+                .find(|starter| starter.name == "orchestrator")
+                .unwrap(),
+        );
+        assert!(orchestrator.render_pi().contains("subagent"));
+    }
+
+    #[test]
     fn round_trip_preserves_all_fields() {
         for starter in STARTERS {
             let original = starter_agent(starter);
@@ -916,6 +971,26 @@ mod tests {
             assert_eq!(parsed.prompt, original.prompt);
             assert_eq!(parsed.permissions, original.permissions);
         }
+    }
+
+    #[test]
+    fn parse_normalizes_crlf_document_endings() {
+        let source = "---\r\ndescription: x\r\nmode: subagent\r\nmodel: openai/gpt-5.4\r\n---\r\nline one\r\nline two\r\n";
+
+        let parsed = Agent::parse("a", source).unwrap();
+
+        assert_eq!(parsed.model.as_deref(), Some("openai/gpt-5.4"));
+        assert_eq!(parsed.prompt, "line one\nline two");
+        assert!(!parsed.render().contains('\r'));
+    }
+
+    #[test]
+    fn parse_trims_model_before_storing_it() {
+        let source = "---\ndescription: x\nmode: subagent\nmodel: \" openai/gpt-5.4 \"\n---\nbody";
+
+        let parsed = Agent::parse("a", source).unwrap();
+
+        assert_eq!(parsed.model.as_deref(), Some("openai/gpt-5.4"));
     }
 
     #[test]

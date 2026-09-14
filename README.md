@@ -1,13 +1,13 @@
 # agenthd
 
-`agenthd` is a small terminal UI that keeps your OpenCode agent definitions under
-your own control. The canonical sources live in `agenthd`'s own config directory,
-and `Install/Update` safely synchronizes them into the directory OpenCode reads
-agents from.
+`agenthd` is a small terminal UI that keeps your agent definitions under your own
+control. The canonical sources live in `agenthd`'s own config directory, and
+`Install/Update` safely synchronizes them into the directories OpenCode and Pi
+read agents from.
 
 ## Bundled starter roles
 
-`agenthd` ships one primary coordinator and seven OpenCode subagent starters in `src/agent.rs`:
+`agenthd` ships one primary coordinator and seven subagent starters in `src/agent.rs`:
 
 | Role | Purpose | Edits? |
 | --- | --- | --- |
@@ -20,7 +20,7 @@ agents from.
 | `delegate` | Lightweight implementation agent that executes an assigned task directly. | Yes |
 | `worker` | Default implementation agent with plan-aware validation. | Yes |
 
-`orchestrator` is `mode: primary`; the other seven are `mode: subagent`. All inherit OpenCode's default model.
+`orchestrator` is `mode: primary`; the other seven are `mode: subagent`. All inherit OpenCode's default model. Pi receives equivalent Pi subagent definitions with the appropriate Pi tool allowlists.
 The starter files in `$HOME/.agenthd/agents/` are yours: edit them freely, and
 `Install/Update` will only fill in roles that are still missing — existing files
 are never overwritten.
@@ -43,11 +43,11 @@ if it is not.
 | Canonical agents | `$HOME/.agenthd/agents/*.md` |
 | Ownership manifest | `$HOME/.agenthd/state.json` |
 | OpenCode agents | `$XDG_CONFIG_HOME/opencode/agents/*.md` (falls back to `$HOME/.config/opencode/agents/*.md`) |
+| Pi agents | `$HOME/.pi/agent/agents/*.md` |
 | Subagent panel plugin | `$XDG_CONFIG_HOME/opencode/plugins/agenthd-subagents.tsx`, registered as `./plugins/agenthd-subagents.tsx` in `tui.json` |
 
 `agenthd`-owned state always lives under `$HOME/.agenthd`, independent of
-`XDG_CONFIG_HOME`. Only the OpenCode output directory follows the XDG layout,
-because that's where OpenCode itself reads agents from.
+`XDG_CONFIG_HOME`. The OpenCode output directory follows the XDG layout; Pi reads its global agents from `$HOME/.pi/agent/agents`.
 
 On first run, if `$HOME/.agenthd` does not yet exist, `agenthd` looks for a
 legacy install at `$XDG_CONFIG_HOME/agenthd` (or `$HOME/.config/agenthd`) and
@@ -111,6 +111,8 @@ The panel lists child sessions with task title, agent, model, input-context
 tokens, and live status. It never shows the delegated prompt body.
 
 ## Synchronization safeguards
+
+`Install/Update` plans and applies OpenCode and Pi targets independently. A conflict in one never overwrites the other.
 
 - Safe sync never touches `Conflict`, `Unowned`, or modified orphan targets.
 - A conflict overwrite is path-specific and always asks for confirmation.

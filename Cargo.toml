@@ -2,7 +2,7 @@
 name = "agenthd"
 version = "0.1.0"
 edition = "2021"
-description = "Terminal UI that manages OpenCode agent definitions and synchronizes them to the OpenCode config directory."
+description = "Terminal UI that manages agent definitions and safely synchronizes them to OpenCode and Pi."
 license = "MIT"
 
 [dependencies]
