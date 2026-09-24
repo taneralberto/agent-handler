@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod models;
 mod store;
+mod tools;
 
 use anyhow::{Context, Result};
 use crossterm::execute;

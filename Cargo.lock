@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",
@@ -15,6 +16,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tui-textarea",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

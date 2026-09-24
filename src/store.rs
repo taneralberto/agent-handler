@@ -29,6 +29,10 @@ pub struct Paths {
     pub pi_target_dir: PathBuf,
     pub plugin_file: PathBuf,
     pub plugin_config: PathBuf,
+    /// Parent of the OpenCode global skills directory. Sibling of `target_dir`
+    /// (`<xdg|home>/.config/opencode/agents` -> `<xdg|home>/.config/opencode/skills`)
+    /// so the no-replace publish primitive stays on the same filesystem volume.
+    pub skills_dir: PathBuf,
 }
 
 impl Paths {
@@ -56,6 +60,7 @@ impl Paths {
             pi_target_dir: home_path.join(".pi").join("agent").join("agents"),
             plugin_file: opencode_root.join("plugins").join(PLUGIN_FILENAME),
             plugin_config: opencode_root.join("tui.json"),
+            skills_dir: opencode_root.join("skills"),
             agenthd_root,
         })
     }
@@ -75,6 +80,8 @@ impl Paths {
             .with_context(|| format!("create {}", self.target_dir.display()))?;
         fs::create_dir_all(&self.pi_target_dir)
             .with_context(|| format!("create {}", self.pi_target_dir.display()))?;
+        fs::create_dir_all(&self.skills_dir)
+            .with_context(|| format!("create {}", self.skills_dir.display()))?;
         Ok(())
     }
 }
@@ -1110,6 +1117,7 @@ mod tests {
                 .join("plugins")
                 .join(PLUGIN_FILENAME),
             plugin_config: dir.path().join(".config").join("opencode").join("tui.json"),
+            skills_dir: dir.path().join(".config").join("opencode").join("skills"),
         };
         paths.ensure_dirs().unwrap();
         paths
@@ -1144,6 +1152,10 @@ mod tests {
             PathBuf::from("/tmp/home/.config/opencode/agents")
         );
         assert_eq!(p.pi_target_dir, PathBuf::from("/tmp/home/.pi/agent/agents"));
+        assert_eq!(
+            p.skills_dir,
+            PathBuf::from("/tmp/home/.config/opencode/skills")
+        );
     }
 
     #[test]
@@ -1154,6 +1166,7 @@ mod tests {
         assert!(!p.canonical_dir.starts_with("/xdg/override"));
         assert_eq!(p.target_dir, PathBuf::from("/xdg/override/opencode/agents"));
         assert_eq!(p.pi_target_dir, PathBuf::from("/home/me/.pi/agent/agents"));
+        assert_eq!(p.skills_dir, PathBuf::from("/xdg/override/opencode/skills"));
     }
 
     #[test]

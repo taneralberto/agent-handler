@@ -2,9 +2,10 @@
 
 ## Progress (2026-09-23)
 
-Partial implementation is on disk (uncommitted in the working tree; not
-pushed, not tagged). The v1 contract and test/acceptance criteria below
-remain authoritative; nothing here implies the feature is complete.
+Implementation is present in the repository; validation remains partial
+and acceptance is not complete. The v1 contract and test/acceptance
+criteria below remain authoritative; nothing here implies the feature
+is complete.
 
 **Implemented (code present, partial validation done):**
 

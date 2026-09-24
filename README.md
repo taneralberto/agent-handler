@@ -43,6 +43,7 @@ if it is not.
 | Canonical agents | `$HOME/.agenthd/agents/*.md` |
 | Ownership manifest | `$HOME/.agenthd/state.json` |
 | OpenCode agents | `$XDG_CONFIG_HOME/opencode/agents/*.md` (falls back to `$HOME/.config/opencode/agents/*.md`) |
+| OpenCode skills | `$XDG_CONFIG_HOME/opencode/skills/<name>/` (falls back to `$HOME/.config/opencode/skills/<name>/`) |
 | Pi agents | `$HOME/.pi/agent/agents/*.md` |
 | Subagent panel plugin | `$XDG_CONFIG_HOME/opencode/plugins/agenthd-subagents.tsx`, registered as `./plugins/agenthd-subagents.tsx` in `tui.json` |
 
@@ -109,6 +110,124 @@ Subagent panel: `i` install/update the managed OpenCode sidebar plugin and its
 single `tui.json` entry, `u` uninstall both (confirm), `r` refresh, `Esc` back.
 The panel lists child sessions with task title, agent, model, input-context
 tokens, and live status. It never shows the delegated prompt body.
+
+Tools: `i` install the third-party OpenCode skill, `r` refresh, `Esc` back.
+
+## Tools (v1: install-only)
+
+The `Tools` menu installs third-party OpenCode skills from a small **bundled
+static catalog** baked into the binary (`src/tools.rs::DEFAULT_CATALOG`). The
+first entry is `pi-psql`, pinned to the verified tag
+`opencode-2026-09-23` (peeled commit
+`0dba366061911f0ec389f4a78cc46fd6d6a19d41`).
+
+### Install contract
+
+v1 is **install-only**. It never updates, replaces, force-installs, adopts
+unowned targets, or removes anything already at the destination. Any
+existing target — regular directory, regular file, or symlink — is a
+**conflict** that refuses to install. Add another tool by appending one
+catalog entry; no other edit is required when the default `SKILL.md`
+`name:` identity check is sufficient.
+
+Each entry declares:
+
+- `repo` — git remote URL (`https://github.com/taneralberto/pi-psql.git` for the
+  bundled entry).
+- `skill_name` — expected `SKILL.md` frontmatter `name:` value (e.g. `pi-psql`).
+- `destination_subpath` — directory name under `<xdg|home>/.config/opencode/skills/`.
+- `pin_tag` and `expected_sha` — verified immutable pin. `git rev-parse HEAD`
+  in the staged tree must equal `expected_sha`, or install fails closed.
+- `node_min` — full `(major, minor, patch)` tuple compared against
+  `node --version` before any network call. The bundled `pi-psql`
+  entry sets `22.12.0` deliberately, to match the `^22.12.0` leg of
+  `yargs@^18`'s `engines.node` (a transitive dependency). Recording
+  `min_major = 22` alone would accept `22.x` versions that ship with a
+  system package manager but cannot load yargs 18; the full tuple
+  catches that case. Future entries can tighten or loosen the bound
+  per their own transitive engines.
+
+### Install flow (eight steps)
+
+1. **Pre-flight** — `git --version`, `node --version` (parsed and compared
+   to `node_min` full-tuple), `npm --version`. Missing tools or
+   `node < node_min` yield `PrerequisitesMissing`. No filesystem writes.
+2. **Resolve tag → peeled SHA** — `git ls-remote <repo> <pin_tag>`. Annotated
+   tags return two lines; lightweight tags return one. The peeled commit
+   SHA is the last 40-hex line. A sanity check refuses to proceed if the
+   peeled SHA differs from `expected_sha` (`InstallFailed`).
+3. **Stage on the same volume** — staging dir is adjacent to the destination
+   (sibling of `<skills>/<name>/`). `git init <staging>`;
+   `git -C <staging> remote add origin <repo>`;
+   `git -C <staging> fetch --depth=1 origin <pin_tag>`;
+   `git -C <staging> checkout FETCH_HEAD`. Fetch by **tag**, never by SHA.
+4. **Verify pinned SHA** — `git -C <staging> rev-parse HEAD` must equal
+   `expected_sha`. Tag moved, repo compromised, or wrong constant →
+   remove staging, `InstallFailed`.
+5. **Identity check** — `<staging>/SKILL.md` frontmatter `name:` must equal
+   `skill_name`. Mismatch or malformed → remove staging,
+   `IdentityMismatch`.
+6. **Install deps** — `npm ci --omit=dev --ignore-scripts` inside staging.
+   Both flags are mandatory: third-party post-install scripts run with the
+   user account and must not be trusted implicitly. Non-zero exit →
+   remove staging, `InstallFailed`.
+7. **Publish via the OS no-replace primitive**:
+   - **Linux** — `renameat2(2)` with `RENAME_NOREPLACE` (raw syscall via
+     `libc`). Returns `EEXIST` if `<target>` exists, `EXDEV` if staging
+     is on a different filesystem.
+   - **Windows** — raw `MoveFileW` via `windows-sys` (not
+     `MoveFileExW`, which would lower to `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`
+     and clobber). Per Microsoft's docs, `MoveFileW` returns `FALSE` with
+     `ERROR_ALREADY_EXISTS` when the destination exists and
+     `ERROR_NOT_SAME_DEVICE` when source/destination differ in volume.
+   - **Other platforms** — fail closed with `InstallFailed`. There is no
+     proven no-replace primitive for v1 on macOS/BSDs/etc.
+
+   There is **no separate "exists" check before the primitive** — no
+   TOCTOU window. `EEXIST` / `ERROR_ALREADY_EXISTS` → `Conflict`, no-op,
+   staging removed. `EXDEV` / `ERROR_NOT_SAME_DEVICE` → `InstallFailed`,
+   staging removed. Any other error → `InstallFailed`, staging removed.
+
+   Staging is always adjacent to the destination on the same volume so
+   the same-volume rule is met by construction.
+8. **Cleanup** — on every failure path the staging dir is removed;
+   `.key`, `connections.enc`, the destination, or any sibling tool are
+   never touched.
+
+All external invocations use `std::process::Command::new(...).args(...)` with
+**explicit argv** — no shell, no string interpolation. Every spawn carries a
+timeout (`30s` for `git`/`node`/`npm` metadata; `120s` for `npm ci`) and a
+kill+reap watchdog that drains stdout/stderr on timeout. stderr is surfaced
+in failure messages as the last ~20 lines.
+
+### Statuses
+
+`NotInstalled`, `Installed`, `PrerequisitesMissing`, `IdentityMismatch`,
+`InstallFailed`, `Conflict` (target already exists). No `UpToDate`,
+`UpdateAvailable`, force-install, or uninstall in v1.
+
+### Windows path caveat
+
+The Windows destination resolves under `%USERPROFILE%\.config\opencode\skills\<name>\`.
+There is no `$XDG_CONFIG_HOME` on Windows; the home fallback is the
+only path. Staging sits adjacent on the same drive so `MoveFileW` can
+publish without crossing volumes.
+
+### Credential non-interference
+
+The installer publishes files only. It never reads `.key`,
+`connections.enc`, or any decrypted secret, never invokes
+`open-connection-manager`, never touches environment variables, and
+never touches the connection-manager UI. The credential flow belongs to
+the skill's runtime, not the installer.
+
+### Remote catalog discovery: still out of scope
+
+The bundled static catalog is **not** remote catalog discovery. The catalog
+is a `const` baked into the binary; `agenthd` does not fetch a list of tools
+from any remote source. The existing "Out of scope" line in this README —
+which excludes remote catalog discovery — still applies. Adding a tool
+remains a one-line source edit to `DEFAULT_CATALOG`.
 
 ## Synchronization safeguards
 
