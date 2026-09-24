@@ -116,10 +116,31 @@ Tools: `i` install the third-party OpenCode skill, `r` refresh, `Esc` back.
 ## Tools (v1: install-only)
 
 The `Tools` menu installs third-party OpenCode skills from a small **bundled
-static catalog** baked into the binary (`src/tools.rs::DEFAULT_CATALOG`). The
-first entry is `pi-psql`, pinned to the verified tag
-`opencode-2026-09-23` (peeled commit
-`0dba366061911f0ec389f4a78cc46fd6d6a19d41`).
+static catalog** baked into the binary (`src/tools/mod.rs::DEFAULT_CATALOG`,
+which composes one entry from `src/tools/pi_psql/mod.rs::ENTRY`). The first
+entry is `pi-psql`, pinned to the verified tag `opencode-2026-09-23` (peeled
+commit `0dba366061911f0ec389f4a78cc46fd6d6a19d41`).
+
+### Module layout
+
+The installer lives under `src/tools/` as a preventive split for future
+per-tool UI:
+
+- `src/tools/mod.rs` — shared types (`ToolCatalogEntry`, `ToolStatus`,
+  `ToolItem`, `ToolOutcome`, `SpawnSpec`, `SpawnOutput`, `SpawnRunner`,
+  `RenameRunner`), the default catalog, and the install flow
+  (`tool_status`, `install_tool`, `install_tool_with`).
+- `src/tools/pi_psql/mod.rs` — the bundled `pi_psql::ENTRY` constants.
+- `src/tools/tests.rs` — the installer unit tests; existing tests
+  kept, with additional tests added during the npm-launcher rework
+  (Windows npm-direct-`node` fix, `discovery_seam`, etc.).
+- `src/tools/<tool>/view.rs` — a future per-tool view (config / execute
+  UI). v1 ships no view; this file is intentionally not present.
+
+The generic Tools list UI (render / open / refresh / handle / install
+and the pure helper) lives in `src/app/tools.rs` as a child module of
+the TUI. `Screen::Tools`, the `MainItem::Tools` entry, dispatch, and
+footer all stay in `src/app/mod.rs`.
 
 ### Install contract
 
@@ -171,6 +192,25 @@ Each entry declares:
    Both flags are mandatory: third-party post-install scripts run with the
    user account and must not be trusted implicitly. Non-zero exit →
    remove staging, `InstallFailed`.
+
+   **Windows npm launcher.** The Node Windows installer ships `npm`
+   (a bash script with no extension — unlaunchable by `CreateProcessW`)
+   and `npm.cmd` (which internally invokes `cmd.exe /c` — also
+   forbidden by this section's strict no-shell rule). The installer
+   therefore reaches npm through `node` directly, with the absolute
+   path to `npm-cli.js` as `argv[0]`:
+
+   ```
+   node "<launcher_parent>\node_modules\npm\bin\npm-cli.js" ci --omit=dev --ignore-scripts
+   ```
+
+   The path is resolved at runtime by walking PATH for `npm.cmd`
+   entries and using each launcher's parent directory as a layout
+   hint (`<launcher_parent>/node_modules/npm/bin/npm-cli.js`) — no
+   `.cmd` is ever spawned or parsed, no shell is invoked. If no PATH
+   entry resolves to a usable `npm-cli.js`, preflight returns
+   `PrerequisitesMissing` with an actionable detail that names the
+   missing prerequisite and asks the user to reinstall Node.js.
 7. **Publish via the OS no-replace primitive**:
    - **Linux** — `renameat2(2)` with `RENAME_NOREPLACE` (raw syscall via
      `libc`). Returns `EEXIST` if `<target>` exists, `EXDEV` if staging
@@ -212,6 +252,16 @@ The Windows destination resolves under `%USERPROFILE%\.config\opencode\skills\<n
 There is no `$XDG_CONFIG_HOME` on Windows; the home fallback is the
 only path. Staging sits adjacent on the same drive so `MoveFileW` can
 publish without crossing volumes.
+
+### Windows npm runtime caveat
+
+The Windows launcher for npm is `node <absolute npm-cli.js> ...` — no
+`npm.cmd` and no shell. `npm-cli.js` is located by walking PATH for
+`npm.cmd` entries and reading `<launcher_parent>\node_modules\npm\bin\npm-cli.js`.
+If the canonical npm layout is missing (no `npm.cmd` in PATH, or no
+`npm-cli.js` next to it), preflight returns `PrerequisitesMissing`
+naming the missing prerequisite; staging is never created. See the
+**Windows npm launcher** note under step 6 above for the full rationale.
 
 ### Credential non-interference
 

@@ -313,7 +313,7 @@ The process ID plus a counter is sufficient for temporary names. Same-directory 
      - Manual entry remains reachable in all discovery-result states.
 
 6. **Implement the TUI and terminal safety**
-   - Files: `src/app.rs`, `src/main.rs`
+   - Files: `src/app/mod.rs`, `src/main.rs`
    - Change:
      - `main.rs` resolves paths, seeds starters, loads the application, enters raw/alternate-screen mode, and runs the event loop.
      - Add an RAII terminal guard whose `Drop` disables raw mode, leaves alternate screen, and restores the cursor on normal return or error.
@@ -409,7 +409,7 @@ The repository is empty, so there are no existing files to modify.
 - `src/agent.rs` — agent model, validation, frontmatter parsing/rendering, permissions, and starters.
 - `src/store.rs` — canonical storage, manifest, atomic writes, sync planning, and installation.
 - `src/models.rs` — `opencode models` discovery and parsing.
-- `src/app.rs` — TUI state, interactions, modals, and rendering.
+- `src/app/mod.rs` — TUI state, interactions, modals, and rendering.
 
 Tests should remain as focused `#[cfg(test)]` modules beside the tested code; do not create a separate test hierarchy unless implementation constraints require it.
 

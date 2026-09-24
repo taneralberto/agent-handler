@@ -7,7 +7,12 @@ use crate::store::{
     ApplyOutcome, Paths, PluginStatus, State, SyncItem, SyncStatus, SyncTarget,
     UpdatePromptOutcome,
 };
-use crate::tools::{self, ToolItem, ToolOutcome, ToolStatus};
+use crate::tools::ToolItem;
+// `tools_lib` is only referenced from the test submodule below; gating the
+// import on `#[cfg(test)]` keeps the production binary warning-free while
+// preserving the natural short path inside the tests.
+#[cfg(test)]
+use crate::tools as tools_lib;
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -21,6 +26,12 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Generic Tools list UI: render / open / refresh / handle / install and
+/// the pure install-row helper. The implementation lives in `app/tools.rs`
+/// as a child module; the screen state, main-menu entry, dispatch, and
+/// footer all stay here.
+mod tools;
 
 const ACCENT: Color = Color::Rgb(94, 234, 212);
 const SURFACE: Color = Color::Rgb(24, 29, 42);
@@ -790,57 +801,6 @@ impl App {
         }
     }
 
-    fn render_tools(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        entries: &[ToolItem],
-        selected: usize,
-        status: Option<&str>,
-        installing: bool,
-    ) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(5),
-                Constraint::Length(if installing { 1 } else { 0 }),
-            ])
-            .split(area);
-        let header = format!("{:<18} {:<22} {}", "NAME", "STATUS", "DESTINATION");
-        let mut items: Vec<ListItem> = Vec::new();
-        items.push(ListItem::new(Line::from(header.bold())));
-        for (idx, item) in entries.iter().enumerate() {
-            let style = if idx == selected {
-                selected_style()
-            } else {
-                match item.status {
-                    ToolStatus::Installed => Style::default().fg(SUCCESS),
-                    ToolStatus::NotInstalled => Style::default(),
-                    ToolStatus::PrerequisitesMissing
-                    | ToolStatus::IdentityMismatch
-                    | ToolStatus::InstallFailed
-                    | ToolStatus::Conflict => Style::default().fg(DANGER),
-                }
-            };
-            let line = Line::from(format!(
-                "{:<18} {:<22} {}",
-                truncate(item.entry.skill_name, 18),
-                truncate(item.status.label(), 22),
-                truncate(&item.destination.display().to_string(), 60),
-            ));
-            items.push(ListItem::new(line).style(style));
-        }
-        let list = List::new(items).block(panel("Tools"));
-        frame.render_widget(list, chunks[0]);
-        if installing {
-            let progress = Paragraph::new("installing…").style(Style::default().fg(MUTED));
-            frame.render_widget(progress, chunks[1]);
-        }
-        if let Some(text) = status {
-            render_popup(frame, area, "Notice", text);
-        }
-    }
-
     fn render_plugin(
         &self,
         frame: &mut Frame,
@@ -1130,188 +1090,6 @@ impl App {
             }
             Err(e) => self.status_bar = Some(format!("error: {}", e)),
         }
-    }
-
-    fn open_tools(&mut self) {
-        self.refresh_tools();
-    }
-
-    /// Build the current Tools view: one `ToolItem` per catalog entry, with
-    /// the destination status read off the filesystem. Pre-flight (git/node/npm)
-    /// is NOT run here — it runs lazily when the user actually presses `i`.
-    fn refresh_tools(&mut self) {
-        let mut entries = Vec::with_capacity(tools::DEFAULT_CATALOG.len());
-        let mut first_error: Option<String> = None;
-        for entry in tools::DEFAULT_CATALOG {
-            match tools::tool_status(&self.paths, entry) {
-                Ok(item) => entries.push(item),
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some(format!("error: {}", e));
-                    }
-                }
-            }
-        }
-        if let Some(err) = first_error {
-            self.status_bar = Some(err);
-            return;
-        }
-        let len = entries.len();
-        let (selected, status) = if let Screen::Tools {
-            selected, status, ..
-        } = &self.screen
-        {
-            (*selected, status.clone())
-        } else {
-            (0, None)
-        };
-        self.status_bar = None;
-        self.screen = Screen::Tools {
-            entries,
-            selected: if len == 0 { 0 } else { selected.min(len - 1) },
-            status,
-            installing: false,
-        };
-    }
-
-    /// Pick the row index the `i` key should install. Lifted out of
-    /// `handle_tools_key` so the dispatch decision can be pinned by a
-    /// unit test without invoking the installer — `install_selected_tool`
-    /// calls `tools::install_tool` directly with no injection seam, so
-    /// running it from a test would spawn real `git` / `node` / `npm` and
-    /// touch the network. The conflict outcome of an `Installed` target
-    /// is covered by the `tools::install_tool_with` tests using injected
-    /// spawn / rename runners; this helper only asserts that the UI
-    /// dispatches into the installer regardless of pre-install row
-    /// state.
-    fn tools_screen_install_target(items: &[ToolItem], selected: usize) -> Option<usize> {
-        if items.get(selected).is_some() {
-            Some(selected)
-        } else {
-            None
-        }
-    }
-
-    fn handle_tools_key(&mut self, key: KeyEvent) {
-        enum Op {
-            Pop,
-            Move(i32),
-            Refresh,
-            Install(usize),
-        }
-        let op = {
-            if let Screen::Tools {
-                entries,
-                selected,
-                installing,
-                ..
-            } = &mut self.screen
-            {
-                if *installing {
-                    // Block dispatch while an install is running so the
-                    // user cannot queue more work or race the spawn loop.
-                    return;
-                }
-                match key.code {
-                    KeyCode::Esc => Op::Pop,
-                    KeyCode::Up | KeyCode::Char('k') => Op::Move(-1),
-                    KeyCode::Down | KeyCode::Char('j') => Op::Move(1),
-                    KeyCode::Char('r') => Op::Refresh,
-                    KeyCode::Char('i') => {
-                        // `i` always dispatches into the installer, per
-                        // TOOL_INSTALLER_PLAN.md: the row's pre-install
-                        // status is informational only. Any existing
-                        // target dir/file/symlink (including a row that
-                        // reads `Installed`) is a Conflict the OS
-                        // no-replace primitive must refuse, surfaced
-                        // as the status message. We therefore do not
-                        // branch on `ToolStatus::Installed` here —
-                        // `install_selected_tool` is the single source
-                        // of truth for the destination state.
-                        if let Some(idx) = Self::tools_screen_install_target(entries, *selected) {
-                            Op::Install(idx)
-                        } else {
-                            return;
-                        }
-                    }
-                    _ => return,
-                }
-            } else {
-                return;
-            }
-        };
-        match op {
-            Op::Pop => {
-                self.screen = Screen::Main { selected: 0 };
-                self.status_bar = None;
-            }
-            Op::Move(delta) => {
-                if let Screen::Tools {
-                    entries, selected, ..
-                } = &mut self.screen
-                {
-                    if entries.is_empty() {
-                        return;
-                    }
-                    if delta < 0 {
-                        *selected = selected.saturating_sub(1);
-                    } else if *selected + 1 < entries.len() {
-                        *selected += 1;
-                    }
-                }
-            }
-            Op::Refresh => self.refresh_tools(),
-            Op::Install(idx) => self.install_selected_tool(idx),
-        }
-    }
-
-    /// Run `tools::install_tool` for the row at `idx`. The installer is
-    /// synchronous and runs inside the TUI event loop, so the screen marks
-    /// `installing = true` for the duration to suppress other key input.
-    fn install_selected_tool(&mut self, idx: usize) {
-        let entry = match &self.screen {
-            Screen::Tools { entries, .. } => match entries.get(idx) {
-                Some(item) => item.entry,
-                None => return,
-            },
-            _ => return,
-        };
-        if let Screen::Tools { installing, .. } = &mut self.screen {
-            *installing = true;
-        }
-        let outcome: ToolOutcome = match tools::install_tool(&self.paths, entry) {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                if let Screen::Tools {
-                    installing, status, ..
-                } = &mut self.screen
-                {
-                    *installing = false;
-                    *status = Some(format!("error: {}", e));
-                }
-                self.status_bar = Some(format!("error: {}", e));
-                return;
-            }
-        };
-        let status_message = format!("{}: {}", outcome.status.label(), outcome.detail);
-        // Only re-read the destination when the install actually mutated
-        // it. On Conflict (or any non-Installed outcome that did not
-        // touch the destination) the screen's pre-install row state is
-        // already accurate — re-reading would, for example, render a
-        // pre-existing directory as a green "installed" row alongside
-        // the conflict message. The user can press `r` to refresh
-        // explicitly when they want the disk-truth view.
-        if matches!(outcome.status, ToolStatus::Installed) {
-            self.refresh_tools();
-        }
-        if let Screen::Tools {
-            installing, status, ..
-        } = &mut self.screen
-        {
-            *installing = false;
-            *status = Some(status_message.clone());
-        }
-        self.status_bar = Some(status_message);
     }
 
     fn handle_agents_key(&mut self, key: KeyEvent, paths: &Paths) {
@@ -3779,7 +3557,14 @@ mod tests {
         // Use a string that contains only letters/digits/symbols that have
         // no NORMAL meaning. `q` and `w` discard/save; `i` enters INSERT;
         // j/k/h/l are navigation. Anything else must be a no-op.
-        for c in "abcdef 0123 .,-".chars() {
+        //
+        // Note: `e` is intentionally excluded because it is a legitimate
+        // NORMAL action on the Prompt field -- it opens the external
+        // editor (`edit_prompt_in_system_editor` in this module), which
+        // would block this headless test. The contract being verified
+        // (NORMAL on Prompt must not call `edit_text_field`) is preserved:
+        // those inert characters still prove no mutation happens.
+        for c in "abcdf 0123 .,-".chars() {
             press(&mut app, &paths, c);
         }
         press_bs(&mut app, &paths);
@@ -4497,13 +4282,13 @@ mod tests {
         let paths = setup_paths(&dir);
         // Build the Tools entries directly so we don't depend on disk state.
         let mut entries = Vec::new();
-        for entry in tools::DEFAULT_CATALOG {
-            entries.push(tools::tool_status(&paths, entry).unwrap_or_else(|_| {
+        for entry in tools_lib::DEFAULT_CATALOG {
+            entries.push(tools_lib::tool_status(&paths, entry).unwrap_or_else(|_| {
                 crate::tools::ToolItem {
                     entry,
                     status: crate::tools::ToolStatus::NotInstalled,
                     detail: String::new(),
-                    destination: tools::destination_for(&paths, entry),
+                    destination: tools_lib::destination_for(&paths, entry),
                 }
             }));
         }
@@ -4533,9 +4318,9 @@ mod tests {
         let mut app = fresh_app();
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
-        let entries: Vec<ToolItem> = tools::DEFAULT_CATALOG
+        let entries: Vec<ToolItem> = tools_lib::DEFAULT_CATALOG
             .iter()
-            .map(|entry| tools::tool_status(&paths, entry).unwrap())
+            .map(|entry| tools_lib::tool_status(&paths, entry).unwrap())
             .collect();
         app.screen = Screen::Tools {
             entries: entries.clone(),
@@ -4564,9 +4349,9 @@ mod tests {
         let mut app = fresh_app();
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
-        let entries: Vec<ToolItem> = tools::DEFAULT_CATALOG
+        let entries: Vec<ToolItem> = tools_lib::DEFAULT_CATALOG
             .iter()
-            .map(|entry| tools::tool_status(&paths, entry).unwrap())
+            .map(|entry| tools_lib::tool_status(&paths, entry).unwrap())
             .collect();
         app.screen = Screen::Tools {
             entries,
@@ -4585,7 +4370,7 @@ mod tests {
         app.open_tools();
         match &app.screen {
             Screen::Tools { entries, .. } => {
-                assert_eq!(entries.len(), tools::DEFAULT_CATALOG.len());
+                assert_eq!(entries.len(), tools_lib::DEFAULT_CATALOG.len());
                 for item in entries {
                     assert_eq!(
                         item.entry.skill_name, "pi-psql",
@@ -4608,19 +4393,19 @@ mod tests {
         // branch on `ToolStatus::Installed` and surface a UI no-op.
         //
         // We cannot exercise this through `App::handle_tools_key`
-        // end-to-end here: that path calls `tools::install_tool`,
+        // end-to-end here: that path calls `tools_lib::install_tool`,
         // which spawns real `git`, `node`, `npm`, and touches the
         // network. There is no injection seam for the installer in
         // `install_selected_tool` (it is a private method on `App`
-        // that calls `tools::install_tool` directly with the default
+        // that calls `tools_lib::install_tool` directly with the default
         // runners). Inventing one — a trait, a callback parameter, a
         // method override — solely for tests would violate the
         // "no extra interface" rule, so the smallest useful test
         // here pins the dispatch decision by calling the extracted
         // helper directly. The Conflict outcome itself is covered by
-        // `tools::install_tool_with` tests in `src/tools.rs`, which
-        // use the injected spawn / rename runners.
-        let entry: &'static crate::tools::ToolCatalogEntry = &tools::DEFAULT_CATALOG[0];
+        // `tools_lib::install_tool_with` tests in `src/tools/tests.rs`,
+        // which use the injected spawn / rename runners.
+        let entry: &'static crate::tools::ToolCatalogEntry = &tools_lib::DEFAULT_CATALOG[0];
         let items = vec![ToolItem {
             entry,
             status: crate::tools::ToolStatus::Installed,
@@ -4639,9 +4424,9 @@ mod tests {
         let mut app = fresh_app();
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
-        let entries: Vec<ToolItem> = tools::DEFAULT_CATALOG
+        let entries: Vec<ToolItem> = tools_lib::DEFAULT_CATALOG
             .iter()
-            .map(|entry| tools::tool_status(&paths, entry).unwrap())
+            .map(|entry| tools_lib::tool_status(&paths, entry).unwrap())
             .collect();
         app.paths = paths;
         app.screen = Screen::Tools {
@@ -4662,9 +4447,9 @@ mod tests {
         let mut app = fresh_app();
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
-        let entries: Vec<ToolItem> = tools::DEFAULT_CATALOG
+        let entries: Vec<ToolItem> = tools_lib::DEFAULT_CATALOG
             .iter()
-            .map(|entry| tools::tool_status(&paths, entry).unwrap())
+            .map(|entry| tools_lib::tool_status(&paths, entry).unwrap())
             .collect();
         app.paths = paths;
         app.screen = Screen::Tools {

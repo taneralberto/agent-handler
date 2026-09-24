@@ -23,7 +23,7 @@
 mod agent;
 #[path = "../src/store.rs"]
 mod store;
-#[path = "../src/tools.rs"]
+#[path = "../src/tools/mod.rs"]
 mod tools;
 
 #[cfg(target_os = "linux")]
