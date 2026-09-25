@@ -15,13 +15,13 @@
 
 // The smoke test only uses a small surface (`store::Paths` and
 // `tools::{install_tool, tool_status, DEFAULT_CATALOG}`); most of the
-// re-included modules' public items end up "unused" from clippy's
-// perspective. Silence that for this binary only.
-#![allow(dead_code)]
+// re-included modules' public items and `pub use` re-exports end up
+// "unused" from clippy's perspective. Silence that for this binary only.
+#![allow(dead_code, unused_imports)]
 
 #[path = "../src/agent.rs"]
 mod agent;
-#[path = "../src/store.rs"]
+#[path = "../src/store/mod.rs"]
 mod store;
 #[path = "../src/tools/mod.rs"]
 mod tools;

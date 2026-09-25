@@ -7,7 +7,7 @@ read agents from.
 
 ## Bundled starter roles
 
-`agenthd` ships one primary coordinator and seven subagent starters in `src/agent.rs`:
+`agenthd` ships one primary coordinator and seven subagent starters under `src/agent/bundled/` (registry in `src/agent/bundled/mod.rs`, one `mod.rs` per role):
 
 | Role | Purpose | Edits? |
 | --- | --- | --- |
@@ -56,6 +56,20 @@ moves it to `$HOME/.agenthd` once. The migration is opt-out by being
 idempotent: if `$HOME/.agenthd` already exists, the legacy directory is left
 untouched and the new one wins.
 
+## Source layout
+
+The paths above are resolved and read/written by a small store module
+shared across the app. The on-disk paths themselves are unchanged.
+
+- `src/store/mod.rs` — path resolution, the ownership manifest, and
+  shared disk I/O (atomic temp+rename, parsing).
+- `src/store/canonical.rs` — load/save of the canonical
+  `$HOME/.agenthd/agents/*.md` agents (source of truth).
+- `src/store/sync.rs` — plan/apply for the OpenCode and Pi targets
+  driven by `Install/Update`.
+- `src/store/plugin.rs` — the managed subagent sidebar plugin.
+- `src/store/tests.rs` — store unit tests.
+
 ## Keys
 
 Main menu: `Up/Down` or `j/k`, `Enter`, `q` / `Esc` exit.
@@ -103,8 +117,15 @@ Permissions: `Space` cycles `inherit → allow → ask → deny → inherit`.
 Model picker: `Up/Down`, `Enter` apply, `m` manual (blank = inherit), `r`
 refresh, `Esc` cancel.
 
-Install/Update: `i` apply all safe actions, `o` overwrite the selected conflict
-(confirm), `r` refresh, `Esc` back.
+Install/Update: opens the **harness selector** on entry. `↑/↓` or `j/k` pick
+OpenCode or Pi; `Enter` opens the per-file list scoped to that harness
+only. On the list, `i` apply all safe actions for the bound harness, `o`
+overwrite the selected conflict (confirm with `Y`, cancel with `N` /
+`Esc`), `r` refresh the bound harness's plan. `Esc` walks back through the
+sheets in order: armed popup → list → harness selector → main menu. A
+session bound to one harness never reads the other's directory or
+ownership map; `plan_for` and the per-target `apply_safe` cleanup
+guarantee per-harness isolation.
 
 Subagent panel: `i` install/update the managed OpenCode sidebar plugin and its
 single `tui.json` entry, `u` uninstall both (confirm), `r` refresh, `Esc` back.

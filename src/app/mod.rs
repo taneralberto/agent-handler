@@ -1,37 +1,65 @@
-use crate::agent::{Agent, Mode, PermissionAction, PERMISSION_KEYS};
-use crate::models::{self, Discovery};
-use crate::store::{
-    apply_safe, compute_plan, delete_canonical, force_install,
-    install_plugin as install_plugin_file, load_canonical, plugin_status, rename_canonical,
-    save_canonical, uninstall_plugin as uninstall_plugin_file, update_bundled_prompts,
-    ApplyOutcome, Paths, PluginStatus, State, SyncItem, SyncStatus, SyncTarget,
-    UpdatePromptOutcome,
-};
+use crate::models::Discovery;
+// Editor / picker types live in the `editor` child module. We import
+// the variants the parent names in `Screen::Editor` and in the
+// contextual footer match arms. Editor-only helpers and `EditorOp`
+// are pulled in by `mod tests` directly so the lib build does not
+// carry an unused-import warning.
+use crate::store::{ApplyOutcome, Paths, PluginStatus, State, SyncItem, SyncTarget};
 use crate::tools::ToolItem;
+use editor::{AgentDraft, EditorField, EditorMode};
 // `tools_lib` is only referenced from the test submodule below; gating the
 // import on `#[cfg(test)]` keeps the production binary warning-free while
 // preserving the natural short path inside the tests.
 #[cfg(test)]
 use crate::tools as tools_lib;
-use anyhow::{anyhow, bail, Result};
+use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
 };
 use ratatui::{DefaultTerminal, Frame};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+// `AgentSummary` lives in the `agents` child module. Re-import it here so
+// the parent's `Screen::Agents` variant can name the type and so
+// `editor.rs`'s `super::AgentSummary` reference (used by
+// `open_editor_existing`) keeps resolving without a child->parent upcast.
+use agents::AgentSummary;
 
 /// Generic Tools list UI: render / open / refresh / handle / install and
 /// the pure install-row helper. The implementation lives in `app/tools.rs`
 /// as a child module; the screen state, main-menu entry, dispatch, and
 /// footer all stay here.
 mod tools;
+
+/// Agents list UI: render / open / handle key / delete /
+/// apply_update_bundled, and the bundled-update status-bar formatter.
+/// The implementation lives in `app/agents.rs` as a child module; the
+/// `Screen::Agents` variant, `pending_delete`, the main-menu entry, the
+/// dispatch, and the contextual footer all stay here.
+mod agents;
+
+/// Install/Update screen: render / open / refresh / handle key /
+/// safe-install / force-overwrite. The implementation lives in
+/// `app/install_update.rs` as a child module; the `Screen::InstallUpdate`
+/// variant, the main-menu entry, the dispatch, and the contextual
+/// footer all stay here.
+mod install_update;
+
+/// Agent editor + model picker: render / open / handle / save / discard
+/// paths, the field-navigation helpers, the external-prompt editor, and
+/// the rename-then-save helper. The implementation lives in
+/// `app/editor.rs` as a child module; the `Screen::Editor` and
+/// `Screen::ModelPicker` variants, the editor fields on `App`, the
+/// dispatch, and the contextual footer all stay here.
+mod editor;
+
+/// Subagent-panel (plugin) screen: render / open / refresh / handle key /
+/// install / uninstall. The implementation lives in `app/plugin.rs` as a
+/// child module; the `Screen::Plugin` variant, the main-menu entry, the
+/// dispatch, and the contextual footer all stay here.
+mod plugin;
 
 const ACCENT: Color = Color::Rgb(94, 234, 212);
 const SURFACE: Color = Color::Rgb(24, 29, 42);
@@ -115,6 +143,10 @@ enum Screen {
         last_outcomes: Vec<ApplyOutcome>,
         status: Option<String>,
         confirm_overwrite: Option<(SyncTarget, String)>,
+        /// Harness the session is bound to. `None` means the
+        /// OpenCode/Pi selector is on screen; `Some(target)` means the
+        /// per-file list for that target is on screen.
+        target: Option<SyncTarget>,
     },
     Tools {
         entries: Vec<ToolItem>,
@@ -130,131 +162,10 @@ enum Screen {
     },
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct AgentSummary {
-    name: String,
-    description: String,
-    mode: Mode,
-    model: Option<String>,
-}
-
-/// Editable view of an agent.
-#[derive(Debug, Clone)]
-struct AgentDraft {
-    agent: Agent,
-    permissions_view: Vec<(String, Option<PermissionAction>)>,
-    prompt: String,
-}
-
-impl AgentDraft {
-    fn from_agent(agent: Agent) -> Self {
-        let permissions_view = PERMISSION_KEYS
-            .iter()
-            .map(|key| {
-                let value = agent.permissions.get(*key).copied();
-                ((*key).to_string(), value)
-            })
-            .collect();
-        let prompt = agent.prompt.clone();
-        AgentDraft {
-            agent,
-            permissions_view,
-            prompt,
-        }
-    }
-
-    fn materialize(&self) -> Agent {
-        let mut agent = self.agent.clone();
-        agent.prompt = self.prompt.clone();
-        agent.permissions.clear();
-        for (key, value) in &self.permissions_view {
-            if let Some(action) = value {
-                agent.permissions.insert(key.clone(), *action);
-            }
-        }
-        agent
-    }
-
-    fn validate(&self) -> Result<()> {
-        self.materialize().validate()
-    }
-
-    fn is_dirty(&self, original: Option<&Agent>) -> bool {
-        let material = self.materialize();
-        match original {
-            Some(orig) => &material != orig,
-            None => !material.description.trim().is_empty() || !material.prompt.trim().is_empty(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditorField {
-    Name,
-    Description,
-    Mode,
-    Model,
-    Prompt,
-    Permissions(usize),
-}
-
-impl EditorField {
-    #[allow(dead_code)]
-    fn label(&self) -> &'static str {
-        match self {
-            EditorField::Name => "Name",
-            EditorField::Description => "Description",
-            EditorField::Mode => "Mode",
-            EditorField::Model => "Model",
-            EditorField::Prompt => "Prompt",
-            EditorField::Permissions(_) => "Permissions",
-        }
-    }
-
-    /// Fields whose values are free-form text and therefore accept
-    /// INSERT-mode typing. Mode, Model, and Permissions cycle a fixed set of
-    /// values, so `i` is a no-op there.
-    fn accepts_insert(&self) -> bool {
-        matches!(
-            self,
-            EditorField::Name | EditorField::Description | EditorField::Prompt
-        )
-    }
-}
-
-/// Vim-style editor mode. Starts in NORMAL on every fresh editor session;
-/// INSERT is only reachable from NORMAL via `i` on a text field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EditorMode {
-    Normal,
-    Insert,
-}
-
-impl EditorMode {
-    fn label(self) -> &'static str {
-        match self {
-            EditorMode::Normal => "NORMAL",
-            EditorMode::Insert => "INSERT",
-        }
-    }
-}
-
 /// Two-press `d` delete state.
 #[derive(Debug, Default)]
 struct PendingDelete {
     name: Option<String>,
-}
-
-/// Outcomes of handling a single editor key. Holding this in a small enum
-/// avoids double-borrowing `self` while destructuring the editor screen.
-enum EditorOp {
-    Discard,
-    RequestDiscard,
-    Save {
-        original_name: Option<String>,
-        material: Agent,
-    },
 }
 
 #[derive(Debug)]
@@ -288,30 +199,6 @@ impl App {
             editor_draft: None,
             editor_original_name: None,
             editor_prior_hash: None,
-        }
-    }
-
-    /// Whether `App` currently holds an editor draft. Used as a precondition
-    /// for actions that need to read or mutate it.
-    fn has_editor_draft(&self) -> bool {
-        self.editor_draft.is_some()
-    }
-
-    /// Re-enter the editor screen using the draft held on `App`. The picker
-    /// uses this to hand control back after a model is applied or cancelled.
-    /// Always returns to NORMAL so the editor never re-enters in INSERT.
-    fn restore_editor_screen(&mut self, status: Option<String>) {
-        if self.editor_draft.is_some() {
-            self.screen = Screen::Editor {
-                field: EditorField::Model,
-                mode: EditorMode::Normal,
-                status,
-                confirm_discard: false,
-            };
-        } else {
-            // No draft to restore; fall back to the agents list so we never
-            // leave the picker with no exit path.
-            self.screen = Screen::Main { selected: 0 };
         }
     }
 
@@ -398,6 +285,7 @@ impl App {
                 last_outcomes,
                 status,
                 confirm_overwrite,
+                target,
             } => self.render_install_update(
                 frame,
                 body,
@@ -406,6 +294,7 @@ impl App {
                 last_outcomes,
                 status.as_deref(),
                 confirm_overwrite.as_ref(),
+                *target,
             ),
             Screen::Tools {
                 entries,
@@ -476,357 +365,6 @@ impl App {
             .highlight_style(selected_style())
             .highlight_symbol("▌ ");
         frame.render_stateful_widget(list, area, &mut state);
-    }
-
-    fn render_agents(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        agents: &[AgentSummary],
-        selected: usize,
-        status: Option<&str>,
-        confirm_update_bundled: Option<&str>,
-    ) {
-        let header = format!(
-            "{:<20} {:<10} {:<14} {}",
-            "NAME", "MODE", "MODEL", "DESCRIPTION"
-        );
-        let mut items: Vec<ListItem> = Vec::new();
-        items.push(ListItem::new(Line::from(header.bold())));
-        for (idx, agent) in agents.iter().enumerate() {
-            let line = Line::from(format!(
-                "{:<20} {:<10} {:<14} {}",
-                truncate(&agent.name, 20),
-                truncate(agent.mode.as_str(), 10),
-                truncate(agent.model.as_deref().unwrap_or("(inherit)"), 14),
-                truncate(&agent.description, 60),
-            ));
-            let item = if idx == selected {
-                ListItem::new(line).style(selected_style())
-            } else {
-                ListItem::new(line)
-            };
-            items.push(item);
-        }
-        let list = List::new(items).block(panel("Agents"));
-        frame.render_widget(list, area);
-        // The update confirmation takes precedence over a transient status
-        // message: while the gate is armed, the screen should describe the
-        // pending action instead of any older notice.
-        if let Some(text) = confirm_update_bundled {
-            render_popup(frame, area, "Update bundled prompts?", text);
-        } else if let Some(text) = status {
-            render_popup(frame, area, "Notice", text);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_editor(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        draft: &AgentDraft,
-        field: EditorField,
-        mode: EditorMode,
-        status: Option<&str>,
-        confirm_discard: bool,
-    ) {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(5),
-                Constraint::Min(5),
-            ])
-            .split(area);
-        self.render_mode_bar(frame, rows[0], field, mode);
-        self.render_field_input(
-            frame,
-            rows[1],
-            "Name",
-            &draft.agent.name,
-            field == EditorField::Name,
-        );
-        self.render_field_input(
-            frame,
-            rows[2],
-            "Description",
-            &draft.agent.description,
-            field == EditorField::Description,
-        );
-        self.render_field_input(
-            frame,
-            rows[3],
-            "Mode",
-            draft.agent.mode.as_str(),
-            field == EditorField::Mode,
-        );
-        let model_text = draft.agent.model.as_deref().unwrap_or("(inherit)");
-        self.render_field_input(
-            frame,
-            rows[4],
-            "Model",
-            model_text,
-            field == EditorField::Model,
-        );
-
-        let prompt_block =
-            panel("Prompt").border_style(border_style_for(field == EditorField::Prompt));
-        let prompt = Paragraph::new(draft.prompt.as_str())
-            .block(prompt_block)
-            .wrap(Wrap { trim: false });
-        frame.render_widget(prompt, rows[5]);
-
-        self.render_permissions(frame, rows[6], &draft.permissions_view, field);
-
-        if confirm_discard {
-            render_popup(
-                frame,
-                area,
-                "Discard changes?",
-                "Unsaved changes will be lost. Press Esc again to discard, or any other key to cancel.",
-            );
-        }
-        if let Some(text) = status {
-            render_popup(frame, area, "Notice", text);
-        }
-    }
-
-    fn render_mode_bar(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        _field: EditorField,
-        mode: EditorMode,
-    ) {
-        // The footer is the sole shortcut reference. This row only keeps the
-        // current Vim-style mode visible while editing.
-        let line = Line::from(Span::styled(
-            format!(" {} ", mode.label()),
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ));
-        frame.render_widget(Paragraph::new(line), area);
-    }
-
-    fn render_field_input(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        title: &str,
-        value: &str,
-        active: bool,
-    ) {
-        let style = border_style_for(active);
-        let block = panel(title).border_style(style);
-        let paragraph = Paragraph::new(value).block(block);
-        frame.render_widget(paragraph, area);
-    }
-
-    fn render_permissions(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        view: &[(String, Option<PermissionAction>)],
-        field: EditorField,
-    ) {
-        let active = matches!(field, EditorField::Permissions(_));
-        let block = panel("Permissions").border_style(border_style_for(active));
-        let inner = block.inner(area);
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(
-                (0..view.len())
-                    .map(|_| Constraint::Length(1))
-                    .collect::<Vec<_>>(),
-            )
-            .split(inner);
-        let active_idx = match field {
-            EditorField::Permissions(idx) => Some(idx),
-            _ => None,
-        };
-        for (i, (key, value)) in view.iter().enumerate() {
-            let text = format!(
-                "{:<18} {}",
-                key,
-                value.map(|a| a.as_str()).unwrap_or("inherit")
-            );
-            let line = if active_idx == Some(i) {
-                Line::from(text).style(selected_style())
-            } else {
-                Line::from(text)
-            };
-            frame.render_widget(Paragraph::new(line), rows[i]);
-        }
-        frame.render_widget(block, area);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_model_picker(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        discovery: &Discovery,
-        manual: &str,
-        selected: usize,
-        manual_open: bool,
-        status: Option<&str>,
-    ) {
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(
-            Line::from(format!("Status · {}", discovery.status_text()))
-                .style(Style::default().fg(MUTED)),
-        );
-        lines.push(Line::from(""));
-        if let Discovery::Found(models) = discovery {
-            for (i, m) in models.iter().enumerate() {
-                let line = Line::from(format!("  {}", m));
-                lines.push(if i == selected {
-                    line.style(selected_style())
-                } else {
-                    line
-                });
-            }
-        }
-        let title = if manual_open {
-            "Model picker (manual)"
-        } else {
-            "Model picker"
-        };
-        let block = panel(title);
-        let para = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false });
-        frame.render_widget(para, area);
-
-        if manual_open {
-            let popup_area = centered_rect(60, 30, area);
-            let manual_lines = vec![
-                Line::from("Manual model (`provider/model`, blank = inherit). Tab to apply."),
-                Line::from(""),
-                Line::from(manual),
-            ];
-            let manual_block = panel("Manual model");
-            let manual_para = Paragraph::new(manual_lines)
-                .block(manual_block)
-                .wrap(Wrap { trim: false });
-            frame.render_widget(Clear, popup_area);
-            frame.render_widget(manual_para, popup_area);
-        }
-        if let Some(text) = status {
-            render_popup(frame, area, "Notice", text);
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_install_update(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        items: &[SyncItem],
-        selected: usize,
-        last_outcomes: &[ApplyOutcome],
-        status: Option<&str>,
-        confirm_overwrite: Option<&(SyncTarget, String)>,
-    ) {
-        let outcome_height = if last_outcomes.is_empty() { 0 } else { 8 };
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(5), Constraint::Length(outcome_height)])
-            .split(area);
-        let header = format!(
-            "{:<10} {:<22} {:<20} {}",
-            "target", "file", "status", "reason"
-        );
-        let mut list_items: Vec<ListItem> = Vec::new();
-        list_items.push(ListItem::new(Line::from(header.bold())));
-        for (idx, item) in items.iter().enumerate() {
-            let line = Line::from(format!(
-                "{:<10} {:<22} {:<20} {}",
-                item.target.label(),
-                truncate(&item.filename, 22),
-                item.status.label(),
-                truncate(&item.reason(), 50),
-            ));
-            let style = if idx == selected {
-                selected_style()
-            } else if matches!(item.status, SyncStatus::Conflict) {
-                Style::default().fg(DANGER)
-            } else if item.status.is_safe_action() {
-                Style::default().fg(SUCCESS)
-            } else {
-                Style::default()
-            };
-            list_items.push(ListItem::new(line).style(style));
-        }
-        let list = List::new(list_items).block(panel("Install / Update"));
-        frame.render_widget(list, chunks[0]);
-
-        if !last_outcomes.is_empty() {
-            let mut lines: Vec<Line> = Vec::new();
-            for outcome in last_outcomes {
-                let line = format!(
-                    "{}: {} ({})",
-                    outcome.filename, outcome.action, outcome.detail
-                );
-                let style = if outcome.ok {
-                    Style::default()
-                } else {
-                    Style::default().fg(DANGER)
-                };
-                lines.push(Line::from(line).style(style));
-            }
-            let block = panel("Last action");
-            frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
-        }
-        if let Some((_, filename)) = confirm_overwrite {
-            render_popup(
-                frame,
-                area,
-                "Overwrite?",
-                &format!(
-                    "Overwrite `{}` with current canonical? Press Y to confirm, N/Esc to cancel.",
-                    filename
-                ),
-            );
-        }
-        if let Some(text) = status {
-            render_popup(frame, area, "Notice", text);
-        }
-    }
-
-    fn render_plugin(
-        &self,
-        frame: &mut Frame,
-        area: Rect,
-        status: PluginStatus,
-        message: Option<&str>,
-        confirm_uninstall: bool,
-    ) {
-        let text = format!(
-            "OpenCode sidebar plugin\n\nStatus: {}\n\nShows each subagent task with its title, role, model, input-context tokens, and status.\n\nInstall/Update copies only agenthd-subagents.tsx into OpenCode's global plugins directory. Uninstall removes it only when its last-installed hash still matches.",
-            status.label()
-        );
-        let panel = Paragraph::new(text)
-            .block(panel("Subagent panel"))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(panel, area);
-        if confirm_uninstall {
-            render_popup(
-                frame,
-                area,
-                "Uninstall subagent panel?",
-                "Remove the agenthd-owned OpenCode plugin? Press Y to confirm, N/Esc to cancel.",
-            );
-        } else if let Some(text) = message {
-            render_popup(frame, area, "Notice", text);
-        }
     }
 
     /// Render the optional status line above the footer. Always occupies its
@@ -921,13 +459,22 @@ impl App {
                 }
             }
             Screen::InstallUpdate {
-                confirm_overwrite, ..
+                confirm_overwrite,
+                target,
+                ..
             } => {
                 if confirm_overwrite.is_some() {
                     return "Y: overwrite · N / Esc: cancel".to_string();
                 }
-                "↑/↓ or j/k: select · i: install safe · o: overwrite conflict · r: refresh · Esc: back"
-                    .to_string()
+                match target {
+                    None => {
+                        "↑/↓ or j/k: pick harness · Enter: open · Esc: back".to_string()
+                    }
+                    Some(t) => format!(
+                        "{} · ↑/↓ or j/k: select · i: install safe · o: overwrite conflict · r: refresh · Esc: harness",
+                        t.label()
+                    ),
+                }
             }
             Screen::Tools { installing, .. } => {
                 if *installing {
@@ -1004,1216 +551,10 @@ impl App {
             }
         }
     }
-
-    fn open_agents(&mut self) {
-        match load_canonical(&self.paths) {
-            Ok(map) => {
-                let mut agents: Vec<AgentSummary> = map
-                    .into_values()
-                    .map(|(a, _)| AgentSummary {
-                        name: a.name,
-                        description: a.description,
-                        mode: a.mode,
-                        model: a.model,
-                    })
-                    .collect();
-                agents.sort_by(|a, b| a.name.cmp(&b.name));
-                self.pending_delete = PendingDelete::default();
-                self.status_bar = None;
-                self.screen = Screen::Agents {
-                    agents,
-                    selected: 0,
-                    status: None,
-                    confirm_update_bundled: None,
-                };
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn open_install_update(&mut self) {
-        self.refresh_install_update();
-    }
-
-    fn open_plugin(&mut self) {
-        self.refresh_plugin();
-    }
-
-    fn refresh_plugin(&mut self) {
-        match State::load(&self.paths.state_file).and_then(|state| {
-            let status = plugin_status(&self.paths, &state)?;
-            Ok((state, status))
-        }) {
-            Ok((state, status)) => {
-                self.state = state;
-                self.status_bar = None;
-                self.screen = Screen::Plugin {
-                    status,
-                    message: None,
-                    confirm_uninstall: false,
-                };
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn refresh_install_update(&mut self) {
-        let state = match State::load(&self.paths.state_file) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status_bar = Some(format!("error: {}", e));
-                return;
-            }
-        };
-        self.state = state;
-        match compute_plan(&self.paths, &self.state) {
-            Ok(items) => {
-                let len = items.len();
-                let (selected, outcomes) = if let Screen::InstallUpdate {
-                    selected,
-                    last_outcomes,
-                    ..
-                } = &self.screen
-                {
-                    (*selected, last_outcomes.clone())
-                } else {
-                    (0, Vec::new())
-                };
-                self.status_bar = None;
-                self.screen = Screen::InstallUpdate {
-                    items,
-                    selected: if len == 0 { 0 } else { selected.min(len - 1) },
-                    last_outcomes: outcomes,
-                    status: None,
-                    confirm_overwrite: None,
-                };
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn handle_agents_key(&mut self, key: KeyEvent, paths: &Paths) {
-        enum Op {
-            Pop,
-            Move(i32),
-            New,
-            Edit(AgentSummary),
-            ArmDelete(String),
-            ConfirmDelete(String),
-            ArmUpdateBundled,
-            ConfirmUpdateBundled,
-            CancelUpdateBundled,
-        }
-        let op = {
-            if let Screen::Agents {
-                agents,
-                ref mut selected,
-                confirm_update_bundled,
-                ..
-            } = &mut self.screen
-            {
-                // When the bundled-update confirmation is armed, only Y/N/Esc
-                // are valid. Any other key is a no-op so users cannot
-                // accidentally navigate or trigger destructive actions while
-                // the gate is up.
-                if confirm_update_bundled.is_some() {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => Op::ConfirmUpdateBundled,
-                        KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                            Op::CancelUpdateBundled
-                        }
-                        _ => return,
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Esc => Op::Pop,
-                        KeyCode::Up | KeyCode::Char('k') => Op::Move(-1),
-                        KeyCode::Down | KeyCode::Char('j') => Op::Move(1),
-                        KeyCode::Char('n') => Op::New,
-                        KeyCode::Char('u') => Op::ArmUpdateBundled,
-                        KeyCode::Enter | KeyCode::Char('e') => {
-                            if let Some(agent) = agents.get(*selected) {
-                                Op::Edit(agent.clone())
-                            } else {
-                                return;
-                            }
-                        }
-                        KeyCode::Char('d') => {
-                            if let Some(agent) = agents.get(*selected) {
-                                let name = agent.name.clone();
-                                if self.pending_delete.name.as_deref() == Some(name.as_str()) {
-                                    Op::ConfirmDelete(name)
-                                } else {
-                                    Op::ArmDelete(name)
-                                }
-                            } else {
-                                return;
-                            }
-                        }
-                        _ => return,
-                    }
-                }
-            } else {
-                return;
-            }
-        };
-        match op {
-            Op::Pop => {
-                self.screen = Screen::Main { selected: 0 };
-                self.status_bar = None;
-                self.pending_delete = PendingDelete::default();
-            }
-            Op::Move(delta) => {
-                if let Screen::Agents {
-                    agents,
-                    selected,
-                    status,
-                    confirm_update_bundled,
-                } = &mut self.screen
-                {
-                    if agents.is_empty() {
-                        return;
-                    }
-                    if delta < 0 {
-                        *selected = selected.saturating_sub(1);
-                    } else if *selected + 1 < agents.len() {
-                        *selected += 1;
-                    }
-                    *status = None;
-                    *confirm_update_bundled = None;
-                }
-                self.pending_delete = PendingDelete::default();
-            }
-            Op::New => self.open_editor_new(),
-            Op::Edit(summary) => self.open_editor_existing(&summary),
-            Op::ArmDelete(name) => {
-                self.pending_delete = PendingDelete {
-                    name: Some(name.clone()),
-                };
-                let msg = format!("Press `d` again to delete `{}`.", name);
-                if let Screen::Agents { status, .. } = &mut self.screen {
-                    *status = Some(msg.clone());
-                }
-                self.status_bar = Some(msg);
-            }
-            Op::ConfirmDelete(name) => {
-                self.pending_delete = PendingDelete::default();
-                self.delete_agent(&name);
-            }
-            Op::ArmUpdateBundled => {
-                let msg = "Refresh the prompt body of every bundled canonical agent? Description, mode, model, and permissions are preserved. Y to confirm, N/Esc to cancel.".to_string();
-                if let Screen::Agents {
-                    confirm_update_bundled,
-                    ..
-                } = &mut self.screen
-                {
-                    *confirm_update_bundled = Some(msg);
-                }
-                // Suppress any prior transient status so the popup is the
-                // only thing the screen communicates about this action.
-                self.status_bar = None;
-                self.pending_delete = PendingDelete::default();
-            }
-            Op::ConfirmUpdateBundled => {
-                // Drop the gate before doing the work: the function call may
-                // touch disk and we do not want the popup still armed while
-                // results are reported. If it fails (very unlikely; only on
-                // directory-level errors), restore it so the user can retry
-                // or cancel cleanly.
-                if let Screen::Agents {
-                    confirm_update_bundled,
-                    ..
-                } = &mut self.screen
-                {
-                    *confirm_update_bundled = None;
-                }
-                self.apply_update_bundled(paths);
-            }
-            Op::CancelUpdateBundled => {
-                if let Screen::Agents {
-                    confirm_update_bundled,
-                    ..
-                } = &mut self.screen
-                {
-                    *confirm_update_bundled = None;
-                }
-                self.status_bar = Some("update bundled prompts cancelled".to_string());
-                self.pending_delete = PendingDelete::default();
-            }
-        }
-    }
-
-    fn open_editor_new(&mut self) {
-        let suggested = self.next_agent_name();
-        match Agent::new_default(suggested.clone()) {
-            Ok(agent) => {
-                self.pending_delete = PendingDelete::default();
-                self.status_bar = None;
-                self.editor_draft = Some(AgentDraft::from_agent(agent));
-                self.editor_original_name = None;
-                self.editor_prior_hash = None;
-                self.screen = Screen::Editor {
-                    field: EditorField::Name,
-                    mode: EditorMode::Normal,
-                    status: None,
-                    confirm_discard: false,
-                };
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn open_editor_existing(&mut self, summary: &AgentSummary) {
-        let path = self
-            .paths
-            .canonical_dir
-            .join(format!("{}.md", summary.name));
-        let prior_hash = crate::store::hash_file(&path).unwrap_or(None);
-        match Agent::read(&path) {
-            Ok(agent) => {
-                self.editor_original_name = Some(agent.name.clone());
-                self.editor_draft = Some(AgentDraft::from_agent(agent));
-                self.editor_prior_hash = prior_hash;
-                self.pending_delete = PendingDelete::default();
-                self.status_bar = None;
-                self.screen = Screen::Editor {
-                    field: EditorField::Name,
-                    mode: EditorMode::Normal,
-                    status: None,
-                    confirm_discard: false,
-                };
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn next_agent_name(&self) -> String {
-        let map = load_canonical(&self.paths).unwrap_or_default();
-        for i in 1..1000 {
-            let candidate = format!("agent-{}", i);
-            if !map.contains_key(&candidate) {
-                return candidate;
-            }
-        }
-        "agent".to_string()
-    }
-
-    fn delete_agent(&mut self, name: &str) {
-        match delete_canonical(&self.paths, name) {
-            Ok(()) => {
-                self.status_bar = Some(format!("deleted canonical `{}`", name));
-                self.open_agents();
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    /// Refresh the prompt body of every bundled canonical agent that
-    /// currently exists. Called after the Agents screen's `u` gate is
-    /// confirmed with `y`. Reports per-file outcomes via the status bar
-    /// so the user sees what changed and what was skipped.
-    ///
-    /// `paths` is the snapshot of `self.paths` taken at the top of
-    /// `handle_key`; using the snapshot avoids re-borrowing `self` while the
-    /// status bar is being updated below.
-    fn apply_update_bundled(&mut self, paths: &Paths) {
-        match update_bundled_prompts(paths) {
-            Ok(outcomes) => {
-                self.status_bar = Some(format_update_bundled_status(&outcomes));
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn handle_editor_key(&mut self, key: KeyEvent, paths: &Paths) {
-        // First-Esc-of-dirty edit: confirm-discard popup is active.
-        let in_confirm = matches!(
-            self.screen,
-            Screen::Editor {
-                confirm_discard: true,
-                ..
-            }
-        );
-        if in_confirm {
-            if key.code == KeyCode::Esc {
-                self.apply_editor_op(EditorOp::Discard);
-            } else if let Screen::Editor {
-                confirm_discard, ..
-            } = &mut self.screen
-            {
-                *confirm_discard = false;
-            }
-            return;
-        }
-
-        // Snapshot the active mode and field. INSERT is only reachable from
-        // NORMAL via `i` on a text field, and we restore the editor in
-        // NORMAL after every model-picker round-trip, so these snapshots
-        // always describe a consistent editor state.
-        let (mode, field) = match &self.screen {
-            Screen::Editor { mode, field, .. } => (*mode, *field),
-            _ => unreachable!("handle_editor_key called outside the editor"),
-        };
-
-        if mode == EditorMode::Insert {
-            self.handle_editor_key_insert(key, field);
-            return;
-        }
-
-        // NORMAL: every action returns early so unrecognized keys can never
-        // reach `edit_text_field`. The only free-text path is INSERT, via
-        // `handle_editor_key_insert` above.
-        match key.code {
-            KeyCode::Esc => {
-                self.editor_esc_or_discard(paths);
-                return;
-            }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.editor_try_save();
-                return;
-            }
-            KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.editor_esc_or_discard(paths);
-                return;
-            }
-            KeyCode::Char('w') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.editor_try_save();
-                return;
-            }
-            KeyCode::Char('i') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if field.accepts_insert() {
-                    if let Screen::Editor { mode, .. } = &mut self.screen {
-                        *mode = EditorMode::Insert;
-                    }
-                }
-                return;
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let perm_len = self
-                    .editor_draft
-                    .as_ref()
-                    .map(|d| d.permissions_view.len())
-                    .unwrap_or(0);
-                if let Screen::Editor { field, .. } = &mut self.screen {
-                    prev_field(field, perm_len);
-                }
-                return;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let perm_len = self
-                    .editor_draft
-                    .as_ref()
-                    .map(|d| d.permissions_view.len())
-                    .unwrap_or(0);
-                if let Screen::Editor { field, .. } = &mut self.screen {
-                    next_field(field, perm_len);
-                }
-                return;
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.editor_apply_horizontal(field, true);
-                return;
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.editor_apply_horizontal(field, false);
-                return;
-            }
-            _ => {}
-        }
-
-        // Field-local NORMAL actions that depend on which field is active:
-        // Enter on Model opens the picker; Tab/BackTab step between the
-        // Prompt and the permission list; Space on a permission row cycles
-        // the value. Each branch returns; there is no fall-through to
-        // `edit_text_field`, so any other printable key is a no-op here.
-        match field {
-            EditorField::Model => {
-                if key.code == KeyCode::Enter {
-                    let model = self
-                        .editor_draft
-                        .as_ref()
-                        .expect("editor screen implies draft")
-                        .agent
-                        .model
-                        .clone();
-                    self.open_model_picker(model);
-                }
-            }
-            EditorField::Prompt => {
-                if key.code == KeyCode::Char('e') {
-                    self.edit_prompt_in_system_editor();
-                } else if key.code == KeyCode::Tab || key.code == KeyCode::BackTab {
-                    let mut field = EditorField::Prompt;
-                    let perm_len = self
-                        .editor_draft
-                        .as_ref()
-                        .map(|d| d.permissions_view.len())
-                        .unwrap_or(0);
-                    if key.code == KeyCode::Tab {
-                        next_field(&mut field, perm_len);
-                    } else {
-                        prev_field(&mut field, perm_len);
-                    }
-                    if let Screen::Editor { field: slot, .. } = &mut self.screen {
-                        *slot = field;
-                    }
-                }
-                // All other keys in NORMAL on Prompt are explicit no-ops.
-            }
-            EditorField::Name | EditorField::Description => {
-                // NORMAL never mutates text on Name or Description. INSERT
-                // is the only path that calls `edit_text_field`.
-            }
-            EditorField::Permissions(idx) => match key.code {
-                KeyCode::Tab | KeyCode::BackTab => {
-                    let mut field = EditorField::Permissions(idx);
-                    let perm_len = self
-                        .editor_draft
-                        .as_ref()
-                        .map(|d| d.permissions_view.len())
-                        .unwrap_or(0);
-                    if key.code == KeyCode::Tab {
-                        next_field(&mut field, perm_len);
-                    } else {
-                        prev_field(&mut field, perm_len);
-                    }
-                    if let Screen::Editor { field: slot, .. } = &mut self.screen {
-                        *slot = field;
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    let mut draft = self
-                        .editor_draft
-                        .take()
-                        .expect("editor screen implies draft");
-                    let (_, value) = &mut draft.permissions_view[idx];
-                    *value = match value {
-                        None => Some(PermissionAction::Allow),
-                        Some(PermissionAction::Allow) => Some(PermissionAction::Ask),
-                        Some(PermissionAction::Ask) => Some(PermissionAction::Deny),
-                        Some(PermissionAction::Deny) => None,
-                    };
-                    self.editor_draft = Some(draft);
-                }
-                _ => {}
-            },
-            EditorField::Mode => {
-                // Already handled above via editor_apply_horizontal (h/l/Left/Right).
-            }
-        }
-    }
-
-    /// Open the full prompt in the user's editor and replace the draft only
-    /// after that editor exits successfully.
-    fn edit_prompt_in_system_editor(&mut self) {
-        let prompt = self
-            .editor_draft
-            .as_ref()
-            .expect("editor screen implies draft")
-            .prompt
-            .clone();
-        match edit_prompt_externally(&prompt) {
-            Ok(edited) => {
-                self.editor_draft
-                    .as_mut()
-                    .expect("editor screen implies draft")
-                    .prompt = edited;
-                self.status_bar = Some("prompt returned from system editor".to_string());
-            }
-            Err(e) => self.status_bar = Some(format!("error: prompt editor: {}", e)),
-        }
-    }
-
-    /// Apply a Left/Right (or h/l) keypress: cycle Mode on the Mode field,
-    /// step between permission rows on the Permissions field, no-op on the
-    /// remaining fields. `back` selects `prev`/decrement; otherwise `next`/
-    /// increment.
-    fn editor_apply_horizontal(&mut self, field: EditorField, back: bool) {
-        match field {
-            EditorField::Mode => {
-                let mut draft = self
-                    .editor_draft
-                    .take()
-                    .expect("editor screen implies draft");
-                draft.agent.mode = if back {
-                    draft.agent.mode.prev()
-                } else {
-                    draft.agent.mode.next()
-                };
-                self.editor_draft = Some(draft);
-            }
-            EditorField::Permissions(idx) => {
-                let len = self
-                    .editor_draft
-                    .as_ref()
-                    .map(|d| d.permissions_view.len())
-                    .unwrap_or(0);
-                if back {
-                    if idx > 0 {
-                        if let Screen::Editor { field, .. } = &mut self.screen {
-                            *field = EditorField::Permissions(idx - 1);
-                        }
-                    }
-                } else if idx + 1 < len {
-                    if let Screen::Editor { field, .. } = &mut self.screen {
-                        *field = EditorField::Permissions(idx + 1);
-                    }
-                }
-            }
-            _ => {
-                // Name, Description, Model, Prompt: explicit no-op so
-                // h/l never leak into the text buffer.
-            }
-        }
-    }
-
-    /// INSERT-mode key handler: only character keys (including q, w, h, j,
-    /// k, l), Backspace, and Esc reach here. Esc returns to NORMAL without
-    /// touching the dirty flag; character keys append to the active text
-    /// field. All other keys are ignored so navigation, save, and quit
-    /// commands can never consume text in INSERT mode.
-    fn handle_editor_key_insert(&mut self, key: KeyEvent, field: EditorField) {
-        if key.code == KeyCode::Esc {
-            if let Screen::Editor { mode, .. } = &mut self.screen {
-                *mode = EditorMode::Normal;
-            }
-            return;
-        }
-        if !field.accepts_insert() {
-            // Defensive: `i` is only honored on text fields, but if INSERT
-            // is somehow active on a non-text field, swallow all keys rather
-            // than mutate values that don't take free-form text.
-            return;
-        }
-        let mut draft = self
-            .editor_draft
-            .take()
-            .expect("editor screen implies draft");
-        match field {
-            EditorField::Name => edit_text_field(key, &mut draft.agent.name),
-            EditorField::Description => edit_text_field(key, &mut draft.agent.description),
-            EditorField::Prompt => edit_text_field(key, &mut draft.prompt),
-            _ => {}
-        }
-        self.editor_draft = Some(draft);
-    }
-
-    /// Esc-in-NORMAL and `q`-in-NORMAL share the existing dirty-confirm
-    /// behavior: clean draft discards immediately, dirty draft arms the
-    /// confirmation popup.
-    fn editor_esc_or_discard(&mut self, paths: &Paths) {
-        let dirty = {
-            let draft = self
-                .editor_draft
-                .as_ref()
-                .expect("editor screen implies draft");
-            let original_agent = self.editor_original_name.as_ref().and_then(|name| {
-                Agent::read(&paths.canonical_dir.join(format!("{}.md", name))).ok()
-            });
-            draft.is_dirty(original_agent.as_ref())
-        };
-        if dirty {
-            if let Screen::Editor {
-                confirm_discard, ..
-            } = &mut self.screen
-            {
-                *confirm_discard = true;
-            }
-            self.apply_editor_op(EditorOp::RequestDiscard);
-        } else {
-            self.apply_editor_op(EditorOp::Discard);
-        }
-    }
-
-    /// Ctrl+S and `w`-in-NORMAL share the same validate-and-save path. On a
-    /// validation failure the editor state stays intact and the error is
-    /// surfaced through the status bar.
-    fn editor_try_save(&mut self) {
-        let op = {
-            let draft = self
-                .editor_draft
-                .as_ref()
-                .expect("editor screen implies draft");
-            match draft.validate() {
-                Ok(()) => EditorOp::Save {
-                    original_name: self.editor_original_name.clone(),
-                    material: draft.materialize(),
-                },
-                Err(e) => {
-                    self.status_bar = Some(format!("error: {}", e));
-                    return;
-                }
-            }
-        };
-        self.apply_editor_op(op);
-    }
-
-    fn apply_editor_op(&mut self, op: EditorOp) {
-        match op {
-            EditorOp::Discard => {
-                self.editor_draft = None;
-                self.editor_original_name = None;
-                self.editor_prior_hash = None;
-                self.open_agents();
-            }
-            EditorOp::RequestDiscard => {
-                self.status_bar = Some("Unsaved changes. Press Esc again to discard.".to_string());
-            }
-            EditorOp::Save {
-                original_name,
-                material,
-            } => {
-                // Clone, don't take: a failed save must leave the editor state
-                // intact so the user can fix the conflict and retry without
-                // re-opening.
-                let prior_hash = self.editor_prior_hash.clone();
-                match save_agent(&self.paths, original_name.clone(), prior_hash, material) {
-                    Ok(name) => {
-                        self.status_bar = Some(format!("saved `{}`", name));
-                        self.editor_draft = None;
-                        self.editor_original_name = None;
-                        self.editor_prior_hash = None;
-                        self.open_agents();
-                    }
-                    Err(e) => {
-                        self.status_bar = Some(format!("error: {}", e));
-                    }
-                }
-            }
-        }
-    }
-
-    fn open_model_picker(&mut self, current: Option<String>) {
-        let discovery = models::discover_models();
-        let manual = current.unwrap_or_default();
-        self.status_bar = None;
-        self.screen = Screen::ModelPicker {
-            discovery,
-            manual,
-            selected: 0,
-            manual_open: false,
-            status: None,
-        };
-    }
-
-    fn handle_model_picker_key(&mut self, key: KeyEvent) {
-        enum Action {
-            Cancel,
-            Refresh,
-            ApplyDiscovered(String),
-            ApplyManual(String),
-            Type(char),
-            Backspace,
-            ToggleManual,
-            None,
-        }
-        let action = {
-            if let Screen::ModelPicker {
-                discovery,
-                manual,
-                selected,
-                manual_open,
-                status,
-                ..
-            } = &mut self.screen
-            {
-                match key.code {
-                    KeyCode::Esc => {
-                        if *manual_open {
-                            *manual_open = false;
-                            Action::None
-                        } else {
-                            Action::Cancel
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if let Discovery::Found(models) = discovery {
-                            if *selected > 0 {
-                                *selected -= 1;
-                            }
-                            let _ = models;
-                        }
-                        Action::None
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if let Discovery::Found(models) = discovery {
-                            if *selected + 1 < models.len() {
-                                *selected += 1;
-                            }
-                        }
-                        Action::None
-                    }
-                    KeyCode::Enter => {
-                        if let Discovery::Found(models) = discovery {
-                            if let Some(model) = models.get(*selected).cloned() {
-                                Action::ApplyDiscovered(model)
-                            } else {
-                                Action::ApplyManual(manual.clone())
-                            }
-                        } else {
-                            Action::ApplyManual(manual.clone())
-                        }
-                    }
-                    KeyCode::Char('r') => {
-                        *discovery = models::discover_models();
-                        *selected = 0;
-                        *status = Some("refreshed".to_string());
-                        Action::Refresh
-                    }
-                    KeyCode::Char('m') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        Action::ToggleManual
-                    }
-                    KeyCode::Tab if *manual_open => Action::ApplyManual(manual.clone()),
-                    KeyCode::Backspace if *manual_open => Action::Backspace,
-                    KeyCode::Char(c)
-                        if *manual_open && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        Action::Type(c)
-                    }
-                    _ => Action::None,
-                }
-            } else {
-                Action::None
-            }
-        };
-        match action {
-            Action::ApplyDiscovered(value) => self.apply_model_value(Some(value)),
-            Action::ApplyManual(manual) => self.apply_manual_model(&manual),
-            Action::Cancel => self.cancel_model_picker(),
-            Action::Refresh => {}
-            Action::ToggleManual => {
-                if let Screen::ModelPicker { manual_open, .. } = &mut self.screen {
-                    *manual_open = !*manual_open;
-                }
-            }
-            Action::Type(c) => {
-                if let Screen::ModelPicker { manual, .. } = &mut self.screen {
-                    manual.push(c);
-                }
-            }
-            Action::Backspace => {
-                if let Screen::ModelPicker { manual, .. } = &mut self.screen {
-                    manual.pop();
-                }
-            }
-            Action::None => {}
-        }
-    }
-
-    fn cancel_model_picker(&mut self) {
-        if !self.has_editor_draft() {
-            // No draft to return to — drop straight to main so the user is
-            // never trapped in the picker.
-            self.screen = Screen::Main { selected: 0 };
-            return;
-        }
-        self.restore_editor_screen(None);
-    }
-
-    fn apply_manual_model(&mut self, manual: &str) {
-        let value = if manual.trim().is_empty() {
-            None
-        } else {
-            Some(manual.trim().to_string())
-        };
-        self.apply_model_value(value);
-    }
-
-    fn apply_model_value(&mut self, value: Option<String>) {
-        if let Err(e) = Agent::validate_model_opt(&value) {
-            self.status_bar = Some(format!("error: {}", e));
-            return;
-        }
-        let draft = match self.editor_draft.as_mut() {
-            Some(d) => d,
-            None => {
-                self.status_bar = Some("error: no editor draft to update".to_string());
-                self.screen = Screen::Main { selected: 0 };
-                return;
-            }
-        };
-        draft.agent.model = value.clone();
-        self.status_bar = Some(match &value {
-            Some(v) => format!("model set to `{}`", v),
-            None => "model cleared (inherit)".to_string(),
-        });
-        self.restore_editor_screen(self.status_bar.clone());
-    }
-
-    fn handle_install_update_key(&mut self, key: KeyEvent) {
-        enum Op {
-            ConfirmForce(SyncTarget, String),
-            CancelConfirm,
-            Refresh,
-            Install,
-            BeginForce(SyncItem),
-            MoveSelection(i32),
-            PopToMain,
-            MarkNonConflict(String),
-        }
-        let op: Op;
-        if let Screen::InstallUpdate {
-            items,
-            selected,
-            confirm_overwrite,
-            ..
-        } = &mut self.screen
-        {
-            if confirm_overwrite.is_some() {
-                match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        let (target, filename) = confirm_overwrite.take().unwrap();
-                        op = Op::ConfirmForce(target, filename);
-                    }
-                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                        *confirm_overwrite = None;
-                        op = Op::CancelConfirm;
-                    }
-                    _ => return,
-                }
-            } else {
-                op = match key.code {
-                    KeyCode::Esc => Op::PopToMain,
-                    KeyCode::Up | KeyCode::Char('k') => Op::MoveSelection(-1),
-                    KeyCode::Down | KeyCode::Char('j') => Op::MoveSelection(1),
-                    KeyCode::Char('r') => Op::Refresh,
-                    KeyCode::Char('i') => Op::Install,
-                    KeyCode::Char('o') => {
-                        if let Some(item) = items.get(*selected) {
-                            if matches!(item.status, SyncStatus::Conflict) {
-                                Op::BeginForce(item.clone())
-                            } else {
-                                Op::MarkNonConflict(item.filename.clone())
-                            }
-                        } else {
-                            return;
-                        }
-                    }
-                    _ => return,
-                };
-            }
-        } else {
-            return;
-        }
-        match op {
-            Op::ConfirmForce(target, filename) => self.force_overwrite(target, &filename),
-            Op::CancelConfirm => self.status_bar = Some("overwrite cancelled".to_string()),
-            Op::Refresh => self.refresh_install_update(),
-            Op::Install => self.apply_safe_install(),
-            Op::BeginForce(item) => {
-                if let Screen::InstallUpdate {
-                    confirm_overwrite, ..
-                } = &mut self.screen
-                {
-                    *confirm_overwrite = Some((item.target, item.filename));
-                }
-            }
-            Op::MoveSelection(delta) => {
-                if let Screen::InstallUpdate {
-                    items, selected, ..
-                } = &mut self.screen
-                {
-                    if items.is_empty() {
-                        return;
-                    }
-                    if delta < 0 {
-                        *selected = selected.saturating_sub(1);
-                    } else if *selected + 1 < items.len() {
-                        *selected += 1;
-                    }
-                }
-            }
-            Op::PopToMain => {
-                self.screen = Screen::Main { selected: 0 };
-                self.status_bar = None;
-            }
-            Op::MarkNonConflict(name) => {
-                if let Screen::InstallUpdate { status, .. } = &mut self.screen {
-                    *status = Some(format!("`{}` is not a conflict", name));
-                }
-            }
-        }
-    }
-
-    fn apply_safe_install(&mut self) {
-        let state = match State::load(&self.paths.state_file) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status_bar = Some(format!("error: {}", e));
-                return;
-            }
-        };
-        self.state = state;
-        // Fail closed: every canonical must parse cleanly.
-        if let Err(e) = load_canonical(&self.paths) {
-            self.status_bar = Some(format!("error: {}", e));
-            return;
-        }
-        let plan = match compute_plan(&self.paths, &self.state) {
-            Ok(p) => p,
-            Err(e) => {
-                self.status_bar = Some(format!("error: {}", e));
-                return;
-            }
-        };
-        match apply_safe(&self.paths, self.state.clone(), plan) {
-            Ok((state, outcomes)) => {
-                self.state = state;
-                let succeeded: usize = outcomes.iter().filter(|o| o.ok).count();
-                let failed: usize = outcomes.iter().filter(|o| !o.ok).count();
-                if let Screen::InstallUpdate {
-                    last_outcomes,
-                    status,
-                    ..
-                } = &mut self.screen
-                {
-                    *last_outcomes = outcomes;
-                    *status = Some(format!("safe install: {} ok, {} failed", succeeded, failed));
-                }
-                self.status_bar =
-                    Some(format!("safe install: {} ok, {} failed", succeeded, failed));
-                self.refresh_install_update();
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn handle_plugin_key(&mut self, key: KeyEvent) {
-        let confirmed = matches!(
-            self.screen,
-            Screen::Plugin {
-                confirm_uninstall: true,
-                ..
-            }
-        );
-        if confirmed {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => self.uninstall_plugin(),
-                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                    if let Screen::Plugin {
-                        confirm_uninstall, ..
-                    } = &mut self.screen
-                    {
-                        *confirm_uninstall = false;
-                    }
-                    self.status_bar = Some("plugin uninstall cancelled".to_string());
-                }
-                _ => {}
-            }
-            return;
-        }
-        match key.code {
-            KeyCode::Esc => {
-                self.screen = Screen::Main { selected: 0 };
-                self.status_bar = None;
-            }
-            KeyCode::Char('r') => self.refresh_plugin(),
-            KeyCode::Char('i') => self.install_plugin(),
-            KeyCode::Char('u') => {
-                if let Screen::Plugin {
-                    confirm_uninstall, ..
-                } = &mut self.screen
-                {
-                    *confirm_uninstall = true;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn install_plugin(&mut self) {
-        let state = match State::load(&self.paths.state_file) {
-            Ok(state) => state,
-            Err(e) => {
-                self.status_bar = Some(format!("error: {}", e));
-                return;
-            }
-        };
-        match install_plugin_file(&self.paths, state) {
-            Ok((state, prior_status)) => {
-                self.state = state;
-                let message = format!("plugin {}", prior_status.label());
-                self.refresh_plugin();
-                if let Screen::Plugin { message: slot, .. } = &mut self.screen {
-                    *slot = Some(message);
-                }
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn uninstall_plugin(&mut self) {
-        let state = match State::load(&self.paths.state_file) {
-            Ok(state) => state,
-            Err(e) => {
-                self.status_bar = Some(format!("error: {}", e));
-                return;
-            }
-        };
-        match uninstall_plugin_file(&self.paths, state) {
-            Ok(state) => {
-                self.state = state;
-                self.refresh_plugin();
-                if let Screen::Plugin { message, .. } = &mut self.screen {
-                    *message = Some("plugin uninstalled".to_string());
-                }
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
-
-    fn force_overwrite(&mut self, target: SyncTarget, filename: &str) {
-        let state = match State::load(&self.paths.state_file) {
-            Ok(s) => s,
-            Err(e) => {
-                self.status_bar = Some(format!("error: {}", e));
-                return;
-            }
-        };
-        self.state = state;
-        match force_install(&self.paths, self.state.clone(), target, filename) {
-            Ok((state, outcome)) => {
-                self.state = state;
-                if let Screen::InstallUpdate {
-                    last_outcomes,
-                    status,
-                    ..
-                } = &mut self.screen
-                {
-                    last_outcomes.push(outcome.clone());
-                    *status = Some(format!("{}: {}", outcome.filename, outcome.action));
-                }
-                self.status_bar =
-                    Some(format!("force installed {} `{}`", target.label(), filename));
-                self.refresh_install_update();
-            }
-            Err(e) => self.status_bar = Some(format!("error: {}", e)),
-        }
-    }
 }
 
-/// Save an agent, performing a rename first if the name changed.
-///
-/// `prior_hash` is the SHA-256 captured when the editor opened the canonical
-/// file (or `None` for a new agent). It is passed straight through to
-/// `save_canonical` so an external edit made between open and save is
-/// rejected. Recomputing it here would defeat the check.
-fn save_agent(
-    paths: &Paths,
-    original_name: Option<String>,
-    prior_hash: Option<String>,
-    material: Agent,
-) -> Result<String> {
-    let target_name = material.name.clone();
-    let needs_rename = original_name
-        .as_ref()
-        .map(|o| o != &target_name)
-        .unwrap_or(false);
-    if needs_rename {
-        let old = original_name.clone().unwrap();
-        let source_path = paths.canonical_dir.join(format!("{}.md", old));
-        let current_hash = crate::store::hash_file(&source_path)?;
-        if current_hash.as_deref() != prior_hash.as_deref() {
-            bail!(
-                "`{}` changed on disk since this edit started; reload to pick up the latest version",
-                source_path.display()
-            );
-        }
-        rename_canonical(paths, &old, &target_name).map_err(|e| anyhow!("rename: {}", e))?;
-    }
-    save_canonical(paths, &material, prior_hash.as_deref()).map_err(|e| anyhow!("save: {}", e))?;
-    Ok(target_name)
-}
-
-fn edit_prompt_externally(prompt: &str) -> Result<String> {
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "agenthd-prompt-{}-{}.md",
-        std::process::id(),
-        stamp
-    ));
-    let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| anyhow!("create temporary file: {}", e))?;
-        file.write_all(prompt.as_bytes())
-            .map_err(|e| anyhow!("write temporary file: {}", e))?;
-        drop(file);
-
-        let editor = std::env::var_os("VISUAL")
-            .or_else(|| std::env::var_os("EDITOR"))
-            .unwrap_or_else(|| {
-                if cfg!(windows) {
-                    "notepad.exe".into()
-                } else {
-                    "vi".into()
-                }
-            });
-        let status = Command::new(editor)
-            .arg(&path)
-            .status()
-            .map_err(|e| anyhow!("start editor: {}", e))?;
-        if !status.success() {
-            return Err(anyhow!("editor exited with {}", status));
-        }
-        fs::read_to_string(&path).map_err(|e| anyhow!("read edited prompt: {}", e))
-    })();
-    let _ = fs::remove_file(&path);
-    result
-}
-
-fn edit_text_field(key: KeyEvent, value: &mut String) {
-    match key.code {
-        KeyCode::Backspace => {
-            value.pop();
-        }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            value.push(c);
-        }
-        _ => {}
-    }
-}
-
-fn next_field(field: &mut EditorField, perm_len: usize) {
-    *field = match *field {
-        EditorField::Name => EditorField::Description,
-        EditorField::Description => EditorField::Mode,
-        EditorField::Mode => EditorField::Model,
-        EditorField::Model => EditorField::Prompt,
-        EditorField::Prompt => EditorField::Permissions(0),
-        EditorField::Permissions(idx) => {
-            if idx + 1 < perm_len {
-                EditorField::Permissions(idx + 1)
-            } else {
-                EditorField::Name
-            }
-        }
-    };
-}
-
-fn prev_field(field: &mut EditorField, perm_len: usize) {
-    *field = match *field {
-        EditorField::Name => {
-            if perm_len == 0 {
-                EditorField::Name
-            } else {
-                EditorField::Permissions(perm_len - 1)
-            }
-        }
-        EditorField::Description => EditorField::Name,
-        EditorField::Mode => EditorField::Description,
-        EditorField::Model => EditorField::Mode,
-        EditorField::Prompt => EditorField::Model,
-        EditorField::Permissions(0) => EditorField::Prompt,
-        EditorField::Permissions(idx) => EditorField::Permissions(idx - 1),
-    };
-}
-
+/// Shared visual helpers used by every screen: panel chrome, border,
+/// title, selection, and status color styling.
 fn panel(title: &str) -> Block<'static> {
     Block::default()
         .title(Line::from(format!(" {} ", title)).style(title_style()))
@@ -2262,44 +603,6 @@ fn status_style_for(text: &str) -> Style {
     Style::default().fg(color).bg(SURFACE)
 }
 
-/// Summarize a `update_bundled_prompts` run into a single status-bar
-/// message. Keeps the per-file detail out of the status line so the
-/// bar stays readable, but stays expressive when something failed.
-fn format_update_bundled_status(outcomes: &[UpdatePromptOutcome]) -> String {
-    let updated = outcomes
-        .iter()
-        .filter(|o| o.action == "updated" && o.ok)
-        .count();
-    let kept = outcomes
-        .iter()
-        .filter(|o| o.action == "kept" && o.ok)
-        .count();
-    let skipped = outcomes
-        .iter()
-        .filter(|o| o.action == "skipped" && o.ok)
-        .count();
-    let failed: Vec<&UpdatePromptOutcome> = outcomes.iter().filter(|o| !o.ok).collect();
-    if failed.is_empty() {
-        if updated > 0 {
-            format!(
-                "updated bundled prompts: {} updated, {} kept, {} skipped",
-                updated, kept, skipped
-            )
-        } else {
-            // No rows needed a write; the user requested a no-op refresh.
-            format!("bundled prompts already current ({} kept)", kept)
-        }
-    } else {
-        let names: Vec<&str> = failed.iter().map(|o| o.name.as_str()).collect();
-        format!(
-            "updated bundled prompts: {} updated, {} failed ({})",
-            updated,
-            failed.len(),
-            names.join(", ")
-        )
-    }
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -2339,21 +642,16 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-impl Mode {
-    fn prev(self) -> Self {
-        match self {
-            Mode::subagent => Mode::all,
-            Mode::primary => Mode::subagent,
-            Mode::all => Mode::primary,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::starter_agent;
     use crate::agent::STARTERS;
+    // Editor-only helpers and the `EditorOp` enum live in the `editor`
+    // child module; pull them in here so the existing editor / model
+    // picker tests keep their direct call shapes.
+    use crate::agent::{Mode, PermissionAction};
+    use editor::{edit_text_field, next_field, prev_field, EditorOp};
     use tempfile::TempDir;
 
     fn setup_paths(dir: &TempDir) -> Paths {
@@ -4206,6 +2504,9 @@ mod tests {
 
     #[test]
     fn footer_install_update_describes_install_overwrite_refresh_back() {
+        // List view: the bound harness label appears up front and the
+        // `Esc` shortcut takes the user back to the harness selector,
+        // not the main menu.
         let mut app = fresh_app();
         app.screen = Screen::InstallUpdate {
             items: Vec::new(),
@@ -4213,6 +2514,7 @@ mod tests {
             last_outcomes: Vec::new(),
             status: None,
             confirm_overwrite: None,
+            target: Some(SyncTarget::OpenCode),
         };
         let text = app.footer_text();
         assert!(
@@ -4228,8 +2530,12 @@ mod tests {
             "install footer mentions refresh: {text:?}"
         );
         assert!(
-            text.contains("back"),
-            "install footer mentions back: {text:?}"
+            text.contains("Esc"),
+            "install footer mentions Esc: {text:?}"
+        );
+        assert!(
+            text.contains("OpenCode"),
+            "list footer must advertise the bound harness: {text:?}"
         );
     }
 
@@ -4242,6 +2548,7 @@ mod tests {
             last_outcomes: Vec::new(),
             status: None,
             confirm_overwrite: Some((SyncTarget::OpenCode, "overwrite?".to_string())),
+            target: Some(SyncTarget::OpenCode),
         };
         let text = app.footer_text();
         assert!(
@@ -4498,6 +2805,7 @@ mod tests {
             last_outcomes: Vec::new(),
             status: None,
             confirm_overwrite: None,
+            target: Some(SyncTarget::OpenCode),
         };
         // Whole render path on a 1x3 terminal: layout shrinks, footer area
         // is clipped, no panic.
@@ -4516,6 +2824,7 @@ mod tests {
             last_outcomes: Vec::new(),
             status: None,
             confirm_overwrite: None,
+            target: Some(SyncTarget::OpenCode),
         };
         let full = app.footer_text();
         assert!(
@@ -4832,5 +3141,812 @@ mod tests {
         );
         // `width` is kept so future readers see the intent of the layout.
         let _ = width;
+    }
+
+    // ---------- Install/Update harness selection ----------
+
+    /// Open the screen from main; the harness selector must be on
+    /// screen with no items loaded.
+    #[test]
+    fn open_install_update_shows_selector() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths, state);
+        app.open_install_update();
+        match &app.screen {
+            Screen::InstallUpdate {
+                items,
+                target,
+                selected,
+                ..
+            } => {
+                assert!(
+                    items.is_empty(),
+                    "selector must not pre-load items: {items:?}"
+                );
+                assert!(
+                    target.is_none(),
+                    "selector must show when target is None: {target:?}"
+                );
+                assert_eq!(*selected, 0, "selector defaults to OpenCode (index 0)");
+            }
+            other => panic!("expected InstallUpdate screen, got {other:?}"),
+        }
+    }
+
+    /// `j` / `Down` walk the selector; `k` / `Up` walk it back; bounds
+    /// clamp at the edges so the user cannot scroll past the harness
+    /// list.
+    #[test]
+    fn install_update_selector_jk_navigation() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths, state);
+        app.open_install_update();
+
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_install_update_key(KeyEvent::new(code, KeyModifiers::empty()));
+        };
+        // Helper returns (selected, target_is_none). Read each time to
+        // avoid borrowing `app.screen` while a mutable borrow is held
+        // by `press`.
+        let snapshot = |app: &App| -> (usize, bool) {
+            match &app.screen {
+                Screen::InstallUpdate {
+                    selected, target, ..
+                } => (*selected, target.is_none()),
+                _ => panic!("expected InstallUpdate screen: {:?}", app.screen),
+            }
+        };
+
+        assert_eq!(snapshot(&app), (0, true));
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(snapshot(&app).0, 1, "j moves down");
+
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(
+            snapshot(&app).0,
+            1,
+            "j clamps at the bottom (only 2 harnesses)"
+        );
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(snapshot(&app).0, 1, "Down clamps too");
+
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(snapshot(&app).0, 0, "k moves back up");
+
+        press(&mut app, KeyCode::Up);
+        assert_eq!(snapshot(&app).0, 0, "Up clamps at the top");
+
+        // Other keys must be no-ops on the selector.
+        press(&mut app, KeyCode::Char('i'));
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(snapshot(&app), (0, true));
+    }
+
+    /// Enter on the selector opens the list scoped to the chosen
+    /// harness. The list only contains items for that target, never
+    /// for the other.
+    #[test]
+    fn install_update_selector_enter_opens_scoped_list() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths, state);
+        app.open_install_update();
+
+        // Pick OpenCode (default selection).
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        match &app.screen {
+            Screen::InstallUpdate {
+                target,
+                items,
+                selected,
+                ..
+            } => {
+                assert_eq!(*target, Some(SyncTarget::OpenCode));
+                assert!(!items.is_empty(), "fresh install must produce items");
+                assert!(
+                    items.iter().all(|i| i.target == SyncTarget::OpenCode),
+                    "scoped list must only contain OpenCode items"
+                );
+                assert_eq!(*selected, 0);
+            }
+            other => panic!("expected InstallUpdate list, got {other:?}"),
+        }
+
+        // Back to selector, then pick Pi.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        match &app.screen {
+            Screen::InstallUpdate { target, items, .. } => {
+                assert_eq!(*target, Some(SyncTarget::Pi));
+                assert!(
+                    items.iter().all(|i| i.target == SyncTarget::Pi),
+                    "scoped list must only contain Pi items, got {:?}",
+                    items
+                        .iter()
+                        .map(|i| (i.target, &i.filename))
+                        .collect::<Vec<_>>()
+                );
+            }
+            other => panic!("expected InstallUpdate list for Pi, got {other:?}"),
+        }
+    }
+
+    /// Esc on the selector returns to the main menu; Esc on the list
+    /// returns to the selector (not the main menu).
+    #[test]
+    fn install_update_esc_walks_selector_then_list_then_main() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths, state);
+
+        // Esc on selector -> main.
+        app.open_install_update();
+        assert!(matches!(
+            app.screen,
+            Screen::InstallUpdate { target: None, .. }
+        ));
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.screen, Screen::Main { .. }));
+
+        // Enter -> list, Esc -> selector (not main).
+        app.open_install_update();
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(matches!(
+            app.screen,
+            Screen::InstallUpdate {
+                target: Some(_),
+                ..
+            }
+        ));
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        match &app.screen {
+            Screen::InstallUpdate { target, items, .. } => {
+                assert!(
+                    target.is_none(),
+                    "Esc on list must return to selector, not main"
+                );
+                assert!(items.is_empty(), "leaving the list clears items");
+            }
+            other => panic!("expected selector, got {other:?}"),
+        }
+        // A second Esc from the selector returns to main.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.screen, Screen::Main { .. }));
+    }
+
+    /// `Esc` on the confirm-overwrite popup must cancel the popup, not
+    /// navigate the list underneath. The list bound to the chosen
+    /// harness must remain visible after the cancel.
+    #[test]
+    fn install_update_esc_cancels_confirm_popup_then_lists_then_selector() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths.clone(), state);
+        app.open_install_update();
+        // Pick OpenCode and install safe so the target file exists
+        // before we mutate it into a conflict.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
+        let target_path = paths.target_dir.join("scout.md");
+        assert!(target_path.exists(), "OpenCode scout.md must be installed");
+        let before = std::fs::read_to_string(&target_path).unwrap();
+        let mutated = before.replace("read-only", "tampered");
+        std::fs::write(&target_path, &mutated).unwrap();
+        app.refresh_install_update();
+
+        // Find the scout row (it's a Conflict now) and arm `o`.
+        let scout_idx = match &app.screen {
+            Screen::InstallUpdate { items, .. } => items
+                .iter()
+                .position(|i| i.filename == "scout.md")
+                .expect("scout row"),
+            _ => unreachable!(),
+        };
+        for _ in 0..scout_idx {
+            app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        }
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        assert!(matches!(
+            &app.screen,
+            Screen::InstallUpdate {
+                confirm_overwrite: Some(_),
+                target: Some(SyncTarget::OpenCode),
+                ..
+            }
+        ));
+
+        // Esc cancels the popup only.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(
+            &app.screen,
+            Screen::InstallUpdate {
+                confirm_overwrite: None,
+                target: Some(SyncTarget::OpenCode),
+                ..
+            }
+        ));
+        assert!(
+            app.status_bar
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cancelled"),
+            "cancelled popup must surface a status: {:?}",
+            app.status_bar
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target_path).unwrap(),
+            mutated,
+            "Esc on the popup must not overwrite the target"
+        );
+
+        // Esc again returns to the selector.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(
+            app.screen,
+            Screen::InstallUpdate { target: None, .. }
+        ));
+
+        // Esc a third time returns to main.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.screen, Screen::Main { .. }));
+    }
+
+    /// The footer text must describe the active sub-screen: the
+    /// selector advertises pick/open/Esc, the list advertises
+    /// install/overwrite/refresh/Esc with the bound harness label,
+    /// and the confirm-overwrite popup overrides both.
+    #[test]
+    fn footer_install_update_selector_vs_list_vs_confirm() {
+        let mut app = fresh_app();
+
+        // Selector.
+        app.screen = Screen::InstallUpdate {
+            items: Vec::new(),
+            selected: 0,
+            last_outcomes: Vec::new(),
+            status: None,
+            confirm_overwrite: None,
+            target: None,
+        };
+        let selector_text = app.footer_text();
+        assert!(
+            selector_text.contains("pick harness") && selector_text.contains("Enter"),
+            "selector footer: {selector_text:?}"
+        );
+        assert!(
+            selector_text.contains("Esc"),
+            "selector footer mentions Esc: {selector_text:?}"
+        );
+        assert!(
+            !selector_text.contains("install safe"),
+            "selector must not advertise install safe: {selector_text:?}"
+        );
+
+        // List bound to Pi.
+        app.screen = Screen::InstallUpdate {
+            items: Vec::new(),
+            selected: 0,
+            last_outcomes: Vec::new(),
+            status: None,
+            confirm_overwrite: None,
+            target: Some(SyncTarget::Pi),
+        };
+        let list_text = app.footer_text();
+        assert!(
+            list_text.contains("Pi"),
+            "list footer shows bound target: {list_text:?}"
+        );
+        assert!(
+            list_text.contains("install safe"),
+            "list footer: {list_text:?}"
+        );
+        assert!(
+            list_text.contains("overwrite"),
+            "list footer: {list_text:?}"
+        );
+        assert!(list_text.contains("refresh"), "list footer: {list_text:?}");
+        assert!(
+            !list_text.contains("pick harness"),
+            "list footer must not show selector shortcuts: {list_text:?}"
+        );
+
+        // Confirm-overwrite popup.
+        app.screen = Screen::InstallUpdate {
+            items: Vec::new(),
+            selected: 0,
+            last_outcomes: Vec::new(),
+            status: None,
+            confirm_overwrite: Some((SyncTarget::OpenCode, "scout.md".to_string())),
+            target: Some(SyncTarget::OpenCode),
+        };
+        let confirm_text = app.footer_text();
+        assert!(
+            confirm_text.contains("Y"),
+            "confirm footer: {confirm_text:?}"
+        );
+        assert!(
+            confirm_text.contains("cancel"),
+            "confirm footer: {confirm_text:?}"
+        );
+        assert!(
+            !confirm_text.contains("install safe"),
+            "confirm footer must not advertise install: {confirm_text:?}"
+        );
+    }
+
+    /// `i` from the list installs safe actions only for the bound
+    /// harness. Files in the other harness's directory must remain
+    /// untouched and its manifest map must be byte-identical to the
+    /// pre-install state.
+    #[test]
+    fn install_safe_only_targets_bound_harness() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths.clone(), state);
+        app.open_install_update();
+        // Pick OpenCode.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        // Sentinel: write a known file to Pi's directory. After the
+        // OpenCode-only install, that file must be untouched.
+        let pi_sentinel = paths.pi_target_dir.join("sentinel.md");
+        let pi_sentinel_body = "pi-only sentinel\n";
+        std::fs::write(&pi_sentinel, pi_sentinel_body).unwrap();
+
+        // Capture Pi's ownership map before the install so we can
+        // verify it stays unchanged. The OpenCode map is expected to
+        // grow, so we do not compare the whole manifest.
+        let state_pre = State::load(&paths.state_file).unwrap();
+        let pre_pi_installed = state_pre.pi_installed.clone();
+
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
+
+        // OpenCode is installed.
+        assert!(
+            paths.target_dir.join("scout.md").exists(),
+            "scout must be installed"
+        );
+        // Pi's directory must NOT have new agenthd-owned files
+        // (starters seeded on the canonical side will appear in plan
+        // for Pi but apply_safe was never asked to plan Pi).
+        assert!(
+            !paths.pi_target_dir.join("scout.md").exists(),
+            "scout.md must not appear in Pi's directory after OpenCode-only install"
+        );
+        // The sentinel is preserved verbatim.
+        assert_eq!(
+            std::fs::read_to_string(&pi_sentinel).unwrap(),
+            pi_sentinel_body
+        );
+
+        // Pi's ownership map is unchanged — same keys, same hashes,
+        // and no new entries for OpenCode's files sneaking in. The
+        // equality check above is strictly stronger than any
+        // per-key cross-map loop: it proves the Pi map was not touched
+        // at all, which already rules out Pi gaining an OpenCode
+        // file. (See `install_safe_pi_only_does_not_touch_opencode`
+        // for the symmetric direction with a planted ghost.)
+        let state_post = State::load(&paths.state_file).unwrap();
+        assert_eq!(
+            state_post.pi_installed, pre_pi_installed,
+            "Pi ownership map must be unchanged after OpenCode-only install"
+        );
+    }
+
+    /// Mirror regression for the reverse direction: a Pi-bound `i` must
+    /// install Pi only and leave OpenCode's directory and ownership
+    /// map untouched. The planted ghost exercises the
+    /// `apply_safe` cleanup pass: a buggy per-target cleanup that
+    /// walked every `SyncTarget` would prune this OpenCode-side
+    /// entry because the file is missing from both the canonical dir
+    /// and the OpenCode target dir.
+    #[test]
+    fn install_safe_pi_only_does_not_touch_opencode() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths.clone(), state);
+
+        app.open_install_update();
+        // Pick Pi (down once from OpenCode default).
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        match &app.screen {
+            Screen::InstallUpdate { target, .. } => {
+                assert_eq!(*target, Some(SyncTarget::Pi));
+            }
+            other => panic!("expected InstallUpdate list for Pi, got {other:?}"),
+        }
+
+        // Sentinel in OpenCode's target dir — must be preserved
+        // verbatim after the Pi-only install.
+        let oc_sentinel = paths.target_dir.join("sentinel.md");
+        let oc_sentinel_body = "opencode-only sentinel\n";
+        std::fs::write(&oc_sentinel, oc_sentinel_body).unwrap();
+
+        // Ghost ownership entry in the OpenCode map. After a full
+        // install, `apply_safe`'s cleanup would prune this because
+        // `ghost-oc.md` is absent from both the canonical dir and the
+        // OpenCode target dir. The Pi-only install must leave it
+        // alone because OpenCode is not in `items` and the cleanup
+        // pass is scoped to targets present in `items`.
+        const GHOST_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        let mut state_pre = State::load(&paths.state_file).unwrap();
+        state_pre
+            .installed
+            .insert("ghost-oc.md".to_string(), GHOST_HASH.to_string());
+        let pre_installed = state_pre.installed.clone();
+        std::fs::write(
+            &paths.state_file,
+            serde_json::to_vec_pretty(&state_pre).unwrap(),
+        )
+        .unwrap();
+
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
+
+        // Pi was installed.
+        let pi_scout = paths.pi_target_dir.join("scout.md");
+        assert!(pi_scout.exists(), "Pi scout must be installed");
+        let pi_scout_bytes = std::fs::read_to_string(&pi_scout).unwrap();
+        assert!(
+            pi_scout_bytes.contains("name: scout"),
+            "Pi scout must be rendered in Pi format: {pi_scout_bytes}"
+        );
+
+        // OpenCode was NOT installed: no scout.md in OpenCode's dir.
+        assert!(
+            !paths.target_dir.join("scout.md").exists(),
+            "OpenCode scout.md must not appear after Pi-only install"
+        );
+        // Sentinel is preserved verbatim.
+        assert_eq!(
+            std::fs::read_to_string(&oc_sentinel).unwrap(),
+            oc_sentinel_body,
+            "OpenCode sentinel must be preserved"
+        );
+
+        // OpenCode ownership map retained: the ghost is still there
+        // with the same hash, and the whole map is byte-identical to
+        // the pre-install state (no entries added, removed, or
+        // rewritten by the Pi install).
+        let state_post = State::load(&paths.state_file).unwrap();
+        assert_eq!(
+            state_post.installed.get("ghost-oc.md").map(String::as_str),
+            Some(GHOST_HASH),
+            "OpenCode ghost entry must survive a Pi-only install"
+        );
+        assert_eq!(
+            state_post.installed, pre_installed,
+            "OpenCode ownership map must be unchanged after Pi-only install"
+        );
+        // The Pi install only writes its own entries; the OpenCode
+        // map's only key must not collide with any Pi map key (the
+        // ghost is by construction absent from Pi's map).
+        for name in state_post.installed.keys() {
+            assert!(
+                !state_post.pi_installed.contains_key(name),
+                "OpenCode map must not gain a Pi file: {name}"
+            );
+        }
+    }
+
+    /// `o` on a selected conflict overwrites only the bound harness's
+    /// target. The other harness's directory and manifest stay untouched.
+    #[test]
+    fn install_overwrite_only_targets_bound_harness() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths.clone(), state);
+        // Seed a baseline where both targets are installed and the
+        // manifest reflects that ownership. `apply_safe` already
+        // persists `state` to disk via `write_state`, so the manual
+        // re-serialize that older revisions of this test carried is
+        // redundant.
+        let full_state = crate::store::State::load(&paths.state_file).unwrap();
+        let full_plan = crate::store::compute_plan(&paths, &full_state).unwrap();
+        let (_full_state, _) = crate::store::apply_safe(&paths, full_state, full_plan).unwrap();
+
+        app.open_install_update();
+        // Pick Pi.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        match &app.screen {
+            Screen::InstallUpdate { target, .. } => assert_eq!(*target, Some(SyncTarget::Pi)),
+            _ => panic!(),
+        }
+
+        // Mutate Pi's scout target so it is a Conflict.
+        let pi_target = paths.pi_target_dir.join("scout.md");
+        let original = std::fs::read_to_string(&pi_target).unwrap();
+        let mutated = original.replace("read-only", "tampered");
+        std::fs::write(&pi_target, &mutated).unwrap();
+        // Also mutate OpenCode's scout target so we can verify it is
+        // not overwritten by the Pi-only force_install.
+        let oc_target = paths.target_dir.join("scout.md");
+        let oc_original = std::fs::read_to_string(&oc_target).unwrap();
+        let oc_mutated = oc_original.replace("read-only", "tampered-oc");
+        std::fs::write(&oc_target, &oc_mutated).unwrap();
+
+        // Capture pre-state.
+        let pre_oc_target_bytes = std::fs::read_to_string(&oc_target).unwrap();
+        let pre_state_bytes = std::fs::read_to_string(&paths.state_file).unwrap();
+
+        app.refresh_install_update();
+        let scout_idx = match &app.screen {
+            Screen::InstallUpdate { items, .. } => items
+                .iter()
+                .position(|i| i.filename == "scout.md")
+                .expect("scout row"),
+            _ => unreachable!(),
+        };
+        for _ in 0..scout_idx {
+            app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        }
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        // Confirm overwrite.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+
+        // Pi's scout is back to canonical.
+        let pi_after = std::fs::read_to_string(&pi_target).unwrap();
+        assert!(pi_after.contains("read-only"));
+        // OpenCode's scout must NOT be rewritten — Pi's force_install
+        // never touched it.
+        assert_eq!(
+            std::fs::read_to_string(&oc_target).unwrap(),
+            pre_oc_target_bytes
+        );
+        // The OpenCode ownership entry's hash is the one we wrote
+        // before the conflict; it is not bumped by the Pi install.
+        let post_state: State =
+            serde_json::from_str(&std::fs::read_to_string(&paths.state_file).unwrap()).unwrap();
+        let post_oc_hash = post_state.installed.get("scout.md").cloned();
+        // Manifest was rewritten by the Pi install (state.installed
+        // for Pi got an update); the bytes won't be byte-equal, but
+        // OpenCode's hash for scout must still equal what we wrote
+        // before the test (the original canonical hash, since the
+        // OpenCode target was never overwritten).
+        // Verify OpenCode's hash equals what we wrote before.
+        let pre_state: State = serde_json::from_str(&pre_state_bytes).unwrap();
+        let pre_oc_hash = pre_state.installed.get("scout.md").cloned();
+        assert_eq!(
+            post_oc_hash, pre_oc_hash,
+            "OpenCode ownership hash must be unchanged"
+        );
+    }
+
+    /// `r` refreshes only the bound harness; the other harness's
+    /// manifest map is byte-identical to before the refresh.
+    #[test]
+    fn install_refresh_only_targets_bound_harness() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths.clone(), state);
+        // First install everything via the store helper.
+        let full_state = crate::store::State::load(&paths.state_file).unwrap();
+        let full_plan = crate::store::compute_plan(&paths, &full_state).unwrap();
+        let (full_state, _) = crate::store::apply_safe(&paths, full_state, full_plan).unwrap();
+        std::fs::write(
+            &paths.state_file,
+            serde_json::to_vec_pretty(&full_state).unwrap(),
+        )
+        .unwrap();
+
+        let pre_state_bytes = std::fs::read(&paths.state_file).unwrap();
+
+        app.open_install_update();
+        // Pick OpenCode.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        // External edit on the OpenCode target so refresh sees an
+        // UpdateAvailable for OpenCode only.
+        let oc_target = paths.target_dir.join("scout.md");
+        let oc_before = std::fs::read_to_string(&oc_target).unwrap();
+        std::fs::write(&oc_target, oc_before.replace("read-only", "tampered-oc")).unwrap();
+
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()));
+
+        // The Pi ownership map in the manifest is byte-identical to
+        // before the refresh — the OpenCode-scoped refresh must not
+        // touch Pi's entries at all.
+        let pre: State = serde_json::from_slice(&pre_state_bytes).unwrap();
+        let post: State =
+            serde_json::from_slice(&std::fs::read(&paths.state_file).unwrap()).unwrap();
+        assert_eq!(
+            pre.pi_installed, post.pi_installed,
+            "Pi manifest entries must be untouched"
+        );
+    }
+
+    /// Empty plan: when the chosen harness has no canonical and no
+    /// targets, `i` is a no-op and a clear message is shown.
+    #[test]
+    fn install_safe_with_empty_plan_reports_and_does_not_write() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Seed no canonical — both target dirs are empty too.
+        let mut app = App::new(paths.clone(), State::default());
+        app.open_install_update();
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        // items is empty.
+        match &app.screen {
+            Screen::InstallUpdate { items, target, .. } => {
+                assert_eq!(*target, Some(SyncTarget::OpenCode));
+                assert!(items.is_empty());
+            }
+            _ => panic!("expected InstallUpdate list"),
+        }
+
+        // No state file should exist yet — but if it does, capture
+        // its bytes so we can prove the empty install is a no-op.
+        let pre_bytes = std::fs::read(&paths.state_file).ok();
+
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
+
+        // Status surfaces the no-op message.
+        assert!(
+            app.status_bar
+                .as_deref()
+                .unwrap_or_default()
+                .contains("nothing to install"),
+            "empty plan must surface a clear message: {:?}",
+            app.status_bar
+        );
+        // State file is untouched (either still absent or unchanged).
+        let post_bytes = std::fs::read(&paths.state_file).ok();
+        assert_eq!(
+            pre_bytes, post_bytes,
+            "empty plan must not touch the manifest"
+        );
+    }
+
+    /// `o` on a non-conflict row is a no-op that surfaces a status
+    /// message; it does not arm the popup or write anything.
+    #[test]
+    fn install_o_on_non_conflict_only_reports() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths.clone(), state);
+        app.open_install_update();
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        // Fresh install -> scout.md is NotInstalled, not a conflict.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        match &app.screen {
+            Screen::InstallUpdate {
+                confirm_overwrite,
+                status,
+                ..
+            } => {
+                assert!(
+                    confirm_overwrite.is_none(),
+                    "non-conflict `o` must not arm the overwrite popup"
+                );
+                assert!(
+                    status.is_none(),
+                    "non-conflict `o` must not leave a screen popup behind: {:?}",
+                    status
+                );
+            }
+            other => panic!("expected InstallUpdate screen, got {other:?}"),
+        }
+        assert!(
+            app.status_bar
+                .as_deref()
+                .unwrap_or_default()
+                .contains("is not a conflict"),
+            "non-conflict `o` must report: {:?}",
+            app.status_bar
+        );
+
+        // After a j/k movement the notice should not re-appear as a
+        // popup. (The screen.status was the original bug: writing it
+        // here meant the message stuck across navigation.)
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        match &app.screen {
+            Screen::InstallUpdate { status, .. } => assert!(
+                status.is_none(),
+                "j must not surface a leftover popup: {status:?}"
+            ),
+            other => panic!("expected InstallUpdate screen, got {other:?}"),
+        }
+    }
+
+    /// `force_overwrite` must refuse to write a target that is not the
+    /// bound harness. This is the cross-harness guard the
+    /// Install/Update session relies on.
+    #[test]
+    fn install_force_overwrite_refuses_cross_target() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let mut app = App::new(paths.clone(), state);
+        app.open_install_update();
+        // Bound to OpenCode.
+        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        // Try to force-overwrite Pi. The handler must refuse.
+        app.force_overwrite(SyncTarget::Pi, "scout.md");
+        assert!(
+            app.status_bar
+                .as_deref()
+                .unwrap_or_default()
+                .contains("overwrite refused"),
+            "cross-target force must be refused: {:?}",
+            app.status_bar
+        );
+        // Pi's target directory must be untouched.
+        assert!(
+            !paths.pi_target_dir.join("scout.md").exists(),
+            "Pi scout.md must not be written by an OpenCode-bound session"
+        );
+    }
+
+    /// `apply_safe` must prune stale ownership entries for the
+    /// targets present in `items`, but must NOT prune entries for
+    /// targets that did not appear in `items`.
+    #[test]
+    fn apply_safe_cleanup_does_not_touch_other_target_map() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Build a state where Pi has a stale ownership entry for a
+        // file that exists on neither side.
+        let mut state = State::default();
+        state
+            .pi_installed
+            .insert("ghost-pi.md".to_string(), "abc".to_string());
+        state
+            .installed
+            .insert("ghost-oc.md".to_string(), "def".to_string());
+
+        // Seed canonical so OpenCode has at least one safe item.
+        let (_, state) = crate::store::seed_starters(&paths, state).unwrap();
+
+        // Plan OpenCode only.
+        let oc_plan = crate::store::plan_for(&paths, &state, SyncTarget::OpenCode).unwrap();
+        assert!(!oc_plan.is_empty());
+
+        let (post_state, _) = crate::store::apply_safe(&paths, state, oc_plan).unwrap();
+
+        // OpenCode's stale entry was cleaned up because OpenCode was
+        // in items.
+        assert!(
+            !post_state.installed.contains_key("ghost-oc.md"),
+            "OpenCode stale entry should be cleaned up"
+        );
+        // Pi's stale entry is untouched because Pi was NOT in items.
+        assert!(
+            post_state.pi_installed.contains_key("ghost-pi.md"),
+            "Pi stale entry must NOT be cleaned up when items is OpenCode-only"
+        );
+    }
+
+    /// Single-target planning: `plan_for` returns only items for the
+    /// requested target, never the other one.
+    #[test]
+    fn plan_for_returns_only_target_items() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let oc = crate::store::plan_for(&paths, &state, SyncTarget::OpenCode).unwrap();
+        assert!(oc.iter().all(|i| i.target == SyncTarget::OpenCode));
+        let pi = crate::store::plan_for(&paths, &state, SyncTarget::Pi).unwrap();
+        assert!(pi.iter().all(|i| i.target == SyncTarget::Pi));
+        // Combined view is the sum of the two.
+        let both = crate::store::compute_plan(&paths, &state).unwrap();
+        assert_eq!(both.len(), oc.len() + pi.len());
     }
 }
