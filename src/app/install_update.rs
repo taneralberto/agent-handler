@@ -2,13 +2,15 @@
 //! and force-overwrite.
 //!
 //! Two-phase UI driven by `Screen::InstallUpdate.target`:
-//! - `target = None`: the OpenCode/Pi selector is on screen. `Enter`
-//!   plans that harness via `plan_for` and switches to the list view.
-//!   `Esc` returns to the main menu.
-//! - `target = Some(t)`: the per-file list for that harness is on screen.
-//!   `i` / `o` / `r` all operate on `t` only — they call `plan_for` and
-//!   `apply_safe` scoped to that harness and cannot reach the other
-//!   target's files or ownership map.
+//! - `target = None`: the OpenCode/Pi/Skills selector is on screen.
+//!   `Enter` on OpenCode or Pi plans that harness via `plan_for` and
+//!   switches to the list view. `Enter` on Skills routes to the
+//!   separate `Screen::Skills` list (different safety contract, no
+//!   force-overwrite path). `Esc` returns to the main menu.
+//! - `target = Some(t)`: the per-file list for that harness is on
+//!   screen. `i` / `o` / `r` all operate on `t` only — they call
+//!   `plan_for` and `apply_safe` scoped to that harness and cannot
+//!   reach the other target's files or ownership map.
 //!
 //! The screen is driven by `crate::store::plan_for`, which returns the
 //! per-file `SyncItem` rows for one target. `force_overwrite` accepts a
@@ -32,10 +34,54 @@ use ratatui::text::Line;
 use ratatui::widgets::{List, ListItem, Paragraph};
 use ratatui::Frame;
 
-/// Static list of harnesses the Install/Update session can target.
-/// Kept in source order so the selector's default selection (`OpenCode`)
-/// matches the previous combined-view behavior.
-const HARNESSES: &[SyncTarget] = &[SyncTarget::OpenCode, SyncTarget::Pi];
+/// Static list of selector entries shown on the Install/Update
+/// harness picker. Kept in source order so the default selection
+/// (`OpenCode`) matches the previous combined-view behavior. The
+/// third entry routes to the Skills list screen (separate
+/// `Screen::Skills` variant) rather than into the agent sync flow
+/// — Skills uses a different safety contract (whole-tree hash, no
+/// force overwrite, third-party tools like `pi-psql` are never
+/// touched).
+const HARNESSES: &[Harness] = &[Harness::OpenCode, Harness::Pi, Harness::Skills];
+
+/// Harness selector entry. `OpenCode` and `Pi` flow into the
+/// existing per-file agent sync; `Skills` is a third entry that
+/// routes into the separate `Screen::Skills` list view. Modeling
+/// this as a flat enum (rather than reusing `SyncTarget`) keeps
+/// the agent-sync types untouched and prevents the Skills flow
+/// from being conflated with the per-target agent ownership map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Harness {
+    OpenCode,
+    Pi,
+    Skills,
+}
+
+impl Harness {
+    fn label(self) -> &'static str {
+        match self {
+            Harness::OpenCode => "OpenCode",
+            Harness::Pi => "Pi",
+            Harness::Skills => "Skills",
+        }
+    }
+    fn detail(self) -> &'static str {
+        match self {
+            Harness::OpenCode => "Sync agents into the OpenCode targets directory",
+            Harness::Pi => "Sync agents into the Pi targets directory",
+            Harness::Skills => {
+                "Sync configured-checkout `skills/` into the OpenCode global skills directory"
+            }
+        }
+    }
+    fn as_sync_target(self) -> Option<SyncTarget> {
+        match self {
+            Harness::OpenCode => Some(SyncTarget::OpenCode),
+            Harness::Pi => Some(SyncTarget::Pi),
+            Harness::Skills => None,
+        }
+    }
+}
 
 impl App {
     #[allow(clippy::too_many_arguments)]
@@ -83,15 +129,15 @@ impl App {
         let rows: Vec<ListItem> = HARNESSES
             .iter()
             .enumerate()
-            .map(|(idx, target)| {
+            .map(|(idx, harness)| {
                 let style = if idx == selected {
                     selected_style()
                 } else {
                     Style::default()
                 };
                 ListItem::new(vec![
-                    Line::from(target.label()),
-                    Line::from(harness_detail(*target)),
+                    Line::from(harness.label()),
+                    Line::from(harness.detail()),
                 ])
                 .style(style)
             })
@@ -239,7 +285,7 @@ impl App {
             BeginForce(SyncItem),
             MoveSelection(i32),
             MoveSelector(i32),
-            PickTarget(SyncTarget),
+            PickHarness(Harness),
             PopToSelector,
             PopToMain,
             MarkNonConflict(String),
@@ -270,7 +316,7 @@ impl App {
                     KeyCode::Esc => Op::PopToMain,
                     KeyCode::Up | KeyCode::Char('k') => Op::MoveSelector(-1),
                     KeyCode::Down | KeyCode::Char('j') => Op::MoveSelector(1),
-                    KeyCode::Enter => Op::PickTarget(HARNESSES[*selected]),
+                    KeyCode::Enter => Op::PickHarness(HARNESSES[*selected]),
                     _ => return,
                 };
             } else {
@@ -334,20 +380,28 @@ impl App {
                     }
                 }
             }
-            Op::PickTarget(target) => {
+            Op::PickHarness(harness) => {
                 // Bind the session to the chosen harness and plan it.
                 // The list view, every safe-install action, and every
                 // force-overwrite will be scoped to this target until
-                // the user backs out to the selector.
-                self.screen = Screen::InstallUpdate {
-                    items: Vec::new(),
-                    selected: 0,
-                    last_outcomes: Vec::new(),
-                    status: None,
-                    confirm_overwrite: None,
-                    target: Some(target),
-                };
-                self.refresh_install_update();
+                // the user backs out to the selector. Skills uses a
+                // separate `Screen::Skills` because its safety contract
+                // (whole-tree hash, no force-overwrite) is not the
+                // agent sync contract.
+                match harness.as_sync_target() {
+                    Some(target) => {
+                        self.screen = Screen::InstallUpdate {
+                            items: Vec::new(),
+                            selected: 0,
+                            last_outcomes: Vec::new(),
+                            status: None,
+                            confirm_overwrite: None,
+                            target: Some(target),
+                        };
+                        self.refresh_install_update();
+                    }
+                    None => self.open_skills(),
+                }
             }
             Op::PopToSelector => {
                 // Drop the target binding so the next Enter on the
@@ -508,12 +562,5 @@ impl App {
             }
             Err(e) => self.status_bar = Some(format!("error: {}", e)),
         }
-    }
-}
-
-fn harness_detail(target: SyncTarget) -> &'static str {
-    match target {
-        SyncTarget::OpenCode => "Sync agents into the OpenCode targets directory",
-        SyncTarget::Pi => "Sync agents into the Pi targets directory",
     }
 }

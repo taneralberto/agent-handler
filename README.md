@@ -117,6 +117,7 @@ shell's `PATH` if it is not.
 | Settings (configured checkout path) | `$HOME/.agenthd/settings.json` |
 | Ownership manifest | `$HOME/.agenthd/state.json` |
 | Canonical agents | `<configured-checkout>/agents/*.md` |
+| Checked-out skills | `<configured-checkout>/skills/<name>/` |
 | OpenCode agents | `$XDG_CONFIG_HOME/opencode/agents/*.md` (falls back to `$HOME/.config/opencode/agents/*.md`) |
 | OpenCode skills | `$XDG_CONFIG_HOME/opencode/skills/<name>/` (falls back to `$HOME/.config/opencode/skills/<name>/`) |
 | Pi agents | `$HOME/.pi/agent/agents/*.md` |
@@ -135,12 +136,18 @@ shared across the app.
 - `src/store/mod.rs` — path resolution, the ownership manifest,
   atomic temp+rename, parsing, and shared SHA-256 helper.
 - `src/store/settings.rs` — per-machine settings (the configured
-  checkout path), `validate_checkout_path`, and the cwd-anchored hint
+  checkout path), `validate_checkout_path`, and the cwd-ancestor hint
   resolver used by the first-run picker.
 - `src/store/canonical.rs` — load/save of the canonical agents (source
   of truth) under the configured checkout.
-- `src/store/sync.rs` — plan/apply for the OpenCode and Pi targets
-  driven by `Install/Update`.
+- `src/store/sync.rs` — plan/apply for the OpenCode and Pi agent
+  targets driven by `Install/Update`.
+- `src/store/skills.rs` — plan/apply for the configured checkout's
+  `skills/` directory into the OpenCode global skills dir; whole-tree
+  hash, identity check, no force-overwrite, third-party tools
+  (`pi-psql`) remain untouched unless the source ships them and the
+  manifest already records them.
+- `src/store/skills_tests.rs` — skills sync unit tests.
 - `src/store/tests.rs` — store unit tests.
 - `src/agent/starter_fixture/` — `#[cfg(test)]` test-only fixture that
   parses `agents/*.md` for unit tests. The production binary does not
@@ -199,17 +206,56 @@ Model picker: `Up/Down`, `Enter` apply, `m` manual (blank = inherit),
 `r` rerun discovery, `Esc` cancel.
 
 Install/Update: opens the **harness selector** on entry. `↑/↓` or
-`j/k` pick OpenCode or Pi; `Enter` opens the per-file list scoped to
-that harness only. On the list, `i` apply all safe actions for the
-bound harness, `o` overwrite the selected conflict (confirm with `Y`,
-cancel with `N` / `Esc`), `r` refresh the bound harness's plan. `Esc`
-walks back through the sheets in order: armed popup → list → harness
-selector → main menu. A session bound to one harness never reads the
-other's directory or ownership map; `plan_for` and the per-target
-`apply_safe` cleanup guarantee per-harness isolation.
+`j/k` pick OpenCode, Pi, or Skills; `Enter` opens the per-file list
+scoped to that target only. On the OpenCode/Pi list, `i` applies all
+safe actions for the bound harness, `o` overwrites the selected
+conflict (confirm with `Y`, cancel with `N` / `Esc`), `r` refreshes
+the bound harness's plan. On the Skills list, `i` applies the safe
+plan, `r` refreshes from disk, `o` is intentionally refused with a
+status-bar explanation (skills sync has no force-overwrite path —
+third-party tools like `pi-psql` must remain untouched unless the
+configured checkout ships them and the manifest already records
+them). `Esc` walks back through the sheets in order: armed popup →
+list → harness selector → main menu. A session bound to one harness
+never reads the other's directory or ownership map; `plan_for` and
+the per-target `apply_safe` cleanup guarantee per-harness isolation.
 
 Tools: `i` install the third-party OpenCode skill, `r` refresh, `Esc`
 back.
+
+## Skills (configured-checkout sync)
+
+The configured checkout's `skills/<name>/` directories install into
+the OpenCode global skills root via `Install/Update` → `Skills`. The
+installer is driven by `src/store/skills.rs` and surfaced through
+`src/app/skills_list.rs`; the flow is intentionally separate from
+the per-target agent sync because the safety contract differs:
+
+- The unit of identity is the **whole tree**: a deterministic
+  SHA-256 over `(relative path, bytes)` pairs in sorted order, so
+  renaming a file inside the tree changes the hash.
+- Each skill's `SKILL.md` frontmatter `name:` MUST equal the
+  directory name. A mismatch fails closed at plan time.
+- Symlinks anywhere in the source tree (root or any nested file)
+  are refused at scan time.
+- `pi-psql` (and any other third-party Tools-installed skill)
+  remains invisible to the skills installer unless the
+  configured checkout ships a `pi-psql/` directory AND the
+  manifest already records ownership. A `pi-psql` left behind by
+  the Tools installer is not scanned, recursed, adopted, or
+  removed.
+- Conflicts (target with different bytes, target is a regular
+  file, target is a symlink) are never auto-overwritten. The
+  UI surfaces them as `conflict` rows; `o` is refused with an
+  explanatory message.
+- Owned updates use a backup + `rename_no_replace` strategy so
+  the user's installed skill directory survives an interrupted
+  update. We do not claim an atomic directory swap.
+
+State compatibility: `State.installed_skills` is `#[serde(default)]`,
+so older `state.json` files written before this feature shipped
+load cleanly into the default empty map and the next save rebuilds
+the JSON without losing existing entries.
 
 ## Tools (v1: install-only)
 
@@ -298,6 +344,31 @@ independently. A conflict in one never overwrites the other.
   + rename.
 - Files that cannot be parsed fail closed: nothing is installed that
   round.
+
+`Install/Update` → `Skills` syncs the configured checkout's
+`skills/` directory into the OpenCode global skills root with its
+own safeguards:
+
+- Whole-tree hash (deterministic SHA-256 over sorted
+  `(relative path, bytes)` pairs). Renaming a file inside a
+  skill changes the tree hash, so the next plan classifies the
+  row as `update`.
+- Symlinks anywhere in the source tree (root or any nested file)
+  are refused at scan time. The destination side rejects
+  symlinks and non-directory entries as `conflict`.
+- `SKILL.md` `name:` MUST equal the directory name; mismatches
+  fail closed at plan time.
+- `pi-psql` (and any other third-party Tools-installed skill)
+  is invisible to the skills installer unless the configured
+  checkout ships a same-named directory AND the manifest already
+  records ownership. The destination-side scan only ever names
+  directories that are either in the source or in the manifest.
+- Owned updates use a sibling backup + `rename_no_replace`
+  strategy so an interrupted update restores the user's
+  installed skill directory. We never claim an atomic directory
+  swap.
+- There is no force-overwrite path. `o` on the Skills list is
+  refused with an explanatory status-bar message.
 
 ## Checkpoint-path safeguards
 

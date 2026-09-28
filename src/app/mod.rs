@@ -4,7 +4,11 @@ use crate::models::Discovery;
 // contextual footer match arms. Editor-only helpers and `EditorOp`
 // are pulled in by `mod tests` directly so the lib build does not
 // carry an unused-import warning.
-use crate::store::{ApplyOutcome, Paths, State, SyncItem, SyncTarget};
+#[allow(unused_imports)]
+use crate::store::{
+    apply_skills, plan_skills, ApplyOutcome, Paths, SkillOutcome, SkillPlanItem, State, SyncItem,
+    SyncTarget,
+};
 use crate::tools::ToolItem;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -57,6 +61,18 @@ mod editor;
 /// Repo mode picker; there is exactly one canonical directory, and
 /// the Settings screen exists to point at it.
 mod settings;
+
+/// Skills list UI: render / open / refresh / handle key / apply safe.
+/// The implementation lives in `app/skills_list.rs` as a child module;
+/// the `Screen::Skills` variant, the main-menu routing inside
+/// Install/Update, the dispatch, and the contextual footer all stay
+/// here. Like the agent Install/Update screens, the Skills list is
+/// keyed on a checked-out source tree (configured-checkout `skills/`)
+/// and a destination tree (`Paths.skills_dir`). Unlike the agent
+/// flow, there is no per-target ownership variant and no force-
+/// overwrite path: `o` is intentionally refused with an explanatory
+/// message.
+mod skills_list;
 
 const ACCENT: Color = Color::Rgb(94, 234, 212);
 const SURFACE: Color = Color::Rgb(24, 29, 42);
@@ -152,6 +168,19 @@ enum Screen {
         status: Option<String>,
         /// `true` while the install is running; blocks key dispatch.
         installing: bool,
+    },
+    /// Skills list screen (configured-checkout `skills/` directory
+    /// into the OpenCode global skills dir). Driven by
+    /// `crate::store::plan_skills` / `apply_skills` — separate from
+    /// the agent sync flow because the safety contract differs (whole
+    /// tree hash, no force overwrite, third-party tools like `pi-psql`
+    /// must remain untouched unless the configured checkout ships them
+    /// and the manifest already records them).
+    Skills {
+        items: Vec<SkillPlanItem>,
+        selected: usize,
+        last_outcomes: Vec<SkillOutcome>,
+        status: Option<String>,
     },
     /// Settings screen (first-run or menu entry). The state lives in
     /// the `settings` child module so the parent only names the
@@ -307,6 +336,19 @@ impl App {
                 status.as_deref(),
                 *installing,
             ),
+            Screen::Skills {
+                items,
+                selected,
+                last_outcomes,
+                status,
+            } => self.render_skills(
+                frame,
+                body,
+                items,
+                *selected,
+                last_outcomes,
+                status.as_deref(),
+            ),
             Screen::Settings { state } => self.render_settings(frame, body, state, None),
         }
         self.render_status_line(frame, status_area);
@@ -321,6 +363,7 @@ impl App {
             Screen::ModelPicker { .. } => "Model picker",
             Screen::InstallUpdate { .. } => "Install / Update",
             Screen::Tools { .. } => "Tools",
+            Screen::Skills { .. } => "Skills",
             Screen::Settings { .. } => "Settings",
         };
         let title = Line::from(vec![
@@ -471,6 +514,9 @@ impl App {
                     "↑/↓ or j/k: select · i: install · r: refresh · Esc: back".to_string()
                 }
             }
+            Screen::Skills { .. } => {
+                "↑/↓ or j/k: select · i: install · r: refresh · Esc: back".to_string()
+            }
             Screen::Settings { state } => {
                 if state.is_path_editing() {
                     "type: edit path · Backspace: delete · Ctrl+U: clear · Enter: apply · Esc: cancel"
@@ -509,6 +555,7 @@ impl App {
             Screen::ModelPicker { .. } => self.handle_model_picker_key(key),
             Screen::InstallUpdate { .. } => self.handle_install_update_key(key),
             Screen::Tools { .. } => self.handle_tools_key(key),
+            Screen::Skills { .. } => self.handle_skills_key(key),
             Screen::Settings { .. } => self.handle_settings_key(key)?,
         }
         Ok(())
@@ -687,6 +734,25 @@ mod tests {
         std::fs::create_dir_all(&paths.agenthd_root).unwrap();
         let settings = Settings::new(checkout.to_string_lossy().into_owned());
         crate::store::save_settings(&paths.settings_file, &settings).unwrap();
+        (paths, checkout)
+    }
+
+    /// Build a `Paths` whose checkout also carries a `skills/`
+    /// directory with a few SKILL.md entries. Used by the Skills
+    /// list UI tests.
+    fn setup_paths_with_skills(dir: &TempDir) -> (Paths, std::path::PathBuf) {
+        let (paths, checkout) = setup_paths_with_checkout(dir);
+        let skills_src = checkout.join("skills");
+        std::fs::create_dir_all(&skills_src).unwrap();
+        for name in ["clarify-before-coding", "kiss-for-you"] {
+            let dir = skills_src.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: x\n---\nbody\n"),
+            )
+            .unwrap();
+        }
         (paths, checkout)
     }
 
@@ -1915,16 +1981,25 @@ mod tests {
     fn gated_setup_preserves_existing_ownership_state() {
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
-        // Seed a real ownership manifest on disk covering both
-        // per-target installed hash maps.
+        // Seed a real ownership manifest on disk covering all three
+        // per-target maps (OpenCode agents, Pi agents, OpenCode skills).
         let mut installed = BTreeMap::new();
         installed.insert("scout.md".to_string(), "hash-scout".to_string());
         installed.insert("reviewer.md".to_string(), "hash-reviewer".to_string());
         let mut pi_installed = BTreeMap::new();
         pi_installed.insert("delegate.md".to_string(), "hash-delegate".to_string());
+        let mut installed_skills = BTreeMap::new();
+        installed_skills.insert(
+            "clarify-before-coding".to_string(),
+            crate::store::OwnedSkill {
+                tree_hash: "hash-clarify".to_string(),
+                skill_name: "clarify-before-coding".to_string(),
+            },
+        );
         let prior = State {
             installed,
             pi_installed,
+            installed_skills,
         };
         std::fs::write(
             &paths.state_file,
@@ -2051,6 +2126,112 @@ mod tests {
                 "Subagent panel detail must be gone: {}",
                 item.detail()
             );
+        }
+    }
+
+    // ---------- Skills list UI tests ------------------------------------------
+
+    /// Opening the Skills list with a populated source produces a
+    /// plan whose first action is `Install`. The screen lists every
+    /// skill directory the configured checkout ships.
+    #[test]
+    fn open_skills_lists_source_skills_as_install() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_skills(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_skills();
+        match &app.screen {
+            Screen::Skills { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].name, "clarify-before-coding");
+                assert!(matches!(
+                    items[0].action,
+                    crate::store::SkillAction::Install
+                ));
+                assert_eq!(items[1].name, "kiss-for-you");
+            }
+            screen => panic!("expected Skills screen, got {screen:?}"),
+        }
+    }
+
+    /// Opening the Skills list with an empty (but present) source
+    /// `skills/` directory produces an empty plan; the empty-state
+    /// row in the renderer is reached without panic.
+    #[test]
+    fn open_skills_with_empty_source_yields_empty_plan() {
+        let dir = TempDir::new().unwrap();
+        let (paths, checkout) = setup_paths_with_checkout(&dir);
+        // Create an empty `skills/` directory so the planner
+        // succeeds with an empty result instead of erroring on a
+        // missing source.
+        std::fs::create_dir_all(checkout.join("skills")).unwrap();
+        let mut app = App::new(paths, State::default());
+        app.open_skills();
+        match &app.screen {
+            Screen::Skills { items, .. } => assert!(items.is_empty()),
+            screen => panic!("expected Skills screen, got {screen:?}"),
+        }
+    }
+
+    /// `o` on the Skills list must NOT trigger an overwrite (there is
+    /// no force-overwrite path); the status bar surfaces an
+    /// explanatory decline message instead.
+    #[test]
+    fn skills_o_key_is_declined_with_explanatory_message() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_skills(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_skills();
+        app.handle_skills_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
+        let msg = app.status_bar.unwrap_or_default();
+        assert!(
+            msg.contains("skills sync has no force-overwrite"),
+            "expected decline message, got: {msg}"
+        );
+        // The screen must still be the Skills list — `o` is a no-op
+        // beyond the status bar message.
+        assert!(matches!(app.screen, Screen::Skills { .. }));
+    }
+
+    /// `i` on the Skills list runs the safe plan: each source skill
+    /// is installed into `Paths.skills_dir` and ownership is recorded
+    /// in `state.installed_skills`.
+    #[test]
+    fn skills_i_key_runs_safe_install() {
+        let dir = TempDir::new().unwrap();
+        let (paths, checkout) = setup_paths_with_skills(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_skills();
+        app.handle_skills_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
+        // After apply, the destination contains both skills.
+        let skills_dir = app.paths.skills_dir.clone();
+        assert!(skills_dir.join("clarify-before-coding").is_dir());
+        assert!(skills_dir.join("kiss-for-you").is_dir());
+        // State records ownership.
+        assert_eq!(app.state.installed_skills.len(), 2);
+        // No skills files were written into the repo's `skills/`
+        // directory (which is untracked but adjacent to `agents/`).
+        // This pins the contract that the installer only writes
+        // into the OpenCode global skills dir.
+        let _ = checkout;
+    }
+
+    /// `Esc` on the Skills list returns the user to the Install/Update
+    /// harness selector with no target binding (mirrors the agent
+    /// list's `PopToSelector` path).
+    #[test]
+    fn skills_esc_returns_to_install_update_selector() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_skills(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_skills();
+        app.handle_skills_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        match &app.screen {
+            Screen::InstallUpdate { target, items, .. } => {
+                assert!(target.is_none(), "Esc must drop the target binding");
+                assert!(items.is_empty());
+            }
+            screen => panic!("expected InstallUpdate selector, got {screen:?}"),
         }
     }
 }

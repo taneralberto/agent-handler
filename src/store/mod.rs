@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod canonical;
 mod settings;
+mod skills;
 mod sync;
 
 #[cfg(test)]
@@ -43,6 +44,11 @@ pub use canonical::{delete_canonical, load_canonical, rename_canonical, save_can
 pub use settings::{
     canonical_dir_from, find_checkout_root_from, load_settings, save_settings, settings_file_path,
     validate_checkout_path, Settings,
+};
+#[allow(unused_imports)]
+pub use skills::{
+    apply as apply_skills, plan as plan_skills, OwnedSkill, SkillAction, SkillOutcome,
+    SkillPlanItem,
 };
 #[allow(unused_imports)]
 pub use sync::{
@@ -195,6 +201,20 @@ pub struct State {
     pub installed: BTreeMap<String, String>,
     #[serde(default)]
     pub pi_installed: BTreeMap<String, String>,
+    /// Per-skill ownership for the configured-checkout `skills/`
+    /// directory into `Paths.skills_dir`. Keyed by skill directory
+    /// name (== `SKILL.md` `name:` value by construction). The
+    /// recorded `tree_hash` is the deterministic whole-tree SHA-256
+    /// the installer used as the source bytes; the `skill_name` is
+    /// the verified identity from `SKILL.md` so identity drift is
+    /// detectable.
+    ///
+    /// `#[serde(default)]` keeps the per-machine state compatible
+    /// with `state.json` files written before this field existed:
+    /// older manifests load as if the field were empty, and the next
+    /// save rebuilds the JSON without losing existing entries.
+    #[serde(default)]
+    pub installed_skills: BTreeMap<String, skills::OwnedSkill>,
 }
 
 impl State {
