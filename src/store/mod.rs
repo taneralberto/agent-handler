@@ -1,10 +1,19 @@
-//! Path resolution, the ownership manifest, atomic-I/O primitives, the
-//! shared SHA-256 helper, and the legacy `agenthd` migration. These are
-//! the building blocks the canonical / sync / plugin submodules compose.
+//! Path resolution, the ownership manifest, atomic-I/O primitives,
+//! and the shared SHA-256 helper. These are the building blocks the
+//! canonical / sync / settings submodules compose.
 //!
 //! Public API is exposed via the parent `crate::store` path; consumers
-//! continue to write `use crate::store::{Paths, State, ...}` exactly as
-//! before. The submodules hold implementation detail only.
+//! continue to write `use crate::store::{Paths, State, ...}` exactly
+//! as before. The submodules hold implementation detail only.
+//!
+//! Configuration model: there is exactly one source of truth for the
+//! canonical agent directory — a single user-configured checkout
+//! whose `agents/` subdirectory is read and written by the rest of
+//! the app. The path is persisted at `$HOME/.agenthd/settings.json`
+//! and re-validated on every read; a missing or moved checkout is an
+//! explicit error, never a silent fallback. The historical
+//! local/repo toggle, Compare screen, and bundled starter registry
+//! are gone — there is no Local mode and no Compare mode.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -17,39 +26,73 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Filename the bundled OpenCode sidebar plugin writes under the global
-/// `plugins/` directory. `Paths::resolve` joins it onto the OpenCode
-/// root to produce `paths.plugin_file`. Test setup helpers also reach
-/// it via the `pub(super)` visibility below.
-pub(in crate::store) const PLUGIN_FILENAME: &str = "agenthd-subagents.tsx";
-
 mod canonical;
-mod plugin;
+mod settings;
 mod sync;
 
 #[cfg(test)]
 mod tests;
 
-pub use canonical::{
-    delete_canonical, load_canonical, rename_canonical, save_canonical, seed_starters,
-    update_bundled_prompts, UpdatePromptOutcome,
+pub use canonical::{delete_canonical, load_canonical, rename_canonical, save_canonical};
+// `find_checkout_root_from` is re-exported so the Settings screen
+// can use it as a first-run hint (without persisting or
+// auto-confirming) without needing the helper to live in the
+// runtime hot path. The runtime never silently walks ancestors to
+// infer a checkout; the helper is used only to suggest a starting
+// point in the editor buffer.
+pub use settings::{
+    canonical_dir_from, find_checkout_root_from, load_settings, save_settings, settings_file_path,
+    validate_checkout_path, Settings,
 };
-pub use plugin::{install_plugin, plugin_status, uninstall_plugin, PluginStatus};
-// `compute_plan` is re-exported even though the production TUI now
-// calls `plan_for` directly. The store unit tests still use the
-// combined-view wrapper, so keep the symbol available to them.
 #[allow(unused_imports)]
 pub use sync::{
     apply_safe, compute_plan, force_install, plan_for, ApplyOutcome, SyncItem, SyncStatus,
     SyncTarget,
 };
 
+/// Validate the configured canonical source before any read, write,
+/// or plan operation. The check is shared by every store entry point
+/// — `load_canonical`, `save_canonical`, `delete_canonical`,
+/// `rename_canonical`, `plan_for`, `apply_safe`, `force_install`,
+/// and `compute_plan` — so the runtime fails closed (with an
+/// explicit error) when the configured checkout has been removed,
+/// moved, or replaced with a symlink, instead of silently returning
+/// an empty canonical set, accidentally recreating a missing
+/// checkout, or letting a precomputed `Remove` plan delete an
+/// installed target that has nothing to do with the current source.
+///
+/// `validate_checkout_path` already enforces the same constraints
+/// (absolute path, real directory, real `agents/` subdirectory, no
+/// symlinks) on the checkout root; here we drive it from the
+/// `paths.canonical_dir` the rest of the store already holds so
+/// every entry point can validate without re-deriving the
+/// configured checkout root.
+pub(in crate::store) fn require_canonical_source(paths: &Paths) -> Result<()> {
+    let canonical = &paths.canonical_dir;
+    let parent = canonical.parent().ok_or_else(|| {
+        anyhow!(
+            "canonical source `{}` has no parent directory",
+            canonical.display()
+        )
+    })?;
+    validate_checkout_path(parent)
+}
+
 /// Resolved paths used by the binary.
 ///
-/// `agenthd_root` is always `$HOME/.agenthd` regardless of `XDG_CONFIG_HOME`,
-/// because agenthd-owned state lives outside the XDG config tree. The OpenCode
-/// target directory, however, still honors `XDG_CONFIG_HOME` with the usual
-/// `$HOME/.config` fallback because OpenCode itself uses that location.
+/// `agenthd_root` is always `$HOME/.agenthd` regardless of
+/// `XDG_CONFIG_HOME`, because agenthd-owned state lives outside the
+/// XDG config tree. The OpenCode target directory, however, still
+/// honors `XDG_CONFIG_HOME` with the usual `$HOME/.config` fallback
+/// because OpenCode itself uses that location.
+///
+/// `canonical_dir` is the directory the rest of the application
+/// treats as the source of truth for agent definitions. It is
+/// derived from `Settings::checkout_path` and points at the
+/// `<checkout>/agents` directory of the user-configured checkout.
+/// `Paths::canonical_dir` is the single source of truth for
+/// "where is canonical?" — there is no Local/Repo toggle, no
+/// separate compare path, and no `~/.agenthd/agents` shortcut.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
     pub agenthd_root: PathBuf,
@@ -57,16 +100,24 @@ pub struct Paths {
     pub state_file: PathBuf,
     pub target_dir: PathBuf,
     pub pi_target_dir: PathBuf,
-    pub plugin_file: PathBuf,
-    pub plugin_config: PathBuf,
-    /// Parent of the OpenCode global skills directory. Sibling of `target_dir`
-    /// (`<xdg|home>/.config/opencode/agents` -> `<xdg|home>/.config/opencode/skills`)
-    /// so the no-replace publish primitive stays on the same filesystem volume.
+    /// Parent of the OpenCode global skills directory. Sibling of
+    /// `target_dir`
+    /// (`<xdg|home>/.config/opencode/agents` ->
+    /// `<xdg|home>/.config/opencode/skills`) so the no-replace
+    /// publish primitive stays on the same filesystem volume.
     pub skills_dir: PathBuf,
+    /// Per-machine settings (currently: the configured checkout
+    /// path). The runtime reads/writes it via the `settings`
+    /// submodule; the field is kept on `Paths` so callers do not have
+    /// to thread a second `PathBuf` through every signature.
+    pub settings_file: PathBuf,
 }
 
 impl Paths {
-    /// Resolve paths from explicit env values. Tests pass these in directly.
+    /// Resolve paths from explicit env values. `canonical_dir` is
+    /// left as the local default `<agenthd_root>/agents`; the caller
+    /// is expected to call `Paths::with_settings` immediately after
+    /// to re-point it at the configured checkout.
     pub fn resolve(xdg_config_home: Option<&str>, home: Option<&str>) -> Result<Self> {
         let home_path = match home {
             Some(h) if !h.is_empty() => PathBuf::from(h),
@@ -88,9 +139,8 @@ impl Paths {
             state_file: agenthd_root.join("state.json"),
             target_dir: opencode_root.join("agents"),
             pi_target_dir: home_path.join(".pi").join("agent").join("agents"),
-            plugin_file: opencode_root.join("plugins").join(PLUGIN_FILENAME),
-            plugin_config: opencode_root.join("tui.json"),
             skills_dir: opencode_root.join("skills"),
+            settings_file: settings_file_path(&agenthd_root),
             agenthd_root,
         })
     }
@@ -103,9 +153,31 @@ impl Paths {
         )
     }
 
+    /// Re-point `canonical_dir` at the configured checkout's
+    /// `agents/` directory. The default `canonical_dir` already
+    /// points at `<agenthd_root>/agents`; the caller is expected to
+    /// replace it with the configured checkout before the first
+    /// canonical read. Validation runs here (rather than at write
+    /// time) so a corrupt settings file is caught at startup; the
+    /// "missing checkout fail closed" contract surfaces the error
+    /// rather than papering over it with an empty canonical set.
+    pub fn with_settings(mut self, settings: &Settings) -> Result<Self> {
+        self.canonical_dir = canonical_dir_from(&self.agenthd_root, settings)?;
+        Ok(self)
+    }
+
+    /// Create the agenthd root (settings + state parents) and the
+    /// output target trees so the binary can write to them on the
+    /// first run. The canonical source directory is intentionally
+    /// **not** created here: until the user configures a checkout
+    /// there is no local canonical, and creating one would silently
+    /// turn the historical `<agenthd_root>/agents` default into a
+    /// real source. A configured checkout's `agents/` directory
+    /// must already exist (see `validate_checkout_path`); the
+    /// runtime never has to make it.
     pub fn ensure_dirs(&self) -> Result<()> {
-        fs::create_dir_all(&self.canonical_dir)
-            .with_context(|| format!("create {}", self.canonical_dir.display()))?;
+        fs::create_dir_all(&self.agenthd_root)
+            .with_context(|| format!("create {}", self.agenthd_root.display()))?;
         fs::create_dir_all(&self.target_dir)
             .with_context(|| format!("create {}", self.target_dir.display()))?;
         fs::create_dir_all(&self.pi_target_dir)
@@ -116,101 +188,19 @@ impl Paths {
     }
 }
 
-/// One-shot legacy migration: move `$XDG_CONFIG_HOME/agenthd` or
-/// `$HOME/.config/agenthd` to `$HOME/.agenthd` when the latter is missing.
-///
-/// Safe by construction:
-/// - Never overwrites or merges into an existing `$HOME/.agenthd`.
-/// - If both locations exist, the new `.agenthd` wins and the legacy directory
-///   is left untouched so the user can inspect or remove it manually.
-/// - Returns `Ok(true)` only when a rename happened.
-///
-/// The OpenCode target directory is not touched by this helper.
-pub fn migrate_legacy_agenthd(home: &Path, xdg_config_home: Option<&Path>) -> Result<bool> {
-    let target = home.join(".agenthd");
-    if target.exists() {
-        return Ok(false);
-    }
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(xdg) = xdg_config_home {
-        if !xdg.as_os_str().is_empty() {
-            candidates.push(xdg.join("agenthd"));
-        }
-    }
-    candidates.push(home.join(".config").join("agenthd"));
-    for candidate in candidates {
-        if !candidate.is_dir() {
-            continue;
-        }
-        move_dir(&candidate, &target).with_context(|| {
-            format!(
-                "migrate legacy `{}` to `{}`",
-                candidate.display(),
-                target.display()
-            )
-        })?;
-        return Ok(true);
-    }
-    Ok(false)
-}
-
-fn move_dir(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
-            copy_dir_recursive(src, dst)?;
-            fs::remove_dir_all(src).with_context(|| format!("remove {}", src.display()))?;
-            Ok(())
-        }
-        Err(e) => Err(anyhow!(
-            "rename `{}` -> `{}`: {}",
-            src.display(),
-            dst.display(),
-            e
-        )),
-    }
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
-    fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
-    for entry in fs::read_dir(src).with_context(|| format!("read_dir {}", src.display()))? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_recursive(&from, &to)?;
-        } else if file_type.is_symlink() {
-            // Skip symlinks: legacy config should not contain them, and copying
-            // blindly could escape the destination.
-            continue;
-        } else if file_type.is_file() {
-            fs::copy(&from, &to)
-                .with_context(|| format!("copy `{}` -> `{}`", from.display(), to.display()))?;
-        }
-    }
-    Ok(())
-}
-
 /// On-disk ownership manifest.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct State {
     #[serde(default)]
-    pub starters_seeded: bool,
-    #[serde(default)]
     pub installed: BTreeMap<String, String>,
     #[serde(default)]
     pub pi_installed: BTreeMap<String, String>,
-    #[serde(default)]
-    pub plugin_hash: Option<String>,
 }
 
 impl State {
-    /// Per-target owned hash map. Exposed to the `sync` submodule so the
-    /// planner can read both `installed` and `pi_installed` uniformly.
+    /// Per-target owned hash map. Exposed to the `sync` submodule so
+    /// the planner can read both `installed` and `pi_installed`
+    /// uniformly.
     pub(in crate::store) fn installed(&self, target: SyncTarget) -> &BTreeMap<String, String> {
         match target {
             SyncTarget::OpenCode => &self.installed,
@@ -258,8 +248,7 @@ pub fn hash_file(path: &Path) -> Result<Option<String>> {
 }
 
 /// Lowercase-hex SHA-256 of an in-memory byte slice. Shared with the
-/// `sync` and `plugin` submodules so the planner, installer, and
-/// bundled-prompt refresh all hash identically.
+/// `sync` submodule so the planner and installer hash identically.
 pub(in crate::store) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);

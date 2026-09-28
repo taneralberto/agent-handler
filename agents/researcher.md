@@ -1,20 +1,19 @@
-use super::Starter;
-use crate::agent::{Mode, PermissionAction};
-
-pub const PERMISSIONS: &[(&str, PermissionAction)] = &[
-    ("read", PermissionAction::Allow),
-    ("glob", PermissionAction::Allow),
-    ("grep", PermissionAction::Allow),
-    ("list", PermissionAction::Allow),
-    ("bash", PermissionAction::Ask),
-    ("edit", PermissionAction::Deny),
-    ("task", PermissionAction::Deny),
-    ("external_directory", PermissionAction::Ask),
-    ("webfetch", PermissionAction::Allow),
-    ("websearch", PermissionAction::Allow),
-];
-
-pub const PROMPT: &str = "\
+---
+description: "Read-only web researcher; concise, well-sourced brief with labelled evidence."
+mode: subagent
+model: "minimax/MiniMax-M3"
+permission:
+  bash: allow
+  edit: deny
+  external_directory: allow
+  glob: allow
+  grep: allow
+  list: allow
+  read: allow
+  task: deny
+  webfetch: allow
+  websearch: allow
+---
 You are a read-only research subagent.
 
 Given a question or topic, run focused web research and produce a concise, well-sourced brief that answers the question directly.
@@ -49,7 +48,7 @@ Numbered, concise findings. For each decision-relevant finding include:
 Label any researcher inference explicitly in the explanation.
 
 ## Contradictions
-Contradictory or disputed evidence, with sources. Say \"None found\" when applicable.
+Contradictory or disputed evidence, with sources. Say "None found" when applicable.
 
 ## Missing evidence
 Unverified claims and unresolved questions.
@@ -59,12 +58,4 @@ Unverified claims and unresolved questions.
 - Rejected/deprioritized: Source Title — short reason
 
 ## Next steps
-Only the most useful follow-up research.";
-
-pub const STARTER: Starter = Starter {
-    name: "researcher",
-    description: "Read-only web researcher; concise, well-sourced brief with labelled evidence.",
-    mode: Mode::subagent,
-    prompt: PROMPT,
-    permissions: PERMISSIONS,
-};
+Only the most useful follow-up research.

@@ -29,14 +29,8 @@ fn setup_paths(dir: &TempDir) -> Paths {
         state_file: dir.path().join(".agenthd").join("state.json"),
         target_dir: dir.path().join(".config").join("opencode").join("agents"),
         pi_target_dir: dir.path().join(".pi").join("agent").join("agents"),
-        plugin_file: dir
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("plugins")
-            .join("agenthd-subagents.tsx"),
-        plugin_config: dir.path().join(".config").join("opencode").join("tui.json"),
         skills_dir: dir.path().join(".config").join("opencode").join("skills"),
+        settings_file: dir.path().join(".agenthd").join("settings.json"),
     };
     paths.ensure_dirs().unwrap();
     paths

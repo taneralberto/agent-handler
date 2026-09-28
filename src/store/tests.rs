@@ -1,22 +1,13 @@
-//! Verbatim port of `src/store.rs`'s `mod tests` block. Re-homed to a
-//! dedicated file so the production siblings stay focused; the tests
-//! themselves are unchanged, modulo the explicit imports that replace
-//! the old `use super::*;` shortcut.
-//!
-//! The store module's mod-relative items (`super::*` from here) cover
-//! everything `pub` or `pub(crate)` at the module level (`Paths`,
-//! `State`, `migrate_legacy_agenthd`, `hash_file`, `write_target`,
-//! `sha256_hex`, `PLUGIN_FILENAME`). Items introduced by the split
-//! that only tests need (`source_hash`) are pulled from their owning
-//! submodule under `pub(in crate::store)` so the helper visibility
-//! stays narrower than crate-wide.
+//! Store unit tests. The `pub(super)` helper visibility matches the
+//! existing convention; consumers reach into the store via the
+//! `crate::store` re-exports.
 
 use super::canonical::source_hash;
 use super::sha256_hex;
-use super::PLUGIN_FILENAME;
 use super::*;
 use crate::agent::{starter_agent, Agent, Mode, PermissionAction, STARTERS};
 use std::collections::BTreeMap;
+use std::fs;
 use tempfile::TempDir;
 
 fn setup_paths(dir: &TempDir) -> Paths {
@@ -26,17 +17,36 @@ fn setup_paths(dir: &TempDir) -> Paths {
         state_file: dir.path().join(".agenthd").join("state.json"),
         target_dir: dir.path().join(".config").join("opencode").join("agents"),
         pi_target_dir: dir.path().join(".pi").join("agent").join("agents"),
-        plugin_file: dir
-            .path()
-            .join(".config")
-            .join("opencode")
-            .join("plugins")
-            .join(PLUGIN_FILENAME),
-        plugin_config: dir.path().join(".config").join("opencode").join("tui.json"),
         skills_dir: dir.path().join(".config").join("opencode").join("skills"),
+        settings_file: dir.path().join(".agenthd").join("settings.json"),
     };
     paths.ensure_dirs().unwrap();
     paths
+}
+
+/// Build a `Paths` whose `canonical_dir` points at a real
+/// `<checkout>/agents` directory inside the tempdir, and seed the
+/// bundled starters into it. Mirrors what the production runtime
+/// does after `with_settings` is called: the canonical directory is
+/// the checkout's `agents/`, the agenthd root stays empty of
+/// agent files.
+fn setup_paths_with_checkout(dir: &TempDir) -> (Paths, std::path::PathBuf) {
+    let paths = setup_paths(dir);
+    let checkout = dir.path().join("checkout");
+    let agents = checkout.join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    for starter in STARTERS {
+        fs::write(
+            agents.join(format!("{}.md", starter.name)),
+            starter_agent(starter).render(),
+        )
+        .unwrap();
+    }
+    let paths = Paths {
+        canonical_dir: agents,
+        ..paths
+    };
+    (paths, checkout)
 }
 
 fn read_target(paths: &Paths, name: &str) -> Option<String> {
@@ -49,17 +59,6 @@ fn read_pi_target(paths: &Paths, name: &str) -> Option<String> {
     fs::read_to_string(&path).ok()
 }
 
-/// Lint helper: collect a summary of parsed agents without bailing on bad
-/// files. Lives next to the tests because it is only used by them.
-#[allow(dead_code)]
-fn lint(paths: &Paths) -> Vec<String> {
-    let mut errors = Vec::new();
-    if let Err(e) = load_canonical(paths) {
-        errors.push(e.to_string());
-    }
-    errors
-}
-
 #[test]
 fn paths_resolve_agenthd_root_follows_home_only() {
     let p = Paths::resolve(Some("/tmp/abc"), Some("/tmp/home")).unwrap();
@@ -68,6 +67,10 @@ fn paths_resolve_agenthd_root_follows_home_only() {
     assert_eq!(p.state_file, PathBuf::from("/tmp/home/.agenthd/state.json"));
     assert_eq!(p.target_dir, PathBuf::from("/tmp/abc/opencode/agents"));
     assert_eq!(p.pi_target_dir, PathBuf::from("/tmp/home/.pi/agent/agents"));
+    assert_eq!(
+        p.settings_file,
+        PathBuf::from("/tmp/home/.agenthd/settings.json")
+    );
 }
 
 #[test]
@@ -103,7 +106,6 @@ fn paths_reject_empty_xdg() {
 
 #[test]
 fn paths_reject_missing_home() {
-    // HOME is required for the agenthd root, even if XDG is set.
     assert!(Paths::resolve(Some("/xdg"), None).is_err());
     assert!(Paths::resolve(None, None).is_err());
 }
@@ -115,281 +117,66 @@ fn paths_reject_empty_home() {
 }
 
 #[test]
-fn migrate_legacy_agenthd_moves_xdg_layout_to_home() {
-    let dir = TempDir::new().unwrap();
-    let home = dir.path();
-    let xdg = home.join("xdg");
-    fs::create_dir_all(xdg.join("agenthd").join("agents")).unwrap();
-    let legacy_state = xdg.join("agenthd").join("state.json");
-    let legacy_marker = xdg.join("agenthd").join("agents").join("custom.md");
-    fs::write(&legacy_state, b"{\"installed\":{}}").unwrap();
-    fs::write(&legacy_marker, b"hello").unwrap();
+fn settings_default_canonical_dir_is_local_default() {
+    // Without a `with_settings` call the canonical dir is the
+    // historical local default. The runtime always re-points it
+    // through `with_settings` on startup; tests rely on this so
+    // they can construct a `Paths` and immediately mutate it.
+    let p = Paths::resolve(None, Some("/tmp/home")).unwrap();
+    assert_eq!(p.canonical_dir, PathBuf::from("/tmp/home/.agenthd/agents"));
+}
 
-    let migrated = migrate_legacy_agenthd(home, Some(xdg.as_path())).unwrap();
-    assert!(migrated, "expected a migration to occur");
-    assert!(home.join(".agenthd").is_dir());
-    assert!(home.join(".agenthd/agents/custom.md").is_file());
-    assert_eq!(
-        fs::read_to_string(home.join(".agenthd/state.json")).unwrap(),
-        "{\"installed\":{}}"
+#[test]
+fn with_settings_repoints_canonical_dir() {
+    let dir = TempDir::new().unwrap();
+    let paths = setup_paths(&dir);
+    let checkout = dir.path().join("checkout");
+    fs::create_dir_all(checkout.join("agents")).unwrap();
+    let settings = Settings::new(checkout.to_string_lossy().into_owned());
+    let after = paths.with_settings(&settings).unwrap();
+    assert_eq!(after.canonical_dir, checkout.join("agents"));
+}
+
+#[test]
+fn with_settings_rejects_missing_checkout() {
+    let dir = TempDir::new().unwrap();
+    let paths = setup_paths(&dir);
+    let settings = Settings::new("/this/path/does/not/exist/agenthd-test");
+    let err = paths.with_settings(&settings).unwrap_err().to_string();
+    assert!(
+        err.contains("does not exist"),
+        "expected missing-checkout error, got: {err}"
     );
-    assert!(!xdg.join("agenthd").exists());
-
-    // Idempotent: a second call is a no-op.
-    let again = migrate_legacy_agenthd(home, Some(xdg.as_path())).unwrap();
-    assert!(!again);
-}
-
-#[test]
-fn migrate_legacy_agenthd_moves_home_config_layout_to_home() {
-    let dir = TempDir::new().unwrap();
-    let home = dir.path();
-    fs::create_dir_all(home.join(".config/agenthd/agents")).unwrap();
-    fs::write(home.join(".config/agenthd/state.json"), b"{}").unwrap();
-    fs::write(home.join(".config/agenthd/agents/extra.md"), b"x").unwrap();
-
-    let migrated = migrate_legacy_agenthd(home, None).unwrap();
-    assert!(migrated);
-    assert!(home.join(".agenthd").is_dir());
-    assert!(home.join(".agenthd/agents/extra.md").is_file());
-    assert!(!home.join(".config/agenthd").exists());
-}
-
-#[test]
-fn migrate_legacy_agenthd_noop_when_nothing_legacy() {
-    let dir = TempDir::new().unwrap();
-    let home = dir.path();
-    let migrated = migrate_legacy_agenthd(home, None).unwrap();
-    assert!(!migrated);
-    assert!(!home.join(".agenthd").exists());
-}
-
-#[test]
-fn migrate_legacy_agenthd_preserves_existing_home_layout() {
-    let dir = TempDir::new().unwrap();
-    let home = dir.path();
-    fs::create_dir_all(home.join(".agenthd/agents")).unwrap();
-    let current = home.join(".agenthd/agents/keep.md");
-    fs::write(&current, b"current").unwrap();
-
-    // Also create a legacy dir that should NOT be touched.
-    fs::create_dir_all(home.join(".config/agenthd/agents")).unwrap();
-    let legacy = home.join(".config/agenthd/agents/legacy.md");
-    fs::write(&legacy, b"legacy").unwrap();
-
-    let migrated = migrate_legacy_agenthd(home, None).unwrap();
-    assert!(!migrated, "must not overwrite existing .agenthd");
-    assert_eq!(fs::read_to_string(&current).unwrap(), "current");
-    assert_eq!(fs::read_to_string(&legacy).unwrap(), "legacy");
-    assert!(home.join(".config/agenthd").is_dir());
-}
-
-#[test]
-fn migrate_legacy_agenthd_prefers_xdg_legacy_over_home_config() {
-    let dir = TempDir::new().unwrap();
-    let home = dir.path();
-    let xdg = home.join("xdg");
-    fs::create_dir_all(xdg.join("agenthd/agents")).unwrap();
-    fs::write(xdg.join("agenthd/agents/from_xdg.md"), b"xdg").unwrap();
-    fs::create_dir_all(home.join(".config/agenthd/agents")).unwrap();
-    fs::write(home.join(".config/agenthd/agents/from_home.md"), b"home").unwrap();
-
-    let migrated = migrate_legacy_agenthd(home, Some(xdg.as_path())).unwrap();
-    assert!(migrated);
-    // The XDG candidate was moved.
-    assert!(home.join(".agenthd/agents/from_xdg.md").is_file());
-    assert!(!home.join(".agenthd/agents/from_home.md").exists());
-    // The HOME/.config/agenthd candidate is left alone (priority is XDG).
-    assert!(home.join(".config/agenthd/agents/from_home.md").is_file());
-}
-
-#[test]
-fn migrate_legacy_agenthd_ignores_legacy_files_that_are_not_dirs() {
-    let dir = TempDir::new().unwrap();
-    let home = dir.path();
-    // A stray file at the legacy path is not a directory and must be skipped.
-    fs::create_dir_all(home.join(".config")).unwrap();
-    fs::write(home.join(".config/agenthd"), b"stray").unwrap();
-    let migrated = migrate_legacy_agenthd(home, None).unwrap();
-    assert!(!migrated);
-    assert!(home.join(".config/agenthd").is_file());
-    assert!(!home.join(".agenthd").exists());
 }
 
 #[test]
 fn compute_plan_is_read_only() {
     let dir = TempDir::new().unwrap();
     let home = dir.path().to_str().unwrap();
-    let paths = Paths::resolve(None, Some(home)).unwrap();
-
+    // Compute-plan now validates the configured canonical source
+    // up front, so the "read-only" contract is exercised against
+    // a real (but empty) checkout instead of an absent one. A
+    // missing checkout is an explicit error covered by the
+    // `plan_for_rejects_missing_source` test below.
+    let mut paths = Paths::resolve(None, Some(home)).unwrap();
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir_all(checkout.join("agents")).unwrap();
+    paths.canonical_dir = checkout.join("agents");
     assert!(compute_plan(&paths, &State::default()).unwrap().is_empty());
-    assert!(!paths.canonical_dir.exists());
+    // The planner must not create target directories on a fresh
+    // checkout that has nothing to install.
     assert!(!paths.target_dir.exists());
-}
-
-#[test]
-fn plugin_install_and_uninstall_are_owned_and_safe() {
-    let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
-
-    assert_eq!(
-        plugin_status(&paths, &state).unwrap(),
-        PluginStatus::NotInstalled
-    );
-    let (state, prior) = install_plugin(&paths, state).unwrap();
-    assert_eq!(prior, PluginStatus::NotInstalled);
-    assert_eq!(
-        plugin_status(&paths, &state).unwrap(),
-        PluginStatus::UpToDate
-    );
-    assert_eq!(
-        fs::read_to_string(&paths.plugin_file).unwrap(),
-        super::plugin::PLUGIN_SOURCE
-    );
-    let config: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&paths.plugin_config).unwrap()).unwrap();
-    assert_eq!(config["plugin"][0], super::plugin::PLUGIN_SPEC);
-
-    let state = uninstall_plugin(&paths, state).unwrap();
-    assert!(!paths.plugin_file.exists());
-    let config: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&paths.plugin_config).unwrap()).unwrap();
-    assert!(config.get("plugin").is_none());
-    assert!(state.plugin_hash.is_none());
-}
-
-#[test]
-fn seed_starters_is_idempotent_and_preserves_existing() {
-    let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (wrote, _) = seed_starters(&paths, State::default()).unwrap();
-    assert!(wrote);
-
-    let scout = paths.canonical_dir.join("scout.md");
-    let bytes = fs::read(&scout).unwrap();
-    // Pre-existing user file: rename to a sentinel and re-seed.
-    fs::write(&scout, b"# existing user file\n").unwrap();
-    let (_wrote2, state) = seed_starters(&paths, State::load(&paths.state_file).unwrap()).unwrap();
-    assert_eq!(fs::read(&scout).unwrap(), b"# existing user file\n");
-    assert!(state.starters_seeded);
-
-    // Restore from earlier bytes so we keep that file valid; we already overwrote.
-    fs::write(&scout, &bytes).unwrap();
-    // Re-seed; should still preserve.
-    let (_wrote3, _) = seed_starters(&paths, State::load(&paths.state_file).unwrap()).unwrap();
-    assert!(!fs::read(&scout).unwrap().is_empty());
-}
-
-#[test]
-fn seed_starters_adds_new_roles_without_overwriting_user_files() {
-    // Simulates an old canonical directory from before delegate, oracle,
-    // orchestrator, planner, and researcher existed: only scout, reviewer,
-    // and worker are present with user-modified sentinel bytes. Seeding
-    // must add the five new starters and preserve existing bytes.
-    let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-
-    let sentinels = [
-        ("scout", b"# user-edited scout\nkeep me\n".to_vec()),
-        ("reviewer", b"# user-edited reviewer\nkeep me\n".to_vec()),
-        ("worker", b"# user-edited worker\nkeep me\n".to_vec()),
-    ];
-    for (name, bytes) in &sentinels {
-        fs::write(paths.canonical_dir.join(format!("{}.md", name)), bytes).unwrap();
-    }
-
-    let (wrote, state) = seed_starters(&paths, State::default()).unwrap();
-    assert!(wrote, "expected the five new starters to be written");
-    assert!(state.starters_seeded);
-
-    // Existing user-edited files are not overwritten.
-    for (name, expected) in &sentinels {
-        let actual = fs::read(paths.canonical_dir.join(format!("{}.md", name))).unwrap();
-        assert_eq!(
-            &actual, expected,
-            "user-edited `{}` was modified by seed_starters",
-            name
-        );
-    }
-
-    // The five new starters are seeded with parseable canonical content.
-    for name in [
-        "delegate",
-        "oracle",
-        "orchestrator",
-        "planner",
-        "researcher",
-    ] {
-        let path = paths.canonical_dir.join(format!("{}.md", name));
-        assert!(path.exists(), "missing seeded file `{}`", name);
-        let agent = Agent::read(&path)
-            .unwrap_or_else(|e| panic!("seeded `{}` does not parse as a valid agent: {}", name, e));
-        assert_eq!(
-            agent.mode,
-            if name == "orchestrator" {
-                Mode::primary
-            } else {
-                Mode::subagent
-            }
-        );
-        assert!(agent.model.is_none());
-        assert!(!agent.description.trim().is_empty());
-        assert!(!agent.prompt.trim().is_empty());
-    }
-
-    // A second invocation touches nothing: nothing was written.
-    let (wrote2, _) = seed_starters(&paths, State::load(&paths.state_file).unwrap()).unwrap();
-    assert!(!wrote2);
-    for (name, expected) in &sentinels {
-        let actual = fs::read(paths.canonical_dir.join(format!("{}.md", name))).unwrap();
-        assert_eq!(&actual, expected);
-    }
-}
-
-#[test]
-fn seed_starters_does_not_overwrite_user_planner() {
-    // A user who hand-wrote a `planner.md` (or who is migrating from a
-    // Pi-format planner file) must not have their bytes clobbered by a
-    // normal startup seed. startup seeding only writes missing files.
-    let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-
-    let planner_body =
-        b"---\ndescription: custom planner\nmode: subagent\n---\nuser-defined body\n";
-    fs::write(paths.canonical_dir.join("planner.md"), planner_body).unwrap();
-
-    let (wrote, _) = seed_starters(&paths, State::default()).unwrap();
-    // The other seven starters were missing, so they were written. The
-    // user's planner.md must remain untouched regardless.
-    assert!(wrote, "the seven missing starters should be seeded");
-    assert_eq!(
-        fs::read(paths.canonical_dir.join("planner.md")).unwrap(),
-        planner_body,
-        "user planner.md must survive startup seeding byte-for-byte"
-    );
-    // And the seeded starter bytes parse cleanly so future refresh
-    // rounds can act on them.
-    for name in [
-        "delegate",
-        "oracle",
-        "orchestrator",
-        "researcher",
-        "reviewer",
-        "scout",
-        "worker",
-    ] {
-        Agent::read(&paths.canonical_dir.join(format!("{}.md", name)))
-            .unwrap_or_else(|e| panic!("seeded `{}` invalid: {}", name, e));
-    }
+    assert!(!paths.pi_target_dir.exists());
+    // And it must not silently recreate the agenthd-root agents
+    // shortcut that the single-source design retired.
+    assert!(!paths.agenthd_root.join("agents").exists());
 }
 
 #[test]
 fn apply_safe_fresh_install() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
     let state = State::default();
-    let (_, state) = seed_starters(&paths, state).unwrap();
     let plan = compute_plan(&paths, &state).unwrap();
     let statuses: Vec<&str> = plan.iter().map(|i| i.status.label()).collect();
     assert!(statuses.iter().all(|s| *s == "not installed"));
@@ -407,8 +194,8 @@ fn apply_safe_fresh_install() {
 #[test]
 fn pi_sync_renders_pi_subagents() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
     assert!(plan
         .iter()
@@ -431,8 +218,8 @@ fn pi_sync_renders_pi_subagents() {
 #[test]
 fn apply_safe_noop_when_up_to_date() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let first = compute_plan(&paths, &state).unwrap();
     let (state, _) = apply_safe(&paths, state, first).unwrap();
     let second = compute_plan(&paths, &state).unwrap();
@@ -442,30 +229,13 @@ fn apply_safe_noop_when_up_to_date() {
 }
 
 #[test]
-fn apply_safe_noop_preserves_manifest_bytes() {
-    let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
-    let install_plan = compute_plan(&paths, &state).unwrap();
-    let (state, _) = apply_safe(&paths, state, install_plan).unwrap();
-    let compact_manifest = serde_json::to_vec(&state).unwrap();
-    fs::write(&paths.state_file, &compact_manifest).unwrap();
-
-    let noop_plan = compute_plan(&paths, &state).unwrap();
-    let (_, outcomes) = apply_safe(&paths, state.clone(), noop_plan).unwrap();
-    assert!(outcomes.iter().all(|o| o.action == "kept"));
-    assert_eq!(fs::read(&paths.state_file).unwrap(), compact_manifest);
-}
-
-#[test]
 fn apply_safe_update_when_target_matches_last_installed() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let first = compute_plan(&paths, &state).unwrap();
     let (state, _) = apply_safe(&paths, state, first).unwrap();
 
-    // Modify canonical and verify safe update.
     let scout_path = paths.canonical_dir.join("scout.md");
     let prior = hash_file(&scout_path).unwrap();
     let mut agent = Agent::read(&scout_path).unwrap();
@@ -485,9 +255,8 @@ fn apply_safe_update_when_target_matches_last_installed() {
 #[test]
 fn safe_sync_preserves_unowned_target() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
-    // Add an unowned target.
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let unowned = paths.target_dir.join("external.md");
     let original = "---\ndescription: external\nmode: subagent\n---\nbody\n";
     fs::write(&unowned, original).unwrap();
@@ -506,12 +275,11 @@ fn safe_sync_preserves_unowned_target() {
 #[test]
 fn safe_sync_preserves_externally_modified_owned_target() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
     let (state, _) = apply_safe(&paths, state, plan).unwrap();
 
-    // Externally modify the target.
     let target = paths.target_dir.join("scout.md");
     let original = fs::read_to_string(&target).unwrap();
     let mutated = original.replace("read-only codebase scout", "tampered");
@@ -529,12 +297,11 @@ fn safe_sync_preserves_externally_modified_owned_target() {
 #[test]
 fn safe_removal_only_when_target_unchanged() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
     let (state, _) = apply_safe(&paths, state, plan).unwrap();
 
-    // Delete canonical, leaving target intact.
     delete_canonical(&paths, "scout").unwrap();
     let plan = compute_plan(&paths, &state).unwrap();
     let scout = plan.iter().find(|i| i.filename == "scout.md").unwrap();
@@ -542,7 +309,6 @@ fn safe_removal_only_when_target_unchanged() {
     let (state, _) = apply_safe(&paths, state, plan).unwrap();
     assert!(!paths.target_dir.join("scout.md").exists());
 
-    // Modify a target that belongs to agenthd, then delete its canonical.
     let reviewer = paths.canonical_dir.join("reviewer.md");
     let prior = hash_file(&reviewer).unwrap();
     save_canonical(&paths, &Agent::read(&reviewer).unwrap(), prior.as_deref()).unwrap();
@@ -563,8 +329,8 @@ fn safe_removal_only_when_target_unchanged() {
 #[test]
 fn force_install_overwrites_conflict() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
     let (state, _) = apply_safe(&paths, state, plan).unwrap();
 
@@ -586,12 +352,11 @@ fn force_install_overwrites_conflict() {
 #[test]
 fn stale_manifest_entries_are_cleaned_up() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
     let (state, _) = apply_safe(&paths, state, plan).unwrap();
 
-    // Wipe both canonical and target, leaving stale manifest.
     for starter in STARTERS {
         fs::remove_file(paths.canonical_dir.join(format!("{}.md", starter.name))).unwrap();
         fs::remove_file(paths.target_dir.join(format!("{}.md", starter.name))).unwrap();
@@ -606,12 +371,11 @@ fn stale_manifest_entries_are_cleaned_up() {
 #[test]
 fn state_recovery_when_source_and_target_match() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
     let (_, _) = apply_safe(&paths, state, plan).unwrap();
 
-    // Simulate losing the manifest.
     fs::remove_file(&paths.state_file).unwrap();
     let state = State::load(&paths.state_file).unwrap();
     let plan = compute_plan(&paths, &state).unwrap();
@@ -626,8 +390,7 @@ fn state_recovery_when_source_and_target_match() {
 #[test]
 fn canonical_crud_and_rename() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
 
     let mut new_agent = Agent::new_default("helper".to_string()).unwrap();
     new_agent.description = "A new helper agent".to_string();
@@ -646,7 +409,6 @@ fn canonical_crud_and_rename() {
     assert!(!paths.canonical_dir.join("helper.md").exists());
     assert!(paths.canonical_dir.join("assistant.md").exists());
 
-    // Cannot rename onto existing file.
     let err = rename_canonical(&paths, "assistant", "scout");
     assert!(err.is_err());
 
@@ -657,11 +419,10 @@ fn canonical_crud_and_rename() {
 #[test]
 fn rejects_non_regular_target() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let first = compute_plan(&paths, &state).unwrap();
     let (state, _) = apply_safe(&paths, state, first).unwrap();
-    // Replace target with a directory.
     fs::remove_file(paths.target_dir.join("scout.md")).unwrap();
     fs::create_dir(paths.target_dir.join("scout.md")).unwrap();
     let result = compute_plan(&paths, &state);
@@ -680,17 +441,14 @@ fn atomic_write_target_replaces_file() {
 #[test]
 fn save_canonical_rejects_collision_when_prior_is_none() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
 
     let mut agent = Agent::read(&paths.canonical_dir.join("scout.md")).unwrap();
-    // Pretend the user typed a name that collides with an existing starter.
     agent.name = "scout".to_string();
     let err = save_canonical(&paths, &agent, None)
         .unwrap_err()
         .to_string();
     assert!(err.contains("refusing to overwrite"));
-    // The original bytes are untouched.
     assert!(fs::read_to_string(paths.canonical_dir.join("scout.md"))
         .unwrap()
         .contains("read-only codebase scout"));
@@ -699,24 +457,20 @@ fn save_canonical_rejects_collision_when_prior_is_none() {
 #[test]
 fn save_canonical_rejects_stale_write() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
 
     let scout_path = paths.canonical_dir.join("scout.md");
     let stale_hash = hash_file(&scout_path).unwrap();
-    // Another writer mutates the file directly, bypassing save_canonical.
     let original = fs::read_to_string(&scout_path).unwrap();
     let external = original.replace("read-only codebase scout", "externally rewritten");
     fs::write(&scout_path, &external).unwrap();
 
-    // The original editor tries to save with the stale hash.
     let mut agent = Agent::read(&scout_path).unwrap();
     agent.prompt = "Editor edit".to_string();
     let err = save_canonical(&paths, &agent, stale_hash.as_deref())
         .unwrap_err()
         .to_string();
     assert!(err.contains("changed on disk"));
-    // The post-conflict bytes win, not the editor's stale draft.
     assert!(fs::read_to_string(&scout_path)
         .unwrap()
         .contains("externally rewritten"));
@@ -726,6 +480,15 @@ fn save_canonical_rejects_stale_write() {
 fn ghost_manifest_entry_has_distinct_reason() {
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
+    // The planner now validates the canonical source up front, so
+    // seed an empty checkout-shaped agents directory for the
+    // manifest-only scenario this test exercises.
+    let checkout = dir.path().join("ghost-checkout");
+    std::fs::create_dir_all(checkout.join("agents")).unwrap();
+    let paths = Paths {
+        canonical_dir: checkout.join("agents"),
+        ..paths
+    };
     let mut state = State::default();
     state
         .installed
@@ -739,15 +502,14 @@ fn ghost_manifest_entry_has_distinct_reason() {
 #[test]
 fn force_install_adopts_when_target_now_matches_canonical() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, state) = seed_starters(&paths, State::default()).unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
     let (state, _) = apply_safe(&paths, state, plan).unwrap();
 
     let target = paths.target_dir.join("scout.md");
     let original = fs::read_to_string(&target).unwrap();
     fs::write(&target, original.replace("read-only", "tampered")).unwrap();
-    // Someone else syncs back to the canonical before we confirm.
     fs::write(&target, &original).unwrap();
 
     let (state, outcome) = force_install(&paths, state, SyncTarget::OpenCode, "scout.md").unwrap();
@@ -780,9 +542,18 @@ fn new_default_user_agent_has_safe_defaults() {
 
 #[test]
 fn plan_includes_manifest_only_target_as_unowned() {
-    // Sanity: a manifest-only entry for an absent target is reported.
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
+    // Seed an empty checkout-shaped agents directory so the
+    // canonical-source validation gate accepts the path. The test
+    // itself only inspects a manifest-only ghost entry, so the
+    // checkout stays empty.
+    let checkout = dir.path().join("manifest-only-checkout");
+    std::fs::create_dir_all(checkout.join("agents")).unwrap();
+    let paths = Paths {
+        canonical_dir: checkout.join("agents"),
+        ..paths
+    };
     let mut state = State::default();
     state
         .installed
@@ -802,6 +573,15 @@ fn plan_includes_manifest_only_target_as_unowned() {
 fn plan_includes_targets_with_duplicate_unowned_state() {
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
+    // Seed an empty checkout-shaped agents directory so the
+    // canonical-source validation gate accepts the path. The test
+    // focuses on a target-side orphan, not on canonical contents.
+    let checkout = dir.path().join("target-orphan-checkout");
+    std::fs::create_dir_all(checkout.join("agents")).unwrap();
+    let paths = Paths {
+        canonical_dir: checkout.join("agents"),
+        ..paths
+    };
     fs::write(paths.target_dir.join("extra.md"), b"hello").unwrap();
     let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
@@ -820,6 +600,9 @@ fn source_hash_matches_render() {
 fn load_canonical_collects_invalid_files() {
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
+    // `ensure_dirs` no longer creates `canonical_dir`: create it
+    // here because the loader needs an actual directory to read.
+    fs::create_dir_all(&paths.canonical_dir).unwrap();
     fs::write(
         paths.canonical_dir.join("good.md"),
         starter_agent(&STARTERS[0]).render(),
@@ -831,317 +614,1032 @@ fn load_canonical_collects_invalid_files() {
 }
 
 #[test]
-fn update_bundled_prompts_replaces_prompt_keeps_other_fields() {
-    // Description, mode, model, and permissions must survive the refresh.
-    // Only the prompt body should change.
+fn load_canonical_accepts_empty_agents_directory() {
+    // An empty `agents/` directory is intentional. A freshly cloned
+    // checkout with no `.md` files produces an empty map, not an
+    // error — the user may have cleared the directory themselves.
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
-
-    // Customize scout's non-prompt fields AND its prompt so the refresh
-    // actually has work to do. Otherwise the row would be reported as
-    // "kept" and we would not be exercising the write path at all.
-    let scout_path = paths.canonical_dir.join("scout.md");
-    let prior = hash_file(&scout_path).unwrap();
-    let mut agent = Agent::read(&scout_path).unwrap();
-    let original_description = agent.description.clone();
-    let original_mode = agent.mode;
-    let original_model = agent.model.clone();
-    let original_permissions = agent.permissions.clone();
-    assert_eq!(original_mode, Mode::subagent);
-    // Add a permission override that must survive the refresh.
-    agent
-        .permissions
-        .insert("read".to_string(), PermissionAction::Deny);
-    // Mutate the prompt so the refresh actually writes this file.
-    agent.prompt = "user-edited scout prompt that should be replaced\n".to_string();
-    save_canonical(&paths, &agent, prior.as_deref()).unwrap();
-
-    let outcomes = update_bundled_prompts(&paths).unwrap();
-    let scout = outcomes
-        .iter()
-        .find(|o| o.name == "scout")
-        .expect("scout outcome");
-    assert!(scout.ok, "scout outcome not ok: {:?}", scout);
-    assert_eq!(scout.action, "updated");
-
-    let refreshed = Agent::read(&scout_path).unwrap();
-    // Prompt is the bundled prompt body for scout.
-    assert_eq!(
-        refreshed.prompt,
-        STARTERS.iter().find(|s| s.name == "scout").unwrap().prompt
-    );
-    // Other fields preserved.
-    assert_eq!(refreshed.description, original_description);
-    assert_eq!(refreshed.mode, original_mode);
-    assert_eq!(refreshed.model, original_model);
-    assert_eq!(
-        refreshed.permissions.get("read"),
-        Some(&PermissionAction::Deny),
-        "user permission override must survive the refresh"
-    );
-    // Sanity: the customized prompt body really did differ before the
-    // refresh, so the "updated" outcome is meaningful.
-    assert_ne!(agent.prompt, refreshed.prompt);
-    let _ = original_permissions; // referenced for clarity
+    let agents = dir.path().join("checkout-empty").join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    let paths = Paths {
+        canonical_dir: agents,
+        ..paths
+    };
+    let agents = load_canonical(&paths).unwrap();
+    assert!(agents.is_empty());
 }
 
 #[test]
-fn update_bundled_prompts_reports_kept_when_already_current() {
-    // Freshly-seeded files already match STARTERS, so the run is a no-op
-    // and the report should say "kept" for each row.
+fn ensure_dirs_does_not_create_canonical() {
+    // `Paths::ensure_dirs` creates the agenthd root (settings +
+    // state parents) and the output target trees. It must NOT
+    // create `canonical_dir`: before a checkout is configured
+    // there is no local canonical directory, and creating one
+    // would silently turn `<agenthd_root>/agents` into a real
+    // source that the runtime never intends to ship.
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
-
-    let outcomes = update_bundled_prompts(&paths).unwrap();
-    assert_eq!(outcomes.len(), STARTERS.len());
-    for outcome in &outcomes {
-        assert!(outcome.ok, "outcome not ok: {:?}", outcome);
-        assert_eq!(
-            outcome.action, "kept",
-            "expected `kept` for fresh starter, got {:?}",
-            outcome
-        );
-    }
-}
-
-#[test]
-fn update_bundled_prompts_skips_missing_files_and_updates_others() {
-    // If the user deleted a bundled canonical, that row must be skipped
-    // (startup seeding owns creation). The other rows are still refreshed.
-    let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
-
-    // Delete scout so the refresh must skip it.
-    fs::remove_file(paths.canonical_dir.join("scout.md")).unwrap();
-
-    // Pre-mutate another starter so we can detect the refresh applied.
-    let worker_path = paths.canonical_dir.join("worker.md");
-    let prior = hash_file(&worker_path).unwrap();
-    let mut agent = Agent::read(&worker_path).unwrap();
-    agent.prompt = "stale worker prompt\n".to_string();
-    save_canonical(&paths, &agent, prior.as_deref()).unwrap();
-
-    let outcomes = update_bundled_prompts(&paths).unwrap();
-    let scout = outcomes.iter().find(|o| o.name == "scout").unwrap();
-    assert!(scout.ok);
-    assert_eq!(scout.action, "skipped");
+    // Reset to a fresh resolve so canonical_dir is the default and
+    // ensure_dirs has not yet been called.
+    let paths = Paths::resolve(None, Some(dir.path().to_str().unwrap())).unwrap();
+    paths.ensure_dirs().unwrap();
+    let agenthd_agents = paths.agenthd_root.join("agents");
     assert!(
-        scout.detail.contains("startup seeding"),
-        "skip detail should explain the contract: {:?}",
-        scout.detail
+        !agenthd_agents.exists(),
+        "ensure_dirs must not create the local canonical directory"
     );
-    // scout.md still does not exist.
-    assert!(!paths.canonical_dir.join("scout.md").exists());
-
-    // worker.md was refreshed to the bundled prompt.
-    let refreshed = Agent::read(&worker_path).unwrap();
-    let bundled_worker = STARTERS.iter().find(|s| s.name == "worker").unwrap();
-    assert_eq!(refreshed.prompt, bundled_worker.prompt);
+    // The output targets are present so the install / sync layers
+    // have somewhere to write.
+    assert!(paths.target_dir.is_dir());
+    assert!(paths.pi_target_dir.is_dir());
+    assert!(paths.skills_dir.is_dir());
+    assert!(paths.agenthd_root.is_dir());
 }
 
 #[test]
-fn update_bundled_prompts_leaves_user_created_agents_untouched() {
-    // User-created agents (anything not in `STARTERS`) must not be
-    // touched by the refresh — matching is by `STARTERS` membership,
-    // not by file-name proximity.
+fn ensure_dirs_does_not_create_checkout_agents() {
+    // The same contract applies after `with_settings` re-points
+    // canonical_dir at a configured checkout: ensure_dirs still
+    // must not create `<checkout>/agents/`. A configured checkout
+    // must already contain an `agents/` directory (validated at
+    // settings load); the runtime never has to make it.
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
-
-    // Custom agent — must survive verbatim.
-    let helper_path = paths.canonical_dir.join("helper.md");
-    let helper_body = "---\ndescription: helper\nmode: subagent\n---\ncustom helper body\n";
-    fs::write(&helper_path, helper_body).unwrap();
-
-    let outcomes = update_bundled_prompts(&paths).unwrap();
+    let checkout = dir.path().join("checkout");
+    fs::create_dir_all(checkout.join("agents")).unwrap();
+    let settings = Settings::new(checkout.to_string_lossy().into_owned());
+    let paths = paths.with_settings(&settings).unwrap();
+    paths.ensure_dirs().unwrap();
+    let agenthd_agents = paths.agenthd_root.join("agents");
     assert!(
-        outcomes.iter().all(|o| o.name != "helper"),
-        "custom agent must not be in the refresh set: {:?}",
-        outcomes
+        !agenthd_agents.exists(),
+        "ensure_dirs must not create <agenthd_root>/agents even after with_settings"
     );
-
-    // helper.md is byte-for-byte unchanged.
-    assert_eq!(fs::read_to_string(&helper_path).unwrap(), helper_body);
+    // The configured checkout's agents directory is untouched by
+    // ensure_dirs.
+    assert!(checkout.join("agents").is_dir());
 }
 
 #[test]
-fn update_bundled_prompts_refreshes_planner_prompt_preserving_frontmatter() {
-    // `planner` is part of `STARTERS`, so a user-customized planner.md
-    // must be refreshed back to the bundled prompt body on confirm,
-    // while description, mode, model, and permissions are preserved.
+fn startup_does_not_create_agenthd_agents() {
+    // The runtime never writes into `<agenthd_root>/agents/`: the
+    // canonical directory is always the configured checkout's
+    // `agents/`. After `Paths::resolve` + `with_settings` +
+    // `ensure_dirs` the agenthd-root agents directory must NOT
+    // exist: there is no legacy sibling directory the runtime
+    // creates for backwards compatibility — the binary never had
+    // a Local mode in the single-source design. This test pins the
+    // contract: a fresh machine with a configured checkout never
+    // has its agenthd-root agents touched by a CRUD round-trip.
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
-
-    let planner_path = paths.canonical_dir.join("planner.md");
-    let prior = hash_file(&planner_path).unwrap();
-    let mut agent = Agent::read(&planner_path).unwrap();
-    let original_description = agent.description.clone();
-    let original_mode = agent.mode;
-    let original_model = agent.model.clone();
-    let original_permissions = agent.permissions.clone();
-    assert_eq!(original_mode, Mode::subagent);
-    // User-set permission override must survive the refresh.
-    agent
-        .permissions
-        .insert("read".to_string(), PermissionAction::Deny);
-    // Mutate the prompt so the refresh actually has work to do.
-    agent.prompt = "user-edited planner prompt that should be replaced\n".to_string();
-    save_canonical(&paths, &agent, prior.as_deref()).unwrap();
-
-    let outcomes = update_bundled_prompts(&paths).unwrap();
-    let planner = outcomes
-        .iter()
-        .find(|o| o.name == "planner")
-        .expect("planner outcome");
-    assert!(planner.ok, "planner outcome not ok: {:?}", planner);
-    assert_eq!(planner.action, "updated");
-
-    let refreshed = Agent::read(&planner_path).unwrap();
-    // Prompt body is the bundled planner body.
-    let bundled_planner = STARTERS.iter().find(|s| s.name == "planner").unwrap();
-    assert_eq!(refreshed.prompt, bundled_planner.prompt);
-    // Other frontmatter fields preserved.
-    assert_eq!(refreshed.description, original_description);
-    assert_eq!(refreshed.mode, original_mode);
-    assert_eq!(refreshed.model, original_model);
-    assert_eq!(
-        refreshed.permissions.get("read"),
-        Some(&PermissionAction::Deny),
-        "user permission override must survive the refresh"
-    );
-    // The customized prompt body really did differ before the refresh.
-    assert_ne!(agent.prompt, refreshed.prompt);
-    // Read-only permissions are still in force after the refresh: the
-    // user override on `read` (Deny) wins over the bundled default
-    // (Allow), while edit/task are still denied and bash stays at ask.
-    assert_eq!(
-        refreshed.permissions.get("edit"),
-        Some(&PermissionAction::Deny)
-    );
-    assert_eq!(
-        refreshed.permissions.get("task"),
-        Some(&PermissionAction::Deny)
-    );
-    assert_eq!(
-        refreshed.permissions.get("bash"),
-        Some(&PermissionAction::Ask)
-    );
-    assert_eq!(
-        refreshed.permissions.get("read"),
-        Some(&PermissionAction::Deny),
-        "user permission override must survive the refresh"
-    );
-    let _ = original_permissions; // referenced for clarity
-}
-
-#[test]
-fn update_bundled_prompts_continues_after_per_file_failure() {
-    // Simulate an external edit on scout.md between read and save so the
-    // save_canonical stale-write guard rejects that one file. The other
-    // five starters must still be refreshed.
-    let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
-
-    // Mutate every bundled file so the refresh wants to write all of
-    // them, then externally rewrite scout.md's on-disk bytes after our
-    // helper captures the prior hash. The simplest way to provoke the
-    // stale-write path here is to make scout.md unreadable to the parser
-    // by replacing it with bytes that fail frontmatter parsing. A parse
-    // failure aborts only that one row.
-    let scout_path = paths.canonical_dir.join("scout.md");
-    // Capture prior hash for every starter so we can verify the
-    // post-refresh content where appropriate.
-    let worker_path = paths.canonical_dir.join("worker.md");
-    let prior_worker = hash_file(&worker_path).unwrap();
-    let mut worker_agent = Agent::read(&worker_path).unwrap();
-    worker_agent.prompt = "stale worker prompt\n".to_string();
-    save_canonical(&paths, &worker_agent, prior_worker.as_deref()).unwrap();
-
-    // Make scout unparseable so the per-file read step fails for that
-    // row only.
-    fs::write(&scout_path, b"not a valid frontmatter document").unwrap();
-
-    let outcomes = update_bundled_prompts(&paths).unwrap();
-    let scout = outcomes.iter().find(|o| o.name == "scout").unwrap();
-    assert!(!scout.ok, "scout should be reported as errored");
-    assert_eq!(scout.action, "error");
+    let checkout = dir.path().join("checkout");
+    fs::create_dir_all(checkout.join("agents")).unwrap();
+    let settings = Settings::new(checkout.to_string_lossy().into_owned());
+    let paths = paths.with_settings(&settings).unwrap();
+    let agenthd_agents = paths.agenthd_root.join("agents");
     assert!(
-        scout.detail.contains("read") || scout.detail.contains("frontmatter"),
-        "scout error should mention the read/parse failure: {:?}",
-        scout.detail
+        !agenthd_agents.exists(),
+        "agenthd_root/agents must never exist"
     );
-
-    // The other starters were still processed independently.
-    let worker = outcomes.iter().find(|o| o.name == "worker").unwrap();
-    assert!(worker.ok, "worker should still be refreshed: {:?}", worker);
-    let bundled_worker = STARTERS.iter().find(|s| s.name == "worker").unwrap();
-    assert_eq!(
-        Agent::read(&worker_path).unwrap().prompt,
-        bundled_worker.prompt
-    );
-
-    // scout.md was not rewritten by the refresh: the stale bytes are
-    // still on disk, so the user can recover manually.
-    assert_eq!(
-        fs::read_to_string(&scout_path).unwrap(),
-        "not a valid frontmatter document"
-    );
+    assert!(!agenthd_agents.join("scout.md").exists());
+    // CRUD round-trip on the checkout does not touch the absent
+    // legacy directory.
+    let mut agent = Agent::new_default("helper".to_string()).unwrap();
+    agent.description = "Test helper".to_string();
+    agent.prompt = "help".into();
+    save_canonical(&paths, &agent, None).unwrap();
+    assert!(checkout.join("agents").join("helper.md").exists());
+    assert!(!agenthd_agents.join("helper.md").exists());
 }
 
 #[test]
-fn update_bundled_prompts_writes_exactly_when_prompt_differs() {
-    // Regression guard: a starter whose prompt already matches must be
-    // reported as "kept" with no write (no spurious mtime bump). A
-    // starter whose prompt has been edited by the user must be reported
-    // as "updated" with the bundled prompt restored.
+fn settings_round_trip() {
     let dir = TempDir::new().unwrap();
-    let paths = setup_paths(&dir);
-    let (_, _) = seed_starters(&paths, State::default()).unwrap();
+    let path = settings_file_path(&dir.path().join(".agenthd"));
+    let settings = Settings::new("/some/abs/path");
+    save_settings(&path, &settings).unwrap();
+    let loaded = load_settings(&path).unwrap().unwrap();
+    assert_eq!(loaded, settings);
+}
 
-    // Capture the original prompt bytes so we can detect mtime bumps.
-    let delegate_path = paths.canonical_dir.join("delegate.md");
-    let delegate_before = fs::metadata(&delegate_path).unwrap().modified().unwrap();
+#[test]
+fn canonical_dir_from_rejects_missing_checkout() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join(".agenthd");
+    let settings = Settings::new("/this/path/does/not/exist/agenthd-test");
+    let err = canonical_dir_from(&root, &settings)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not exist"), "got: {err}");
+}
 
-    // Edit scout's prompt so the refresh wants to write it.
-    let scout_path = paths.canonical_dir.join("scout.md");
-    let prior = hash_file(&scout_path).unwrap();
-    let mut scout = Agent::read(&scout_path).unwrap();
-    scout.prompt = "the user changed this on purpose\n".to_string();
-    save_canonical(&paths, &scout, prior.as_deref()).unwrap();
+#[test]
+fn canonical_dir_from_rejects_empty_checkout_path() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join(".agenthd");
+    let settings = Settings::new("");
+    let err = canonical_dir_from(&root, &settings)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no checkout_path"), "got: {err}");
+}
 
-    // Sleep long enough that any write produces a strictly newer mtime
-    // on coarse-grained filesystems. macOS HFS+ has 1-second mtime
-    // granularity, so use a small sleep here.
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+#[test]
+fn validate_checkout_accepts_empty_agents_dir() {
+    let dir = TempDir::new().unwrap();
+    let agents = dir.path().join("agents");
+    fs::create_dir_all(&agents).unwrap();
+    validate_checkout_path(dir.path()).unwrap();
+}
 
-    let outcomes = update_bundled_prompts(&paths).unwrap();
-    let delegate = outcomes.iter().find(|o| o.name == "delegate").unwrap();
-    assert_eq!(delegate.action, "kept", "delegate was a no-op");
-    let delegate_after = fs::metadata(&delegate_path).unwrap().modified().unwrap();
-    assert_eq!(
-        delegate_before, delegate_after,
-        "kept rows must not bump the file mtime"
-    );
-
-    let scout_outcome = outcomes.iter().find(|o| o.name == "scout").unwrap();
-    assert_eq!(scout_outcome.action, "updated", "scout must be rewritten");
-    let scout_after = fs::metadata(&scout_path).unwrap().modified().unwrap();
-    assert!(
-        scout_after > delegate_before,
-        "updated row must produce a newer mtime"
-    );
+#[test]
+fn validate_checkout_rejects_missing_agents_subdir() {
+    let dir = TempDir::new().unwrap();
+    let err = validate_checkout_path(dir.path()).unwrap_err().to_string();
+    assert!(err.contains("does not exist"), "got: {err}");
 }
 
 #[test]
 fn _ensure_mode_action_in_scope() {
-    // Smoke test that the imports stay in scope.
     let mut map: BTreeMap<String, Mode> = BTreeMap::new();
     map.insert("a".into(), Mode::subagent);
     let _action = PermissionAction::Allow;
     assert!(map.contains_key("a"));
+}
+
+// ---------- Safety tests: canonical-source validation ----------
+//
+// The four tests below pin the missing-checkout / missing-agents /
+// symlinked-source fail-closed contract that the runtime now
+// enforces at every store entry point. The contract is the same
+// one `with_settings` / `validate_checkout_path` already enforce at
+// startup; the new tests cover what happens when the configured
+// source disappears or is replaced with a symlink AFTER startup —
+// the case the original silent-empty `load_canonical` and
+// `read_md_filenames` paths got wrong.
+
+/// `load_canonical` must surface an explicit error when the
+/// configured checkout has been removed between launches — not
+/// return an empty map the UI would then render as "no agents".
+/// The runtime cannot tell the difference between a checkout the
+/// user genuinely cleared and a checkout that was deleted out of
+/// band, so it must fail closed and surface the failure rather
+/// than silently treat the missing source as an empty set.
+#[test]
+fn load_canonical_rejects_missing_canonical_dir() {
+    let dir = TempDir::new().unwrap();
+    let paths = setup_paths(&dir);
+    // `setup_paths` leaves `canonical_dir` pointing at the
+    // never-created `<agenthd_root>/agents`. The validation gate
+    // must refuse to load from a missing source.
+    let err = load_canonical(&paths).unwrap_err().to_string();
+    assert!(
+        err.contains("does not exist") || err.contains("`agents/`"),
+        "expected missing-source error, got: {err}"
+    );
+}
+
+/// `load_canonical` on a checkout root that is a symlink must be
+/// refused even if the symlink target is a valid directory. The
+/// canonical source is the only indirection the runtime permits —
+/// anything else (especially a symlink pointing at an unrelated
+/// directory the user did not pick) must surface as an error so
+/// the user can repoint the configuration through Settings.
+#[test]
+fn load_canonical_rejects_symlinked_source() {
+    let dir = TempDir::new().unwrap();
+    let paths = setup_paths(&dir);
+    let target = dir.path().join("real-source");
+    fs::create_dir_all(target.join("agents")).unwrap();
+    let link = dir.path().join("checkout-link");
+    if std::os::unix::fs::symlink(&target, &link).is_err() {
+        // Symlink creation can fail in sandboxed CI environments.
+        return;
+    }
+    let paths = Paths {
+        canonical_dir: link.join("agents"),
+        ..paths
+    };
+    let err = load_canonical(&paths).unwrap_err().to_string();
+    assert!(
+        err.contains("symlink") || err.contains("not a directory"),
+        "expected symlink rejection, got: {err}"
+    );
+}
+
+/// A valid empty checkout must still produce an empty map and MUST
+/// NOT create `<agenthd_root>/agents/`. The safety gate must not
+/// reintroduce the historical local-default canonical shortcut the
+/// single-source design retired.
+#[test]
+fn load_canonical_on_valid_empty_dir_does_not_create_agenthd_agents() {
+    let dir = TempDir::new().unwrap();
+    let paths = setup_paths(&dir);
+    let checkout = dir.path().join("empty-checkout");
+    fs::create_dir_all(checkout.join("agents")).unwrap();
+    let paths = Paths {
+        canonical_dir: checkout.join("agents"),
+        ..paths
+    };
+    let agents = load_canonical(&paths).unwrap();
+    assert!(agents.is_empty());
+    assert!(
+        !paths.agenthd_root.join("agents").exists(),
+        "loading an empty checkout must not recreate <agenthd_root>/agents"
+    );
+}
+
+/// `plan_for` must refuse to plan when the configured canonical
+/// source is missing. Without this check, a removed checkout would
+/// produce an empty plan that downstream UI would happily render
+/// — and a precomputed `Remove` entry for an installed target
+/// would silently delete that target on the next `apply_safe`.
+#[test]
+fn plan_for_rejects_missing_source() {
+    let dir = TempDir::new().unwrap();
+    let paths = setup_paths(&dir);
+    let err = plan_for(&paths, &State::default(), SyncTarget::OpenCode)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not exist") || err.contains("`agents/`"),
+        "expected missing-source error, got: {err}"
+    );
+}
+
+/// Simulates the directory-removal-after-launch scenario the
+/// safety gate is built for: the user installs an agent, then the
+/// checkout is removed out of band. A subsequent `plan_for` must
+/// error (rather than produce a `Remove` plan), and `apply_safe`
+/// invoked with the stale precomputed `Remove` plan must NOT
+/// delete the installed target — the validation gate must run
+/// before any item in the plan is honored, including the
+/// precomputed `Remove` entry the previous `plan_for` produced
+/// before the checkout vanished.
+///
+/// This is the regression test for the bug where a precomputed
+/// `Remove` could remove an installed target after the configured
+/// checkout disappears: the runtime must keep the installed
+/// target on disk until the user resolves the missing-source error.
+#[test]
+fn apply_safe_with_precomputed_remove_does_not_delete_target_after_source_removal() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    // Install a starter so the target is owned by agenthd.
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
+    let scout_target = paths.target_dir.join("scout.md");
+    assert!(
+        scout_target.exists(),
+        "scout.md must be installed on the OpenCode target"
+    );
+    // Drop the canonical file AND the entire checkout out of band
+    // — this is the state the runtime would observe if the user
+    // `rm -rf`'d their checkout between two Install/Update ticks.
+    fs::remove_file(paths.canonical_dir.join("scout.md")).unwrap();
+    fs::remove_dir_all(&checkout).unwrap();
+    // A fresh planner call MUST error rather than produce an empty
+    // or `Remove`-laden plan.
+    let plan_err = plan_for(&paths, &state, SyncTarget::OpenCode).unwrap_err();
+    assert!(
+        plan_err.to_string().contains("does not exist"),
+        "fresh plan after source removal must fail closed, got: {plan_err}"
+    );
+    // And a stale precomputed `Remove` plan (which we hand-craft
+    // here to model the bug) MUST be refused by `apply_safe`
+    // before any file is removed. The installed target stays put.
+    let stale_remove = vec![SyncItem {
+        target: SyncTarget::OpenCode,
+        filename: "scout.md".to_string(),
+        status: SyncStatus::Remove,
+        canonical_hash: None,
+        target_hash: Some(sha256_hex(b"placeholder")),
+        last_installed_hash: Some(sha256_hex(b"placeholder")),
+        canonical_path: paths.canonical_dir.join("scout.md"),
+        target_path: scout_target.clone(),
+    }];
+    let apply_err = apply_safe(&paths, state, stale_remove).unwrap_err();
+    assert!(
+        apply_err.to_string().contains("does not exist"),
+        "stale precomputed Remove plan must fail closed, got: {apply_err}"
+    );
+    assert!(
+        scout_target.exists(),
+        "installed target must survive a precomputed Remove plan after source removal"
+    );
+}
+
+/// `apply_safe` must also refuse to install or update when the
+/// configured checkout has been removed. Without this check, a
+/// precomputed `NotInstalled` or `UpdateAvailable` plan could
+/// re-create an installed target from a now-missing source (which
+/// would silently recreate the missing checkout via
+/// `write_target`'s parent-creation behavior).
+#[test]
+fn apply_safe_rejects_install_or_update_after_source_removal() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    // Hand-craft an `UpdateAvailable` item so the apply path
+    // would otherwise write to the target.
+    let canonical_path = paths.canonical_dir.join("scout.md");
+    let target_path = paths.target_dir.join("scout.md");
+    fs::remove_dir_all(&checkout).unwrap();
+    let item = SyncItem {
+        target: SyncTarget::OpenCode,
+        filename: "scout.md".to_string(),
+        status: SyncStatus::UpdateAvailable,
+        canonical_hash: Some(sha256_hex(b"placeholder-canonical")),
+        target_hash: Some(sha256_hex(b"placeholder-target")),
+        last_installed_hash: Some(sha256_hex(b"placeholder-target")),
+        canonical_path: canonical_path.clone(),
+        target_path: target_path.clone(),
+    };
+    let apply_err = apply_safe(&paths, state, vec![item]).unwrap_err();
+    assert!(
+        apply_err.to_string().contains("does not exist"),
+        "apply_safe with an UpdateAvailable item must fail closed after source removal, got: {apply_err}"
+    );
+}
+
+/// `save_canonical` must refuse to write a new agent file when the
+/// configured checkout has been removed. This is the regression
+/// test for the silent checkout-recreation bug: previously,
+/// `write_target`'s parent-directory creation would silently
+/// recreate the missing checkout (or worse, fall back to
+/// `<agenthd_root>/agents`) the moment the user clicked Save on
+/// a brand-new agent. The validation gate now blocks the write
+/// before any directory is created.
+#[test]
+fn save_canonical_does_not_recreate_missing_checkout() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_checkout(&dir);
+    // User removes the entire checkout.
+    fs::remove_dir_all(&checkout).unwrap();
+    let mut agent = Agent::new_default("helper".to_string()).unwrap();
+    agent.description = "Should never be written".to_string();
+    agent.prompt = "Should never be written".to_string();
+    let err = save_canonical(&paths, &agent, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not exist") || err.contains("`agents/`"),
+        "save_canonical must refuse to recreate a missing checkout, got: {err}"
+    );
+    // Neither the configured checkout's `agents/` nor the historical
+    // `<agenthd_root>/agents/` shortcut must exist.
+    assert!(!paths.canonical_dir.exists());
+    assert!(
+        !paths.agenthd_root.join("agents").exists(),
+        "<agenthd_root>/agents must never be recreated by save_canonical"
+    );
+}
+
+/// `delete_canonical` must surface a missing source as an
+/// explicit error rather than silently returning Ok. The
+/// historical NotFound-on-file path was about race conditions on
+/// the agent file itself; the validation gate handles the
+/// distinct case where the configured checkout has vanished.
+#[test]
+fn delete_canonical_rejects_missing_source() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_checkout(&dir);
+    fs::remove_dir_all(&checkout).unwrap();
+    let err = delete_canonical(&paths, "scout").unwrap_err().to_string();
+    assert!(
+        err.contains("does not exist") || err.contains("`agents/`"),
+        "delete_canonical must fail closed on missing source, got: {err}"
+    );
+}
+
+/// `rename_canonical` must surface a missing source as an
+/// explicit error rather than silently returning Ok or
+/// accidentally creating a new agent file in a freshly-created
+/// checkout.
+#[test]
+fn rename_canonical_rejects_missing_source() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_checkout(&dir);
+    fs::remove_dir_all(&checkout).unwrap();
+    let err = rename_canonical(&paths, "scout", "renamed")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not exist") || err.contains("`agents/`"),
+        "rename_canonical must fail closed on missing source, got: {err}"
+    );
+}
+
+/// `force_install` must surface a missing source as an explicit
+/// error. The function reads from canonical and writes into the
+/// target — without the validation gate, a missing source would
+/// return NotFound on the canonical read and the call would
+/// error confusingly from inside `target_bytes` rather than from
+/// the source check.
+#[test]
+fn force_install_rejects_missing_source() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_checkout(&dir);
+    fs::remove_dir_all(&checkout).unwrap();
+    let err = force_install(&paths, State::default(), SyncTarget::OpenCode, "scout.md")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not exist") || err.contains("`agents/`"),
+        "force_install must fail closed on missing source, got: {err}"
+    );
+}
+
+/// A user can still create a new agent inside an existing empty
+/// checkout. The validation gate accepts a present-and-empty
+/// `agents/` directory; the historical local-default shortcut is
+/// not recreated by this save.
+#[test]
+fn save_canonical_into_empty_but_existing_agents_dir_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let paths = setup_paths(&dir);
+    let checkout = dir.path().join("empty-checkout");
+    fs::create_dir_all(checkout.join("agents")).unwrap();
+    let paths = Paths {
+        canonical_dir: checkout.join("agents"),
+        ..paths
+    };
+    let mut agent = Agent::new_default("helper".to_string()).unwrap();
+    agent.description = "A new helper agent".to_string();
+    agent.prompt = "Do helpful things.".to_string();
+    save_canonical(&paths, &agent, None).unwrap();
+    assert!(paths.canonical_dir.join("helper.md").exists());
+    assert!(
+        !paths.agenthd_root.join("agents").join("helper.md").exists(),
+        "save_canonical into the configured checkout must not touch <agenthd_root>/agents"
+    );
+}
+
+// ---------- Safety tests: apply_safe per-item revalidation ----------
+//
+// The tests below pin the fail-closed per-item revalidation
+// contract `apply_safe` enforces against a stale `SyncItem`
+// snapshot. Each test hand-crafts a `SyncItem` whose plan-time
+// observations no longer match the filesystem (source/target
+// changed, vanished, reappeared, or replaced with a symlink) and
+// asserts that `apply_safe` honors the live filesystem rather than
+// the snapshot.
+//
+// Helper: build a SyncItem with all snapshot fields explicit so a
+// test can stage any combination of plan-vs-truth.
+
+fn make_sync_item(
+    paths: &Paths,
+    target: SyncTarget,
+    filename: &str,
+    status: SyncStatus,
+    canonical_hash: Option<String>,
+    target_hash: Option<String>,
+    last_installed_hash: Option<String>,
+) -> SyncItem {
+    let target_path = match target {
+        SyncTarget::OpenCode => paths.target_dir.join(filename),
+        SyncTarget::Pi => paths.pi_target_dir.join(filename),
+    };
+    SyncItem {
+        target,
+        filename: filename.to_string(),
+        status,
+        canonical_hash,
+        target_hash,
+        last_installed_hash,
+        canonical_path: paths.canonical_dir.join(filename),
+        target_path,
+    }
+}
+
+/// Stale UpdateAvailable snapshot: the target was externally
+/// modified between plan and apply (its byte hash no longer matches
+/// `last_installed_hash`). `apply_safe` MUST skip the update and
+/// preserve both the existing target bytes and the manifest entry.
+#[test]
+fn apply_safe_skips_update_when_target_changed_externally() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
+
+    // Mutate the target behind apply_safe's back.
+    let target_path = paths.target_dir.join("scout.md");
+    let original = fs::read_to_string(&target_path).unwrap();
+    let tampered = original.replace("read-only", "TAMPERED");
+    fs::write(&target_path, &tampered).unwrap();
+    let tampered_hash = sha256_hex(tampered.as_bytes());
+
+    // Hand-craft an UpdateAvailable plan that still records the
+    // *pre-mutation* hashes — modeling the bug where apply_safe
+    // trusts the snapshot without re-hashing the target.
+    let canonical_path = paths.canonical_dir.join("scout.md");
+    let canonical_bytes = fs::read(&canonical_path).unwrap();
+    let canonical_hash = sha256_hex(&canonical_bytes);
+    let owned_hash = sha256_hex(original.as_bytes());
+    let item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "scout.md",
+        SyncStatus::UpdateAvailable,
+        Some(canonical_hash.clone()),
+        Some(owned_hash.clone()),
+        Some(owned_hash.clone()),
+    );
+    let (state, outcomes) = apply_safe(&paths, state, vec![item]).unwrap();
+    let outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(outcome.action, "error");
+    assert!(!outcome.ok);
+    // Target bytes are untouched.
+    assert_eq!(fs::read_to_string(&target_path).unwrap(), tampered);
+    // Manifest is preserved.
+    assert_eq!(state.installed.get("scout.md"), Some(&owned_hash));
+    let _ = tampered_hash;
+}
+
+/// Stale Remove snapshot: the canonical reappears between plan and
+/// apply. The Remove MUST NOT delete the target and MUST NOT drop
+/// the ownership entry — both will be re-evaluated by the next
+/// plan.
+#[test]
+fn apply_safe_skips_remove_when_canonical_reappears() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
+
+    // Delete the canonical file so a fresh plan would classify
+    // scout.md as Remove.
+    let canonical_path = paths.canonical_dir.join("scout.md");
+    fs::remove_file(&canonical_path).unwrap();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let remove_item = plan
+        .iter()
+        .find(|i| i.filename == "scout.md")
+        .unwrap()
+        .clone();
+    assert_eq!(remove_item.status, SyncStatus::Remove);
+
+    // Canonical comes back before apply_safe runs.
+    let new_canonical = starter_agent(&STARTERS[0]).render();
+    fs::write(&canonical_path, &new_canonical).unwrap();
+    let owned_hash = state.installed.get("scout.md").cloned().unwrap();
+    let target_path = paths.target_dir.join("scout.md");
+    let target_bytes = fs::read(&target_path).unwrap();
+    let _target_hash = sha256_hex(&target_bytes);
+
+    // The plan's Remove snapshot still claims canonical_hash = None;
+    // live filesystem disagrees.
+    let (state, outcomes) = apply_safe(&paths, state, vec![remove_item]).unwrap();
+    let outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(outcome.action, "error");
+    assert!(!outcome.ok);
+    assert!(outcome.detail.contains("reappeared"));
+    // Target is still on disk.
+    assert!(target_path.exists());
+    assert_eq!(fs::read(&target_path).unwrap(), target_bytes);
+    // Ownership entry is preserved.
+    assert_eq!(state.installed.get("scout.md"), Some(&owned_hash));
+}
+
+/// Stale NotInstalled snapshot: the target appeared after plan
+/// (e.g. the user dropped a file there). `apply_safe` MUST NOT
+/// overwrite it. The manifest entry stays empty (NotInstalled
+/// recorded no owner) so the next plan will surface the situation
+/// as either UpToDate, Conflict, or Unowned.
+#[test]
+fn apply_safe_skips_install_when_target_appeared_after_plan() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let scout_item = plan
+        .iter()
+        .find(|i| i.filename == "scout.md" && i.target == SyncTarget::OpenCode)
+        .cloned()
+        .unwrap();
+    assert_eq!(scout_item.status, SyncStatus::NotInstalled);
+
+    // The user drops a hand-written file into the OpenCode target
+    // before apply runs.
+    let target_path = scout_item.target_path.clone();
+    let user_bytes = b"user-owned-content\n";
+    fs::write(&target_path, user_bytes).unwrap();
+    let user_hash = sha256_hex(user_bytes);
+
+    let (state, outcomes) = apply_safe(&paths, state, vec![scout_item]).unwrap();
+    let outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(outcome.action, "error");
+    assert!(!outcome.ok);
+    assert!(outcome.detail.contains("appeared after plan"));
+    // User file is untouched.
+    assert_eq!(fs::read(&target_path).unwrap(), user_bytes);
+    // Manifest stays empty for this row.
+    assert!(!state.installed.contains_key("scout.md"));
+    let _ = user_hash;
+}
+
+/// Source disappears after plan: `apply_safe` must surface a
+/// non-panic error for the affected item and CONTINUE processing
+/// other items. Before this revalidation, a `NotInstalled` /
+/// `UpdateAvailable` plan whose canonical source vanished between
+/// plan and apply would `.expect()` and panic, killing the whole
+/// sync batch.
+#[test]
+fn apply_safe_continues_after_source_disappears_no_panic() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let _plan = compute_plan(&paths, &state).unwrap();
+
+    // Remove two canonicals after plan but before apply.
+    fs::remove_file(paths.canonical_dir.join("scout.md")).unwrap();
+    fs::remove_file(paths.canonical_dir.join("reviewer.md")).unwrap();
+    // Rebuild a plan-like SyncItem list using the pre-removal
+    // hashes by re-hashing the now-missing files would fail, so we
+    // use the canonical contents we already wrote to disk during
+    // `setup_paths_with_checkout` — they are still available via
+    // the starter fixtures.
+    let scout_bytes = starter_agent(&STARTERS[0]).render().into_bytes();
+    let reviewer_bytes = starter_agent(&STARTERS[1]).render().into_bytes();
+    let scout_hash = sha256_hex(&scout_bytes);
+    let reviewer_hash = sha256_hex(&reviewer_bytes);
+    let scout_item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "scout.md",
+        SyncStatus::NotInstalled,
+        Some(scout_hash),
+        None,
+        None,
+    );
+    let reviewer_item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "reviewer.md",
+        SyncStatus::NotInstalled,
+        Some(reviewer_hash),
+        None,
+        None,
+    );
+    // A third item whose canonical is still present — must succeed
+    // even though its siblings failed.
+    let worker_bytes = starter_agent(&STARTERS[2]).render().into_bytes();
+    let worker_hash = sha256_hex(&worker_bytes);
+    let worker_item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "worker.md",
+        SyncStatus::NotInstalled,
+        Some(worker_hash),
+        None,
+        None,
+    );
+
+    let (state, outcomes) =
+        apply_safe(&paths, state, vec![scout_item, reviewer_item, worker_item]).unwrap();
+
+    let scout_outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(scout_outcome.action, "error");
+    assert!(!scout_outcome.ok);
+    assert!(scout_outcome.detail.contains("disappeared after plan"));
+    let reviewer_outcome = outcomes
+        .iter()
+        .find(|o| o.filename == "reviewer.md")
+        .unwrap();
+    assert_eq!(reviewer_outcome.action, "error");
+    let worker_outcome = outcomes.iter().find(|o| o.filename == "worker.md").unwrap();
+    assert_eq!(worker_outcome.action, "installed");
+    assert!(worker_outcome.ok);
+    // Worker is actually installed.
+    assert!(paths.target_dir.join("worker.md").exists());
+    // Scout and reviewer targets stay absent.
+    assert!(!paths.target_dir.join("scout.md").exists());
+    assert!(!paths.target_dir.join("reviewer.md").exists());
+    // Only the successful row is recorded in the manifest.
+    assert!(state.installed.contains_key("worker.md"));
+    assert!(!state.installed.contains_key("scout.md"));
+    assert!(!state.installed.contains_key("reviewer.md"));
+}
+
+/// Source changes after plan: `apply_safe` must surface a
+/// non-panic error and refuse to write the now-stale snapshot
+/// bytes. The existing manifest entry (if any) is preserved.
+#[test]
+fn apply_safe_skips_install_when_source_changed_after_plan() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
+
+    let scout_canonical = paths.canonical_dir.join("scout.md");
+    let prior = hash_file(&scout_canonical).unwrap();
+    let mut agent = Agent::read(&scout_canonical).unwrap();
+    agent.prompt.push_str("\nUpdated.");
+    save_canonical(&paths, &agent, prior.as_deref()).unwrap();
+
+    // Build a NotInstalled-ish plan item that records the OLD
+    // canonical hash from before the save — modeling the bug
+    // where the planner snapshot is no longer accurate.
+    let old_hash = prior.unwrap();
+    let target_path = paths.target_dir.join("scout.md");
+    let target_hash_before = hash_file(&target_path).unwrap();
+    let item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "scout.md",
+        SyncStatus::UpdateAvailable,
+        Some(old_hash.clone()),
+        target_hash_before.clone(),
+        target_hash_before,
+    );
+
+    let (state, outcomes) = apply_safe(&paths, state, vec![item]).unwrap();
+    let outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(outcome.action, "error");
+    assert!(!outcome.ok);
+    assert!(outcome.detail.contains("changed since plan"));
+    // Target is untouched (still has the original install bytes).
+    let on_disk = fs::read_to_string(&target_path).unwrap();
+    assert!(on_disk.contains("read-only codebase scout"));
+    assert!(!on_disk.contains("Updated."));
+    // Manifest preserves the original install hash.
+    assert_eq!(state.installed.get("scout.md"), Some(&old_hash));
+}
+
+/// Per-target state isolation: a failed Pi row must not pollute the
+/// OpenCode ownership map and vice versa. The cleanup pass at the
+/// end of `apply_safe` must only touch the targets the caller
+/// passed in.
+#[test]
+fn apply_safe_isolates_failed_rows_per_target() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
+    let opencode_owned: BTreeMap<String, String> = state.installed.clone();
+    let pi_owned: BTreeMap<String, String> = state.pi_installed.clone();
+
+    // Force a NotInstalled snapshot for Pi that targets a
+    // canonical we then delete. apply_safe must record an error
+    // outcome for the Pi row, leave Pi's ownership map alone, and
+    // leave OpenCode's ownership map completely untouched.
+    let pi_canonical = paths.canonical_dir.join("scout.md");
+    let pi_bytes = starter_agent(&STARTERS[0]).render().into_bytes();
+    let pi_canonical_hash = sha256_hex(&pi_bytes);
+    fs::remove_file(&pi_canonical).unwrap();
+    let pi_item = make_sync_item(
+        &paths,
+        SyncTarget::Pi,
+        "scout.md",
+        SyncStatus::NotInstalled,
+        Some(pi_canonical_hash),
+        None,
+        None,
+    );
+    let (state, outcomes) = apply_safe(&paths, state, vec![pi_item]).unwrap();
+    let pi_outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(pi_outcome.action, "error");
+    // OpenCode ownership map is byte-for-byte unchanged.
+    assert_eq!(state.installed, opencode_owned);
+    // Pi ownership map is unchanged (entry was never recorded).
+    assert_eq!(state.pi_installed, pi_owned);
+}
+
+/// Successes continue after a failed row: a single failed
+/// `NotInstalled` row must not prevent subsequent successful rows
+/// from being applied and recorded in the manifest.
+#[test]
+fn apply_safe_continues_successes_after_failed_row() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let _plan = compute_plan(&paths, &state).unwrap();
+
+    // Build a batch: scout (will be poisoned by removing its
+    // canonical after planning), reviewer (will succeed), worker
+    // (will succeed).
+    fs::remove_file(paths.canonical_dir.join("scout.md")).unwrap();
+    let scout_bytes = starter_agent(&STARTERS[0]).render().into_bytes();
+    let reviewer_bytes = starter_agent(&STARTERS[1]).render().into_bytes();
+    let worker_bytes = starter_agent(&STARTERS[2]).render().into_bytes();
+    let scout_item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "scout.md",
+        SyncStatus::NotInstalled,
+        Some(sha256_hex(&scout_bytes)),
+        None,
+        None,
+    );
+    let reviewer_item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "reviewer.md",
+        SyncStatus::NotInstalled,
+        Some(sha256_hex(&reviewer_bytes)),
+        None,
+        None,
+    );
+    let worker_item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "worker.md",
+        SyncStatus::NotInstalled,
+        Some(sha256_hex(&worker_bytes)),
+        None,
+        None,
+    );
+    let (state, outcomes) =
+        apply_safe(&paths, state, vec![scout_item, reviewer_item, worker_item]).unwrap();
+
+    let scout_outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(scout_outcome.action, "error");
+    let reviewer_outcome = outcomes
+        .iter()
+        .find(|o| o.filename == "reviewer.md")
+        .unwrap();
+    assert_eq!(reviewer_outcome.action, "installed");
+    assert!(reviewer_outcome.ok);
+    let worker_outcome = outcomes.iter().find(|o| o.filename == "worker.md").unwrap();
+    assert_eq!(worker_outcome.action, "installed");
+    assert!(worker_outcome.ok);
+    // Reviewer and worker are actually installed.
+    assert!(paths.target_dir.join("reviewer.md").exists());
+    assert!(paths.target_dir.join("worker.md").exists());
+    assert!(!paths.target_dir.join("scout.md").exists());
+    // Manifest records only the successful rows.
+    assert!(state.installed.contains_key("reviewer.md"));
+    assert!(state.installed.contains_key("worker.md"));
+    assert!(!state.installed.contains_key("scout.md"));
+}
+
+/// Stale UpdateAvailable regression: the plan claimed an update was
+/// available, but between plan and apply the target was externally
+/// edited AND the manifest still records the old owned hash.
+/// `apply_safe` must NOT silently become an install (the user's
+/// ownership hash no longer matches the bytes on disk — this is
+/// what `UpdateAvailable` was supposed to catch as `Conflict`).
+/// Adding the regression locks the documented behavior so a future
+/// "lenient overwrite" change has to update the test on purpose.
+#[test]
+fn apply_safe_rejects_stale_update_available_on_changed_target() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
+
+    let target_path = paths.target_dir.join("scout.md");
+    let original = fs::read_to_string(&target_path).unwrap();
+    let owned_hash = state.installed.get("scout.md").cloned().unwrap();
+
+    // Hand-craft an UpdateAvailable row that still records the
+    // pre-edit hashes — the plan-time classification was correct
+    // when it ran, but the user has since edited the target.
+    let canonical_path = paths.canonical_dir.join("scout.md");
+    let canonical_bytes = fs::read(&canonical_path).unwrap();
+    let canonical_hash = sha256_hex(&canonical_bytes);
+    let mut item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "scout.md",
+        SyncStatus::UpdateAvailable,
+        Some(canonical_hash.clone()),
+        Some(owned_hash.clone()),
+        Some(owned_hash.clone()),
+    );
+
+    // Now do the actual external edit between plan and apply.
+    let tampered = original.replace("read-only", "TAMPERED");
+    fs::write(&target_path, &tampered).unwrap();
+
+    // Confirm the live target hash no longer matches the plan's
+    // target_hash/last_installed_hash. Either mismatch trips the
+    // skip; the spec wants errors here, not silent overwrites.
+    item.target_hash = Some(sha256_hex(owned_hash.as_bytes())); // pre-edit hash
+    item.last_installed_hash = Some(owned_hash.clone());
+
+    let (state, outcomes) = apply_safe(&paths, state, vec![item]).unwrap();
+    let outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(outcome.action, "error");
+    assert!(!outcome.ok);
+    // Target bytes are untouched (the "no silent overwrite"
+    // contract).
+    assert_eq!(fs::read_to_string(&target_path).unwrap(), tampered);
+    // Manifest preserves the prior install hash — we did not
+    // re-insert anything for a row we did not actually update.
+    assert_eq!(state.installed.get("scout.md"), Some(&owned_hash));
+}
+
+/// Symlinked source between plan and apply: `apply_safe` must fail
+/// the per-item revalidation on the symlink check (canonical must
+/// be a regular file), keep the existing ownership entry intact,
+/// and continue with the rest of the batch.
+#[test]
+fn apply_safe_skips_when_canonical_is_symlink_after_plan() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (mut state, _) = apply_safe(&paths, state, plan).unwrap();
+
+    // Replace the canonical scout.md with a symlink pointing at
+    // some unrelated content. Plan said `UpToDate`; live is now a
+    // symlink (not a regular file). The revalidation must detect
+    // this and refuse to adopt.
+    let canonical_path = paths.canonical_dir.join("scout.md");
+    let original_canonical = fs::read(&canonical_path).unwrap();
+    fs::remove_file(&canonical_path).unwrap();
+    let real_target = dir.path().join("real-canonical.md");
+    fs::write(&real_target, b"symlink-target\n").unwrap();
+    if std::os::unix::fs::symlink(&real_target, &canonical_path).is_err() {
+        // Symlink creation can fail in sandboxed CI environments.
+        return;
+    }
+
+    let canonical_hash = sha256_hex(&original_canonical);
+    let item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "scout.md",
+        SyncStatus::UpToDate,
+        Some(canonical_hash.clone()),
+        Some(canonical_hash.clone()),
+        Some(canonical_hash.clone()),
+    );
+    let owned_hash_before = state.installed.get("scout.md").cloned();
+
+    let (state, outcomes) = apply_safe(&paths, state, vec![item]).unwrap();
+    let outcome = &outcomes[0];
+    assert_eq!(outcome.action, "error");
+    assert!(!outcome.ok);
+    // Truthful message: the source is still on disk as a symlink,
+    // so it did not "disappear"; surface the real reason.
+    assert!(outcome.detail.contains("not a regular file"));
+    assert!(!outcome.detail.contains("disappeared"));
+    // Manifest is preserved.
+    assert_eq!(state.installed.get("scout.md"), owned_hash_before.as_ref());
+    // Restore the file so cleanup doesn't see a stale symlink.
+    fs::remove_file(&canonical_path).unwrap();
+    fs::write(&canonical_path, &original_canonical).unwrap();
+}
+
+/// Symlinked target between plan and apply: a symlink at the
+/// target path is not a regular file and must never be
+/// overwritten or deleted by `apply_safe`.
+#[test]
+fn apply_safe_skips_when_target_is_symlink_after_plan() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
+
+    let target_path = paths.target_dir.join("scout.md");
+    let real_target = dir.path().join("real-target.md");
+    fs::write(&real_target, b"target-backing-content\n").unwrap();
+    fs::remove_file(&target_path).unwrap();
+    if std::os::unix::fs::symlink(&real_target, &target_path).is_err() {
+        return;
+    }
+
+    let canonical_path = paths.canonical_dir.join("scout.md");
+    let canonical_bytes = fs::read(&canonical_path).unwrap();
+    let canonical_hash = sha256_hex(&canonical_bytes);
+    // Force an UpdateAvailable by changing the canonical bytes
+    // (we don't actually re-plan here — the stale plan still
+    // thinks the file is UpToDate at the manifest).
+    let item = make_sync_item(
+        &paths,
+        SyncTarget::OpenCode,
+        "scout.md",
+        SyncStatus::UpToDate,
+        Some(canonical_hash.clone()),
+        Some(canonical_hash.clone()),
+        Some(canonical_hash.clone()),
+    );
+
+    let owned_hash_before = state.installed.get("scout.md").cloned();
+    let (state, outcomes) = apply_safe(&paths, state, vec![item]).unwrap();
+    let outcome = outcomes.iter().find(|o| o.filename == "scout.md").unwrap();
+    assert_eq!(outcome.action, "error");
+    assert!(!outcome.ok);
+    assert!(outcome.detail.contains("not a regular file"));
+    // Symlink is left in place; the backing file is untouched.
+    assert!(fs::symlink_metadata(&target_path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(&real_target).unwrap(), b"target-backing-content\n");
+    // Manifest is preserved.
+    assert_eq!(state.installed.get("scout.md"), owned_hash_before.as_ref());
 }

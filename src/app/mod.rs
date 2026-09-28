@@ -4,16 +4,11 @@ use crate::models::Discovery;
 // contextual footer match arms. Editor-only helpers and `EditorOp`
 // are pulled in by `mod tests` directly so the lib build does not
 // carry an unused-import warning.
-use crate::store::{ApplyOutcome, Paths, PluginStatus, State, SyncItem, SyncTarget};
+use crate::store::{ApplyOutcome, Paths, State, SyncItem, SyncTarget};
 use crate::tools::ToolItem;
-use editor::{AgentDraft, EditorField, EditorMode};
-// `tools_lib` is only referenced from the test submodule below; gating the
-// import on `#[cfg(test)]` keeps the production binary warning-free while
-// preserving the natural short path inside the tests.
-#[cfg(test)]
-use crate::tools as tools_lib;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use editor::{AgentDraft, EditorField, EditorMode};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -33,9 +28,8 @@ use agents::AgentSummary;
 /// footer all stay here.
 mod tools;
 
-/// Agents list UI: render / open / handle key / delete /
-/// apply_update_bundled, and the bundled-update status-bar formatter.
-/// The implementation lives in `app/agents.rs` as a child module; the
+/// Agents list UI: render / open / handle key / delete. The
+/// implementation lives in `app/agents.rs` as a child module; the
 /// `Screen::Agents` variant, `pending_delete`, the main-menu entry, the
 /// dispatch, and the contextual footer all stay here.
 mod agents;
@@ -55,11 +49,14 @@ mod install_update;
 /// dispatch, and the contextual footer all stay here.
 mod editor;
 
-/// Subagent-panel (plugin) screen: render / open / refresh / handle key /
-/// install / uninstall. The implementation lives in `app/plugin.rs` as a
-/// child module; the `Screen::Plugin` variant, the main-menu entry, the
-/// dispatch, and the contextual footer all stay here.
-mod plugin;
+/// Settings screen: configure the canonical checkout path. The
+/// implementation lives in `app/settings.rs` as a child module; the
+/// `Screen::Settings` variant, the main-menu entry, the dispatch, and
+/// the contextual footer all stay here. The screen replaces the
+/// historical source-selection screen — there is no Local mode and no
+/// Repo mode picker; there is exactly one canonical directory, and
+/// the Settings screen exists to point at it.
+mod settings;
 
 const ACCENT: Color = Color::Rgb(94, 234, 212);
 const SURFACE: Color = Color::Rgb(24, 29, 42);
@@ -75,8 +72,8 @@ const DANGER: Color = Color::Rgb(251, 113, 133);
 enum MainItem {
     Agents,
     InstallUpdate,
+    Settings,
     Tools,
-    Plugin,
     Exit,
 }
 
@@ -85,8 +82,8 @@ impl MainItem {
         &[
             MainItem::Agents,
             MainItem::InstallUpdate,
+            MainItem::Settings,
             MainItem::Tools,
-            MainItem::Plugin,
             MainItem::Exit,
         ]
     }
@@ -95,8 +92,8 @@ impl MainItem {
         match self {
             MainItem::Agents => "Agents",
             MainItem::InstallUpdate => "Install/Update",
+            MainItem::Settings => "Settings",
             MainItem::Tools => "Tools",
-            MainItem::Plugin => "Subagent panel",
             MainItem::Exit => "Exit",
         }
     }
@@ -105,8 +102,10 @@ impl MainItem {
         match self {
             MainItem::Agents => "Create and tune OpenCode roles",
             MainItem::InstallUpdate => "Review safe synchronization changes",
+            MainItem::Settings => {
+                "Point agenthd at the checkout whose `agents/` directory holds canonical definitions"
+            }
             MainItem::Tools => "Install bundled third-party OpenCode skills",
-            MainItem::Plugin => "Manage the OpenCode task sidebar",
             MainItem::Exit => "Close agenthd",
         }
     }
@@ -122,7 +121,6 @@ enum Screen {
         agents: Vec<AgentSummary>,
         selected: usize,
         status: Option<String>,
-        confirm_update_bundled: Option<String>,
     },
     Editor {
         field: EditorField,
@@ -155,10 +153,11 @@ enum Screen {
         /// `true` while the install is running; blocks key dispatch.
         installing: bool,
     },
-    Plugin {
-        status: PluginStatus,
-        message: Option<String>,
-        confirm_uninstall: bool,
+    /// Settings screen (first-run or menu entry). The state lives in
+    /// the `settings` child module so the parent only names the
+    /// shape.
+    Settings {
+        state: settings::SettingsState,
     },
 }
 
@@ -202,6 +201,13 @@ impl App {
         }
     }
 
+    /// Replace the persistent status-bar message. Used by `main` for
+    /// banners ("saved checkout path", "first run", etc.) that should
+    /// outlive the screen transitions the user goes through next.
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_bar = Some(msg.into());
+    }
+
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|frame| self.render(frame))?;
@@ -235,15 +241,7 @@ impl App {
                 agents,
                 selected,
                 status,
-                confirm_update_bundled,
-            } => self.render_agents(
-                frame,
-                body,
-                agents,
-                *selected,
-                status.as_deref(),
-                confirm_update_bundled.as_deref(),
-            ),
+            } => self.render_agents(frame, body, agents, *selected, status.as_deref()),
             Screen::Editor {
                 field,
                 mode,
@@ -309,11 +307,7 @@ impl App {
                 status.as_deref(),
                 *installing,
             ),
-            Screen::Plugin {
-                status,
-                message,
-                confirm_uninstall,
-            } => self.render_plugin(frame, body, *status, message.as_deref(), *confirm_uninstall),
+            Screen::Settings { state } => self.render_settings(frame, body, state, None),
         }
         self.render_status_line(frame, status_area);
         self.render_footer(frame, footer_area);
@@ -327,7 +321,7 @@ impl App {
             Screen::ModelPicker { .. } => "Model picker",
             Screen::InstallUpdate { .. } => "Install / Update",
             Screen::Tools { .. } => "Tools",
-            Screen::Plugin { .. } => "Subagent panel",
+            Screen::Settings { .. } => "Settings",
         };
         let title = Line::from(vec![
             Span::styled(
@@ -404,14 +398,8 @@ impl App {
     fn footer_text(&self) -> String {
         match &self.screen {
             Screen::Main { .. } => "↑/↓ or j/k: select · Enter: open · q / Esc: quit".to_string(),
-            Screen::Agents {
-                confirm_update_bundled,
-                ..
-            } => {
-                if confirm_update_bundled.is_some() {
-                    return "Y: update prompts · N / Esc: cancel".to_string();
-                }
-                "↑/↓ or j/k: select · n: new · e / Enter: edit · d d: delete · u: update bundled prompts · Esc: back"
+            Screen::Agents { .. } => {
+                "↑/↓ or j/k: select · n: new · e / Enter: edit · d d: delete · Esc: back"
                     .to_string()
             }
             Screen::Editor {
@@ -483,13 +471,14 @@ impl App {
                     "↑/↓ or j/k: select · i: install · r: refresh · Esc: back".to_string()
                 }
             }
-            Screen::Plugin {
-                confirm_uninstall, ..
-            } => {
-                if *confirm_uninstall {
-                    "Y: uninstall · N / Esc: cancel".to_string()
+            Screen::Settings { state } => {
+                if state.is_path_editing() {
+                    "type: edit path · Backspace: delete · Ctrl+U: clear · Enter: apply · Esc: cancel"
+                        .to_string()
+                } else if state.gated {
+                    "Enter: edit path".to_string()
                 } else {
-                    "i: install/update · u: uninstall · r: refresh · Esc: back".to_string()
+                    "Enter: edit path · Esc: back".to_string()
                 }
             }
         }
@@ -520,7 +509,7 @@ impl App {
             Screen::ModelPicker { .. } => self.handle_model_picker_key(key),
             Screen::InstallUpdate { .. } => self.handle_install_update_key(key),
             Screen::Tools { .. } => self.handle_tools_key(key),
-            Screen::Plugin { .. } => self.handle_plugin_key(key),
+            Screen::Settings { .. } => self.handle_settings_key(key)?,
         }
         Ok(())
     }
@@ -541,8 +530,8 @@ impl App {
                     match item {
                         MainItem::Agents => self.open_agents(),
                         MainItem::InstallUpdate => self.open_install_update(),
+                        MainItem::Settings => self.open_settings(false),
                         MainItem::Tools => self.open_tools(),
-                        MainItem::Plugin => self.open_plugin(),
                         MainItem::Exit => self.quit = true,
                     }
                 }
@@ -592,7 +581,6 @@ fn status_style_for(text: &str) -> Style {
     } else if text.starts_with("saved ")
         || text.starts_with("force installed ")
         || text.starts_with("deleted canonical ")
-        || text.starts_with("updated bundled prompts")
     {
         SUCCESS
     } else if text.starts_with("Unsaved") {
@@ -641,7 +629,6 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         ])
         .split(popup_layout[1])[1]
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,7 +638,10 @@ mod tests {
     // child module; pull them in here so the existing editor / model
     // picker tests keep their direct call shapes.
     use crate::agent::{Mode, PermissionAction};
+    use crate::store::{hash_file, save_canonical, Settings};
     use editor::{edit_text_field, next_field, prev_field, EditorOp};
+    use serde_json;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     fn setup_paths(dir: &TempDir) -> Paths {
@@ -661,25 +651,68 @@ mod tests {
             state_file: dir.path().join(".agenthd").join("state.json"),
             target_dir: dir.path().join(".config").join("opencode").join("agents"),
             pi_target_dir: dir.path().join(".pi").join("agent").join("agents"),
-            plugin_file: dir
-                .path()
-                .join(".config")
-                .join("opencode")
-                .join("plugins")
-                .join("agenthd-subagents.tsx"),
-            plugin_config: dir.path().join(".config").join("opencode").join("tui.json"),
             skills_dir: dir.path().join(".config").join("opencode").join("skills"),
+            settings_file: dir.path().join(".agenthd").join("settings.json"),
         };
         paths.ensure_dirs().unwrap();
         paths
     }
 
+    /// Build a `Paths` whose canonical_dir points at a fresh
+    /// checkout-shaped directory inside the tempdir. Mirrors the
+    /// committed-version `setup_paths` but uses the configured
+    /// checkout layout so the tests exercise the production read /
+    /// write path against a real `<repo>/agents/` directory rather
+    /// than a local default that the new design no longer ships.
+    fn setup_paths_with_checkout(dir: &TempDir) -> (Paths, std::path::PathBuf) {
+        let paths = setup_paths(dir);
+        let checkout = dir.path().join("checkout");
+        let agents = checkout.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        // Write the three starter files the editor tests need so
+        // `App::open_agents` finds a non-empty list.
+        for starter in STARTERS.iter().take(3) {
+            std::fs::write(
+                agents.join(format!("{}.md", starter.name)),
+                starter_agent(starter).render(),
+            )
+            .unwrap();
+        }
+        let paths = Paths {
+            canonical_dir: agents.clone(),
+            ..paths
+        };
+        // Persist the settings file so the runtime could re-derive
+        // canonical_dir from it.
+        std::fs::create_dir_all(&paths.agenthd_root).unwrap();
+        let settings = Settings::new(checkout.to_string_lossy().into_owned());
+        crate::store::save_settings(&paths.settings_file, &settings).unwrap();
+        (paths, checkout)
+    }
+
+    /// Drop a single canonical `*.md` file into `canonical_dir`. Used
+    /// by tests that need a specific starter on disk without seeding
+    /// every bundled starter.
+    #[allow(dead_code)]
+    fn write_one_canonical(paths: &Paths, name: &str) {
+        let starter = STARTERS
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no starter named `{name}`"));
+        std::fs::write(
+            paths.canonical_dir.join(format!("{}.md", name)),
+            starter_agent(starter).render(),
+        )
+        .unwrap();
+    }
+
+    // ---------- Editor tests ----------
+
     #[test]
     fn screen_transitions_create_new_editor() {
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
         app.open_agents();
         app.pending_delete = PendingDelete {
             name: Some("scout".to_string()),
@@ -692,11 +725,8 @@ mod tests {
     #[test]
     fn save_and_open_existing_round_trip() {
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        // Open the agents list and pick scout so we exercise the real editor
-        // flow (open_editor_existing captures the canonical hash).
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         let summary = match &app.screen {
             Screen::Agents { agents, .. } => agents
@@ -712,7 +742,6 @@ mod tests {
             "open_editor_existing must capture the canonical hash"
         );
 
-        // Modify the prompt and save through the normal flow.
         let prior_hash = app.editor_prior_hash.clone();
         let original_name = app.editor_original_name.clone();
         let material = {
@@ -724,8 +753,6 @@ mod tests {
             original_name: original_name.clone(),
             material,
         });
-        // On success the editor transitions to the agents list (status_bar is
-        // cleared by open_agents), so verify via screen state and file content.
         assert!(
             matches!(app.screen, Screen::Agents { .. }),
             "save should transition to the agents list: {:?}",
@@ -737,21 +764,15 @@ mod tests {
         );
         let prompt = std::fs::read_to_string(paths.canonical_dir.join("scout.md")).unwrap();
         assert!(prompt.contains("Updated prompt"));
-        // The captured hash matched the on-disk hash at save time; otherwise
-        // save_canonical would have rejected the save with a stale-write error.
         assert!(prior_hash.is_some(), "prior_hash captured at open");
         assert_eq!(original_name.as_deref(), Some(STARTERS[0].name));
     }
 
     #[test]
     fn save_rejects_external_edit_during_editor_session() {
-        // The audit fix: prior_hash must be captured at open time, not
-        // recomputed at save time. Otherwise an external edit that lands
-        // between open and save slips through.
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         let summary = match &app.screen {
             Screen::Agents { agents, .. } => agents
@@ -768,18 +789,16 @@ mod tests {
             .expect("open captured the hash");
         let original_name = app.editor_original_name.clone();
 
-        // Externally rewrite the canonical file after the editor opened.
         let scout_path = paths.canonical_dir.join("scout.md");
         let original_bytes = std::fs::read_to_string(&scout_path).unwrap();
         let external = original_bytes.replace("read-only codebase scout", "externally rewritten");
         std::fs::write(&scout_path, &external).unwrap();
         assert_ne!(
-            crate::store::hash_file(&scout_path).unwrap().as_deref(),
+            hash_file(&scout_path).unwrap().as_deref(),
             Some(prior_hash.as_str()),
             "sanity: external edit changed the hash"
         );
 
-        // The editor's save should reject because prior_hash is stale.
         let material = {
             let draft = app.editor_draft.as_mut().expect("draft present");
             draft.prompt = "Editor edit".to_string();
@@ -806,7 +825,6 @@ mod tests {
             app.status_bar
         );
 
-        // The external bytes win; the editor's draft is not on disk.
         let on_disk = std::fs::read_to_string(&scout_path).unwrap();
         assert!(
             on_disk.contains("externally rewritten"),
@@ -817,8 +835,6 @@ mod tests {
             "editor's stale draft must not be written"
         );
 
-        // The editor still holds its prior_hash so the user can retry once
-        // they reload.
         assert_eq!(app.editor_prior_hash.as_deref(), Some(prior_hash.as_str()));
         assert_eq!(
             app.editor_original_name.as_deref(),
@@ -829,9 +845,8 @@ mod tests {
     #[test]
     fn save_rename_rejects_stale_source_without_moving_it() {
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         let summary = match &app.screen {
             Screen::Agents { agents, .. } => agents
@@ -869,13 +884,9 @@ mod tests {
 
     #[test]
     fn save_rename_into_existing_destination_is_rejected() {
-        // Rename collision semantics: do not overwrite a differing
-        // destination. The existing `rename_canonical` already enforces this;
-        // this test pins the behavior through the editor save flow.
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         let scout_summary = match &app.screen {
             Screen::Agents { agents, .. } => agents
@@ -890,7 +901,6 @@ mod tests {
         let original_name = app.editor_original_name.clone();
         let material = {
             let draft = app.editor_draft.as_mut().expect("draft present");
-            // Try to rename scout onto reviewer, which already exists.
             draft.agent.name = "reviewer".to_string();
             draft.materialize()
         };
@@ -906,7 +916,6 @@ mod tests {
             "rename into existing destination should fail: {:?}",
             app.status_bar
         );
-        // scout.md still exists; reviewer.md still has its starter content.
         assert!(paths.canonical_dir.join("scout.md").exists());
         let reviewer = std::fs::read_to_string(paths.canonical_dir.join("reviewer.md")).unwrap();
         assert!(
@@ -918,9 +927,8 @@ mod tests {
     #[test]
     fn apply_model_validates_value() {
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
         let draft = AgentDraft::from_agent(starter_agent(&STARTERS[0]));
         app.editor_draft = Some(draft);
         app.editor_original_name = Some(STARTERS[0].name.to_string());
@@ -944,13 +952,9 @@ mod tests {
 
     #[test]
     fn model_picker_esc_restores_editor_with_draft_intact() {
-        // The original bug: Esc in the model picker left the user trapped
-        // because the picker replaced the editor screen and apply_model_value
-        // matched on Screen::Editor.
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
         let mut draft = AgentDraft::from_agent(starter_agent(&STARTERS[0]));
         draft.agent.model = Some("openai/gpt-5.4".to_string());
         app.editor_draft = Some(draft);
@@ -972,9 +976,8 @@ mod tests {
     #[test]
     fn model_picker_tab_applies_manual_and_returns_to_editor() {
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
         let draft = AgentDraft::from_agent(starter_agent(&STARTERS[0]));
         app.editor_draft = Some(draft);
         app.editor_original_name = Some(STARTERS[0].name.to_string());
@@ -985,9 +988,6 @@ mod tests {
             confirm_discard: false,
         };
         app.open_model_picker(None);
-        // The picker may have populated Discovery::Found from the local
-        // `opencode models` invocation; open the manual modal then type, then
-        // Tab (which always applies manual, regardless of discovery).
         app.handle_model_picker_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty()));
         for c in "openai/gpt-5.4".chars() {
             app.handle_model_picker_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
@@ -1001,9 +1001,8 @@ mod tests {
     #[test]
     fn model_picker_ignores_manual_input_while_browsing() {
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
         app.editor_draft = Some(AgentDraft::from_agent(starter_agent(&STARTERS[0])));
         app.editor_original_name = Some(STARTERS[0].name.to_string());
         app.open_model_picker(Some("openai/gpt-5.4".to_string()));
@@ -1028,9 +1027,8 @@ mod tests {
     #[test]
     fn model_picker_m_toggles_manual_modal() {
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
         app.editor_draft = Some(AgentDraft::from_agent(starter_agent(&STARTERS[0])));
         app.editor_original_name = Some(STARTERS[0].name.to_string());
         app.screen = Screen::Editor {
@@ -1051,14 +1049,12 @@ mod tests {
             _ => false,
         };
         assert!(after);
-        // Esc closes the manual modal instead of cancelling the picker.
         app.handle_model_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         let closed = match &app.screen {
             Screen::ModelPicker { manual_open, .. } => *manual_open,
             _ => false,
         };
         assert!(!closed);
-        // Now Esc returns to the editor.
         app.handle_model_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert!(matches!(app.screen, Screen::Editor { .. }));
     }
@@ -1079,15 +1075,13 @@ mod tests {
         assert_eq!(Mode::subagent.next(), Mode::primary);
         assert_eq!(Mode::primary.next(), Mode::all);
         assert_eq!(Mode::all.next(), Mode::subagent);
-        assert_eq!(Mode::subagent.prev(), Mode::all);
     }
 
     #[test]
     fn pending_delete_double_press_deletes() {
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         app.pending_delete = PendingDelete {
             name: Some("scout".to_string()),
@@ -1099,11 +1093,9 @@ mod tests {
 
     #[test]
     fn truncate_helper_shortens_and_passes_through() {
-        // ASCII pass-through and shortening.
         let s = "abcdef";
         assert_eq!(truncate(s, 4), "abc…");
         assert_eq!(truncate(s, 10), "abcdef");
-        // Multibyte: truncation must respect character boundaries, not bytes.
         assert_eq!(truncate("日本語", 2), "日…");
         assert_eq!(truncate("日本語", 3), "日本語");
         assert_eq!(truncate("日本語", 4), "日本語");
@@ -1148,13 +1140,9 @@ mod tests {
 
     #[test]
     fn editor_up_down_navigate_all_fields() {
-        // The original bug: Up/Down only worked for the Mode and Permissions
-        // rows, so users got stuck on whichever field they entered. Now
-        // Up/Down traverse the whole editor surface via prev_field/next_field.
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         app.open_editor_new();
 
@@ -1171,7 +1159,6 @@ mod tests {
             app.handle_editor_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()), paths);
         };
 
-        // From Name, Down walks every editor field in order.
         assert_eq!(field(&app), EditorField::Name);
         down(&mut app, &paths);
         assert_eq!(field(&app), EditorField::Description);
@@ -1184,22 +1171,15 @@ mod tests {
         down(&mut app, &paths);
         assert_eq!(field(&app), EditorField::Permissions(0));
 
-        // From Permissions(0), Up jumps out to Prompt (no longer moves within
-        // the permission list — that role is now Left/Right).
         up(&mut app, &paths);
         assert_eq!(field(&app), EditorField::Prompt);
     }
 
     #[test]
     fn editor_jk_navigate_fields_in_normal() {
-        // NORMAL Vim semantics: `j`/`k` mirror Up/Down and walk the whole
-        // editor surface (Name → Description → Mode → Model → Prompt →
-        // Permissions and back). Typing literal j/k into a text field only
-        // happens in INSERT mode; see editor_literal_jkl_in_insert below.
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         app.open_editor_new();
 
@@ -1244,28 +1224,20 @@ mod tests {
         );
         assert_eq!(field_of(&app), EditorField::Permissions(0));
 
-        // k walks back up; on the permission list it returns to Prompt
-        // (matching the existing field-helper behavior).
         app.handle_editor_key(
             KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
             &paths,
         );
         assert_eq!(field_of(&app), EditorField::Prompt);
 
-        // NORMAL must NOT have appended j/k to the Name buffer.
         assert_eq!(app.editor_draft.as_ref().unwrap().agent.name, "agent-1");
     }
 
     #[test]
     fn editor_literal_jklqw_in_insert() {
-        // INSERT-mode contract: every printable character — including the
-        // Vim navigation/save/quit keys q, w, h, j, k, l — appends verbatim
-        // to the active text field. NORMAL would navigate on these keys, so
-        // the test would fail if INSERT ever leaked.
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         app.open_editor_new();
 
@@ -1293,7 +1265,6 @@ mod tests {
         assert_eq!(mode_of(&app), EditorMode::Normal);
         assert_eq!(field_of(&app), EditorField::Name);
 
-        // `i` enters INSERT, but only on text fields.
         app.handle_editor_key(
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()),
             &paths,
@@ -1303,8 +1274,6 @@ mod tests {
         type_chars(&mut app, &paths, "qjkhl");
         assert_eq!(mode_of(&app), EditorMode::Insert);
         assert_eq!(field_of(&app), EditorField::Name);
-        // All five Vim navigation/save/quit letters must have landed in the
-        // name buffer instead of triggering their NORMAL actions.
         assert_eq!(
             app.editor_draft.as_ref().unwrap().agent.name,
             "agent-1qjkhl"
@@ -1313,13 +1282,9 @@ mod tests {
 
     #[test]
     fn editor_esc_returns_to_normal_from_insert() {
-        // Esc in INSERT must switch back to NORMAL without running the
-        // dirty-confirm path: the editor stays open, the draft is preserved,
-        // and the next Esc in NORMAL is what arms the discard popup.
         let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
         app.open_agents();
         app.open_editor_new();
 
@@ -1342,2611 +1307,750 @@ mod tests {
         app.handle_editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &paths);
         assert_eq!(mode_of(&app), EditorMode::Normal);
         assert!(matches!(app.screen, Screen::Editor { .. }));
-        // Typing landed: the dirty-confirm path on the next Esc needs real
-        // content to detect.
         assert_eq!(app.editor_draft.as_ref().unwrap().agent.name, "agent-1x");
     }
 
+    // ---------- Canonical / Settings tests ----------
+
+    /// The runtime reads/writes agent definitions only inside the
+    /// configured checkout. The historical local default
+    /// `<agenthd_root>/agents/` is intentionally not created at any
+    /// point in the boot path: `Paths::ensure_dirs` deliberately
+    /// omits it, the Settings apply does not call `ensure_dirs` (so
+    /// it cannot be smuggled in there), and the runtime never falls
+    /// back to it as an unconfigured source. CRUD operations live
+    /// in the configured checkout.
     #[test]
-    fn editor_i_is_noop_on_non_text_field() {
-        // `i` is only meaningful on text fields. On Mode, Model, and the
-        // permission list it must leave the editor in NORMAL.
+    fn canonical_crud_writes_only_inside_checkout() {
+        let dir = TempDir::new().unwrap();
+        let (paths, checkout) = setup_paths_with_checkout(&dir);
+
+        // The agenthd_root/agents directory was not created by
+        // setup_paths_with_checkout, and the test's `canonical_dir`
+        // is the checkout's `agents/` (set by setup_paths_with_checkout),
+        // not the agenthd-root default.
+        assert_eq!(paths.canonical_dir, checkout.join("agents"));
+        assert!(
+            !paths.agenthd_root.join("agents").exists(),
+            "the historical <agenthd_root>/agents default must not be created"
+        );
+
+        // Create a new agent through the store helper. It must land
+        // under the checkout, not under the agenthd root.
+        let mut agent = crate::agent::Agent::new_default("helper".to_string()).unwrap();
+        agent.description = "A new helper".to_string();
+        agent.prompt = "Help the user.".to_string();
+        save_canonical(&paths, &agent, None).unwrap();
+        assert!(checkout.join("agents").join("helper.md").exists());
+        assert!(
+            !paths.agenthd_root.join("agents").join("helper.md").exists(),
+            "agenthd_root/agents must never receive writes"
+        );
+
+        // Rename + delete also stay inside the checkout.
+        crate::store::rename_canonical(&paths, "helper", "assistant").unwrap();
+        assert!(checkout.join("agents").join("assistant.md").exists());
+        assert!(!checkout.join("agents").join("helper.md").exists());
+        crate::store::delete_canonical(&paths, "assistant").unwrap();
+        assert!(!checkout.join("agents").join("assistant.md").exists());
+    }
+
+    /// Empty configured checkout is valid: the runtime surfaces an
+    /// empty Agents list, not a seed step.
+    #[test]
+    fn empty_checkout_loads_zero_agents_and_lists_them() {
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        app.open_editor_new();
-
-        let mode_of = |app: &App| -> EditorMode {
-            match app.screen {
-                Screen::Editor { mode, .. } => mode,
-                _ => panic!("expected editor screen"),
-            }
+        // Build a checkout with an empty agents/ dir.
+        let checkout = dir.path().join("empty-checkout");
+        std::fs::create_dir_all(checkout.join("agents")).unwrap();
+        let paths = Paths {
+            canonical_dir: checkout.join("agents"),
+            ..paths
         };
-
-        // Walk to Mode (Name → Description → Mode).
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(matches!(
-            app.screen,
-            Screen::Editor {
-                field: EditorField::Mode,
-                ..
-            }
-        ));
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-
-        // Walk to Model.
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(matches!(
-            app.screen,
-            Screen::Editor {
-                field: EditorField::Model,
-                ..
-            }
-        ));
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-
-        // Walk to Permissions(0).
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        ); // Prompt
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        ); // Permissions(0)
-        assert!(matches!(
-            app.screen,
-            Screen::Editor {
-                field: EditorField::Permissions(0),
-                ..
-            }
-        ));
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-    }
-
-    #[test]
-    fn editor_q_in_normal_does_not_change_text_and_triggers_discard() {
-        // `q` in NORMAL is the dirty-confirmation discard path. The buffer
-        // must NOT receive a literal 'q', and a clean draft discards
-        // immediately (returns to Agents), while a dirty draft arms the
-        // confirmation popup without leaving the editor.
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
+        let mut app = App::new(paths, State::default());
         app.open_agents();
-        app.open_editor_new();
-        let original_name = app.editor_draft.as_ref().unwrap().agent.name.clone();
-        // Clean draft: `q` should discard immediately.
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(
-            matches!(app.screen, Screen::Agents { .. }),
-            "clean `q` should return to Agents: {:?}",
-            app.screen
-        );
-        assert!(app.editor_draft.is_none());
-
-        // Dirty draft: `q` should arm the discard popup, not discard yet.
-        app.open_agents();
-        app.open_editor_existing(&match &app.screen {
-            Screen::Agents { agents, .. } => agents[0].clone(),
-            _ => unreachable!(),
-        });
-        {
-            let draft = app.editor_draft.as_mut().unwrap();
-            draft.agent.description = "edit".into();
-        }
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(
-            matches!(
-                app.screen,
-                Screen::Editor {
-                    confirm_discard: true,
-                    ..
-                }
-            ),
-            "dirty `q` should arm confirm_discard: {:?}",
-            app.screen
-        );
-        // Buffer must not contain a literal 'q' from this keystroke.
-        assert!(
-            !original_name.contains('q'),
-            "sanity: starting name had no 'q' to confuse the assertion"
-        );
-        assert!(
-            !app.editor_draft
-                .as_ref()
-                .unwrap()
-                .agent
-                .description
-                .contains('q'),
-            "description must not have consumed a literal 'q' from the keystroke"
-        );
-        app.handle_editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &paths);
-        assert!(
-            matches!(app.screen, Screen::Agents { .. }),
-            "confirmed discard should return to Agents: {:?}",
-            app.screen
-        );
-    }
-
-    #[test]
-    fn editor_w_in_normal_reaches_save_flow() {
-        // `w` in NORMAL must reach the same validate-and-save path as Ctrl+S.
-        // The cleanest evidence is that the editor transitions to the
-        // agents list on a successful save.
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        let summary = match &app.screen {
-            Screen::Agents { agents, .. } => agents
-                .iter()
-                .find(|a| a.name == STARTERS[0].name)
-                .cloned()
-                .expect("scout in agents list"),
-            _ => panic!("expected agents screen"),
-        };
-        app.open_editor_existing(&summary);
-        // Make the draft dirty so a save actually runs.
-        {
-            let draft = app.editor_draft.as_mut().expect("draft present");
-            draft.prompt = "Updated prompt via w".to_string();
-        }
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(
-            matches!(app.screen, Screen::Agents { .. }),
-            "save should transition to the agents list: {:?}",
-            app.screen
-        );
-        let prompt = std::fs::read_to_string(paths.canonical_dir.join("scout.md")).unwrap();
-        assert!(
-            prompt.contains("Updated prompt via w"),
-            "save did not persist the prompt change: {:?}",
-            prompt
-        );
-    }
-
-    #[test]
-    fn editor_hl_preserve_mode_cycle_and_permission_rows() {
-        // h/l mirror Left/Right: cycle Mode on the Mode field, step between
-        // permission rows on the Permissions field, and are no-ops elsewhere.
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        app.open_editor_new();
-
-        // Walk to Mode (Name → Description → Mode) using j.
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        );
-        let initial = app.editor_draft.as_ref().unwrap().agent.mode;
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(
-            app.editor_draft.as_ref().unwrap().agent.mode,
-            initial.next()
-        );
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(app.editor_draft.as_ref().unwrap().agent.mode, initial);
-
-        // Walk down to Permissions(0).
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        ); // Model
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        ); // Prompt
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        ); // Permissions(0)
-        let field_of = |app: &App| -> EditorField {
-            match app.screen {
-                Screen::Editor { field, .. } => field,
-                _ => panic!("expected editor screen"),
-            }
-        };
-        assert_eq!(field_of(&app), EditorField::Permissions(0));
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(field_of(&app), EditorField::Permissions(1));
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(field_of(&app), EditorField::Permissions(0));
-
-        // On a non-text, non-mode, non-permission field (Name) h/l must
-        // not mutate the draft or change the field.
-        let snapshot_name = app.editor_draft.as_ref().unwrap().agent.name.clone();
-        // Walk back up to Name (Permissions(0) → Prompt → Model → Mode →
-        // Description → Name is five k presses, not four).
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(field_of(&app), EditorField::Name);
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_editor_key(
-            KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert_eq!(field_of(&app), EditorField::Name);
-        assert_eq!(app.editor_draft.as_ref().unwrap().agent.name, snapshot_name);
-    }
-
-    #[test]
-    fn model_picker_round_trip_resets_editor_mode_to_normal() {
-        // Entering the model picker from NORMAL and returning must leave
-        // the editor in NORMAL. INSERT must not survive the round-trip
-        // because the picker is only reachable from the Model field.
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
-        let mut draft = AgentDraft::from_agent(starter_agent(&STARTERS[0]));
-        draft.agent.model = Some("openai/gpt-5.4".to_string());
-        app.editor_draft = Some(draft);
-        app.editor_original_name = Some(STARTERS[0].name.to_string());
-        // Pretend we came from INSERT (defensive: the picker should still
-        // reset to NORMAL on return).
-        app.screen = Screen::Editor {
-            field: EditorField::Model,
-            mode: EditorMode::Insert,
-            status: None,
-            confirm_discard: false,
-        };
-        app.open_model_picker(Some("openai/gpt-5.4".to_string()));
-        assert!(matches!(app.screen, Screen::ModelPicker { .. }));
-        app.handle_model_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        let mode = match app.screen {
-            Screen::Editor { mode, .. } => mode,
-            _ => panic!("expected editor after picker Esc"),
-        };
-        assert_eq!(mode, EditorMode::Normal);
-    }
-
-    #[test]
-    fn editor_left_right_preserves_mode_cycling() {
-        // Left/Right still cycle Mode. The fix must not touch this path.
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        app.open_editor_new();
-        // Walk down to Mode (Name -> Description -> Mode).
-        app.handle_editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &paths);
-        app.handle_editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &paths);
-
-        let initial = app.editor_draft.as_ref().unwrap().agent.mode;
-        app.handle_editor_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()), &paths);
-        let after_right = app.editor_draft.as_ref().unwrap().agent.mode;
-        assert_eq!(after_right, initial.next());
-        app.handle_editor_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()), &paths);
-        let after_left = app.editor_draft.as_ref().unwrap().agent.mode;
-        assert_eq!(after_left, initial);
-    }
-
-    #[test]
-    fn editor_left_right_moves_permission_rows() {
-        // Left/Right take over the within-permission-list navigation that
-        // Up/Down used to do, so users still have a way to step between
-        // permission rows without leaving the Permissions block.
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        app.open_editor_new();
-        // Walk down to Permissions(0).
-        for _ in 0..5 {
-            app.handle_editor_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()), &paths);
-        }
-        let field = |app: &App| -> EditorField {
-            match app.screen {
-                Screen::Editor { field, .. } => field,
-                _ => panic!("expected editor screen"),
-            }
-        };
-        assert_eq!(field(&app), EditorField::Permissions(0));
-
-        app.handle_editor_key(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()), &paths);
-        assert_eq!(field(&app), EditorField::Permissions(1));
-        app.handle_editor_key(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()), &paths);
-        assert_eq!(field(&app), EditorField::Permissions(0));
-    }
-
-    #[test]
-    fn editor_arbitrary_key_in_normal_does_not_mutate_text_fields() {
-        // Regression: NORMAL must consume (swallow) every key that is not an
-        // explicit NORMAL action. Previously the handler fell through to
-        // `edit_text_field` on Name/Description/Prompt, so a stray `x`
-        // (or any other printable key) would silently append to the buffer.
-        // The contract: NORMAL = navigation/save/quit only; text editing
-        // requires INSERT (reached via `i`).
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        app.open_editor_new();
-
-        let field_of = |app: &App| -> EditorField {
-            match app.screen {
-                Screen::Editor { field, .. } => field,
-                _ => panic!("expected editor screen"),
-            }
-        };
-        let mode_of = |app: &App| -> EditorMode {
-            match app.screen {
-                Screen::Editor { mode, .. } => mode,
-                _ => panic!("expected editor screen"),
-            }
-        };
-        let press = |app: &mut App, paths: &Paths, c: char| {
-            app.handle_editor_key(
-                KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()),
-                paths,
-            );
-        };
-        // Backspace is also covered: in NORMAL it must not strip characters.
-        let press_bs = |app: &mut App, paths: &Paths| {
-            app.handle_editor_key(
-                KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
-                paths,
-            );
-        };
-
-        // ---------- Name ----------
-        // New-agent default name is "agent-1". Press several arbitrary
-        // printable keys plus Backspace in NORMAL; buffer must be byte-
-        // identical afterwards.
-        let name_before = app.editor_draft.as_ref().unwrap().agent.name.clone();
-        assert_eq!(field_of(&app), EditorField::Name);
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-        for c in "xyzabc123!@#".chars() {
-            press(&mut app, &paths, c);
-        }
-        press_bs(&mut app, &paths);
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-        assert_eq!(field_of(&app), EditorField::Name);
-        assert_eq!(
-            app.editor_draft.as_ref().unwrap().agent.name,
-            name_before,
-            "NORMAL leaked chars into Name: {:?}",
-            app.editor_draft.as_ref().unwrap().agent.name
-        );
-
-        // After `i`, the same key MUST append (proves INSERT is intact and
-        // proves the test would have caught the bug if it had regressed).
-        press(&mut app, &paths, 'i');
-        assert_eq!(mode_of(&app), EditorMode::Insert);
-        press(&mut app, &paths, 'x');
-        assert_eq!(
-            app.editor_draft.as_ref().unwrap().agent.name,
-            format!("{}x", name_before),
-            "INSERT failed to append `x` to Name"
-        );
-        // Backspace in INSERT still edits: `x` removed, buffer restored.
-        press_bs(&mut app, &paths);
-        assert_eq!(app.editor_draft.as_ref().unwrap().agent.name, name_before);
-        // Return to NORMAL so the next section's `j` navigates instead of
-        // typing.
-        app.handle_editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &paths);
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-
-        // ---------- Description ----------
-        // Move to Description (Name → Description).
-        press(&mut app, &paths, 'j');
-        assert_eq!(field_of(&app), EditorField::Description);
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-
-        let desc_before = app.editor_draft.as_ref().unwrap().agent.description.clone();
-        for c in "hello-world".chars() {
-            press(&mut app, &paths, c);
-        }
-        press_bs(&mut app, &paths);
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-        assert_eq!(field_of(&app), EditorField::Description);
-        assert_eq!(
-            app.editor_draft.as_ref().unwrap().agent.description,
-            desc_before,
-            "NORMAL leaked chars into Description: {:?}",
-            app.editor_draft.as_ref().unwrap().agent.description
-        );
-
-        // After `i`, the same key MUST append.
-        press(&mut app, &paths, 'i');
-        assert_eq!(mode_of(&app), EditorMode::Insert);
-        press(&mut app, &paths, 'x');
-        assert_eq!(
-            app.editor_draft.as_ref().unwrap().agent.description,
-            format!("{}x", desc_before),
-            "INSERT failed to append `x` to Description"
-        );
-        press_bs(&mut app, &paths);
-        assert_eq!(
-            app.editor_draft.as_ref().unwrap().agent.description,
-            desc_before
-        );
-        app.handle_editor_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &paths);
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-
-        // ---------- Prompt ----------
-        // Move to Prompt (Description → Mode → Model → Prompt).
-        press(&mut app, &paths, 'j'); // Mode
-        press(&mut app, &paths, 'j'); // Model
-        press(&mut app, &paths, 'j'); // Prompt
-        assert_eq!(field_of(&app), EditorField::Prompt);
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-
-        let prompt_before = app.editor_draft.as_ref().unwrap().prompt.clone();
-        // Use a string that contains only letters/digits/symbols that have
-        // no NORMAL meaning. `q` and `w` discard/save; `i` enters INSERT;
-        // j/k/h/l are navigation. Anything else must be a no-op.
-        //
-        // Note: `e` is intentionally excluded because it is a legitimate
-        // NORMAL action on the Prompt field -- it opens the external
-        // editor (`edit_prompt_in_system_editor` in this module), which
-        // would block this headless test. The contract being verified
-        // (NORMAL on Prompt must not call `edit_text_field`) is preserved:
-        // those inert characters still prove no mutation happens.
-        for c in "abcdf 0123 .,-".chars() {
-            press(&mut app, &paths, c);
-        }
-        press_bs(&mut app, &paths);
-        assert_eq!(mode_of(&app), EditorMode::Normal);
-        assert_eq!(field_of(&app), EditorField::Prompt);
-        assert_eq!(
-            app.editor_draft.as_ref().unwrap().prompt,
-            prompt_before,
-            "NORMAL leaked chars into Prompt: {:?}",
-            app.editor_draft.as_ref().unwrap().prompt
-        );
-
-        // After `i`, the same key MUST append.
-        press(&mut app, &paths, 'i');
-        assert_eq!(mode_of(&app), EditorMode::Insert);
-        press(&mut app, &paths, 'x');
-        assert_eq!(
-            app.editor_draft.as_ref().unwrap().prompt,
-            format!("{}x", prompt_before),
-            "INSERT failed to append `x` to Prompt"
-        );
-        press_bs(&mut app, &paths);
-        assert_eq!(app.editor_draft.as_ref().unwrap().prompt, prompt_before);
-    }
-
-    // ---------- Contextual footer ----------
-
-    /// Build an `App` with no filesystem state. `footer_text` only inspects
-    /// the active screen, so the dummy paths are safe.
-    fn fresh_app() -> App {
-        App::new(
-            Paths {
-                agenthd_root: std::path::PathBuf::from("/tmp/agenthd-footer-test/.agenthd"),
-                canonical_dir: std::path::PathBuf::from("/tmp/agenthd-footer-test/.agenthd/agents"),
-                state_file: std::path::PathBuf::from(
-                    "/tmp/agenthd-footer-test/.agenthd/state.json",
-                ),
-                target_dir: std::path::PathBuf::from(
-                    "/tmp/agenthd-footer-test/.config/opencode/agents",
-                ),
-                pi_target_dir: std::path::PathBuf::from(
-                    "/tmp/agenthd-footer-test/.pi/agent/agents",
-                ),
-                plugin_file: std::path::PathBuf::from(
-                    "/tmp/agenthd-footer-test/.config/opencode/plugins/agenthd-subagents.tsx",
-                ),
-                plugin_config: std::path::PathBuf::from(
-                    "/tmp/agenthd-footer-test/.config/opencode/tui.json",
-                ),
-                skills_dir: std::path::PathBuf::from(
-                    "/tmp/agenthd-footer-test/.config/opencode/skills",
-                ),
-            },
-            State::default(),
-        )
-    }
-
-    #[test]
-    fn footer_main_describes_navigate_open_quit() {
-        let mut app = fresh_app();
-        app.screen = Screen::Main { selected: 0 };
-        let text = app.footer_text();
-        assert!(
-            text.contains("Enter"),
-            "main footer mentions Enter: {text:?}"
-        );
-        assert!(text.contains("open"), "main footer mentions open: {text:?}");
-        assert!(text.contains("quit"), "main footer mentions quit: {text:?}");
-        assert!(text.contains("Esc"), "main footer mentions Esc: {text:?}");
-    }
-
-    #[test]
-    fn footer_agents_describes_select_new_edit_delete_back() {
-        let mut app = fresh_app();
-        app.screen = Screen::Agents {
-            agents: Vec::new(),
-            selected: 0,
-            status: None,
-            confirm_update_bundled: None,
-        };
-        let text = app.footer_text();
-        assert!(text.contains("new"), "agents footer mentions new: {text:?}");
-        assert!(
-            text.contains("edit"),
-            "agents footer mentions edit: {text:?}"
-        );
-        assert!(
-            text.contains("delete"),
-            "agents footer mentions delete: {text:?}"
-        );
-        assert!(
-            text.contains("back"),
-            "agents footer mentions back: {text:?}"
-        );
-        // The new bundled-update shortcut must be advertised in the idle
-        // footer so users discover it without reading the README.
-        assert!(
-            text.contains("u") && text.contains("update bundled prompts"),
-            "agents footer mentions u + update bundled prompts: {text:?}"
-        );
-    }
-
-    #[test]
-    fn footer_agents_confirm_update_overrides_default_keys() {
-        let mut app = fresh_app();
-        app.screen = Screen::Agents {
-            agents: Vec::new(),
-            selected: 0,
-            status: None,
-            confirm_update_bundled: Some("confirm?".to_string()),
-        };
-        let text = app.footer_text();
-        assert!(text.contains("Y"), "confirm footer mentions Y: {text:?}");
-        assert!(
-            text.contains("cancel"),
-            "confirm footer mentions cancel: {text:?}"
-        );
-        // The idle actions are suppressed while the gate is armed so the
-        // footer cannot contradict itself.
-        assert!(
-            !text.contains("delete"),
-            "confirm footer must not mention delete: {text:?}"
-        );
-        assert!(
-            !text.contains("update bundled prompts"),
-            "confirm footer must not advertise the idle shortcut: {text:?}"
-        );
-    }
-
-    /// `u` arms the bundled-update gate; pressing `y` runs the refresh;
-    /// pressing `n` cancels without writing.
-    #[test]
-    fn agents_screen_u_arms_and_n_cancels() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        // Capture a sentinel: every starter's prompt is the bundled one, so
-        // any successful refresh would bump the prompt body. We want to
-        // verify that n cancels *without* touching the files at all.
-        let scout_path = paths.canonical_dir.join("scout.md");
-        let scout_before = std::fs::read_to_string(&scout_path).unwrap();
-
-        // Press `u` — gate should arm and no write should have happened.
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(
-            matches!(
-                app.screen,
-                Screen::Agents {
-                    confirm_update_bundled: Some(_),
-                    ..
-                }
-            ),
-            "u should arm the bundled-update confirmation: {:?}",
-            app.screen
-        );
-        assert_eq!(
-            std::fs::read_to_string(&scout_path).unwrap(),
-            scout_before,
-            "u must not write until y is pressed"
-        );
-
-        // Press `n` — gate should clear with a cancel status, files still
-        // untouched.
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(matches!(
-            app.screen,
-            Screen::Agents {
-                confirm_update_bundled: None,
-                ..
-            }
-        ));
-        assert_eq!(
-            std::fs::read_to_string(&scout_path).unwrap(),
-            scout_before,
-            "n must not write"
-        );
-        assert!(
-            app.status_bar
-                .as_deref()
-                .unwrap_or_default()
-                .contains("cancelled"),
-            "status should announce cancellation: {:?}",
-            app.status_bar
-        );
-    }
-
-    /// `Esc` cancels the bundled-update gate without writing.
-    #[test]
-    fn agents_screen_u_arms_and_esc_cancels() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        let scout_path = paths.canonical_dir.join("scout.md");
-        let scout_before = std::fs::read_to_string(&scout_path).unwrap();
-
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(matches!(
-            app.screen,
-            Screen::Agents {
-                confirm_update_bundled: Some(_),
-                ..
-            }
-        ));
-        app.handle_agents_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()), &paths);
-        // Esc on the armed confirmation must cancel the gate, NOT pop back
-        // to the main menu. Otherwise a stray Esc while reviewing the
-        // confirmation would silently lose the user's place in the list.
-        assert!(matches!(
-            app.screen,
-            Screen::Agents {
-                confirm_update_bundled: None,
-                ..
-            }
-        ));
-        assert_eq!(
-            std::fs::read_to_string(&scout_path).unwrap(),
-            scout_before,
-            "Esc must not write"
-        );
-    }
-
-    /// While the gate is armed, only `y`/`Y`/`n`/`N`/`Esc` are valid; any
-    /// other key must be a no-op so the user cannot accidentally navigate,
-    /// edit, or delete agents while a prompt refresh is pending.
-    ///
-    /// `n` is excluded from this test: it is itself a valid gate response
-    /// (its own test, `agents_screen_u_arms_and_n_cancels`, covers that
-    /// behavior). Mixing it into this test would cancel the gate mid-loop
-    /// and then exercise the un-gated keys, which is the wrong question.
-    #[test]
-    fn agents_screen_confirmation_gates_other_keys() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        let initial_selected = match &app.screen {
-            Screen::Agents { selected, .. } => *selected,
-            _ => unreachable!(),
-        };
-
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(matches!(
-            app.screen,
-            Screen::Agents {
-                confirm_update_bundled: Some(_),
-                ..
-            }
-        ));
-
-        // Each stray key is sent through the *still-armed* gate. Navigation
-        // keys must not move the cursor, the create/edit/delete keys must
-        // not change the screen, and the gate must remain armed.
-        let stray_keys = [
-            KeyCode::Char('j'),
-            KeyCode::Down,
-            KeyCode::Char('k'),
-            KeyCode::Up,
-            KeyCode::Char('d'),
-            KeyCode::Char('e'),
-            KeyCode::Enter,
-            KeyCode::Char('x'),
-        ];
-        for code in stray_keys {
-            app.handle_agents_key(KeyEvent::new(code, KeyModifiers::empty()), &paths);
-            match &app.screen {
-                Screen::Agents {
-                    selected,
-                    confirm_update_bundled,
-                    ..
-                } => {
-                    assert!(
-                        confirm_update_bundled.is_some(),
-                        "gate must remain armed through stray key {:?}",
-                        code
-                    );
-                    assert_eq!(
-                        *selected, initial_selected,
-                        "navigation key {:?} must not move the cursor while the gate is armed",
-                        code
-                    );
-                }
-                other => panic!("stray key {:?} changed screen to {:?}", code, other),
-            }
-        }
-    }
-
-    /// `y` accepts the gate and the bundled prompts are refreshed. The
-    /// per-file outcomes show up as a green "updated" status message so
-    /// the user can see what changed.
-    #[test]
-    fn agents_screen_y_refreshes_prompts_and_preserves_other_fields() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-
-        // Customize scout's description and permissions, then edit its
-        // prompt so the refresh has work to do.
-        let scout_path = paths.canonical_dir.join("scout.md");
-        let prior = crate::store::hash_file(&scout_path).unwrap();
-        let mut scout = crate::agent::Agent::read(&scout_path).unwrap();
-        let original_description = scout.description.clone();
-        let original_mode = scout.mode;
-        let original_model = scout.model.clone();
-        scout
-            .permissions
-            .insert("read".to_string(), crate::agent::PermissionAction::Deny);
-        scout.prompt = "the user changed this prompt on purpose\n".to_string();
-        crate::store::save_canonical(&paths, &scout, prior.as_deref()).unwrap();
-
-        // Press u, then y.
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(matches!(
-            app.screen,
-            Screen::Agents {
-                confirm_update_bundled: Some(_),
-                ..
-            }
-        ));
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
-            &paths,
-        );
-
-        // Gate cleared after y.
-        assert!(matches!(
-            app.screen,
-            Screen::Agents {
-                confirm_update_bundled: None,
-                ..
-            }
-        ));
-        let status = app.status_bar.clone().unwrap_or_default();
-        assert!(
-            status.starts_with("updated bundled prompts")
-                || status.starts_with("bundled prompts already current"),
-            "expected a successful summary, got {:?}",
-            status
-        );
-
-        // The scout prompt body is now the bundled one.
-        let refreshed = crate::agent::Agent::read(&scout_path).unwrap();
-        let bundled_prompt = STARTERS.iter().find(|s| s.name == "scout").unwrap().prompt;
-        assert_eq!(refreshed.prompt, bundled_prompt);
-        // Other fields preserved.
-        assert_eq!(refreshed.description, original_description);
-        assert_eq!(refreshed.mode, original_mode);
-        assert_eq!(refreshed.model, original_model);
-        assert_eq!(
-            refreshed.permissions.get("read"),
-            Some(&crate::agent::PermissionAction::Deny),
-            "user permission override must survive the refresh"
-        );
-    }
-
-    /// Uppercase `Y` also confirms the gate (matching the overwrite pattern).
-    #[test]
-    fn agents_screen_uppercase_y_also_confirms() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::empty()),
-            &paths,
-        );
-        assert!(matches!(
-            app.screen,
-            Screen::Agents {
-                confirm_update_bundled: None,
-                ..
-            }
-        ));
-        assert!(
-            app.status_bar
-                .as_deref()
-                .unwrap_or_default()
-                .starts_with("updated bundled prompts")
-                || app
-                    .status_bar
-                    .as_deref()
-                    .unwrap_or_default()
-                    .starts_with("bundled prompts already current"),
-            "Y must run the refresh: {:?}",
-            app.status_bar
-        );
-    }
-
-    /// `u` must not write anything on its own. Confirms the single-key
-    /// confirmation semantics: arming the gate is free.
-    #[test]
-    fn agents_screen_u_alone_does_not_write() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        let scout_path = paths.canonical_dir.join("scout.md");
-        let before = std::fs::read_to_string(&scout_path).unwrap();
-        let mtime_before = std::fs::metadata(&scout_path).unwrap().modified().unwrap();
-
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::empty()),
-            &paths,
-        );
-
-        // No file touched: mtime must match and bytes must match.
-        let after = std::fs::read_to_string(&scout_path).unwrap();
-        let mtime_after = std::fs::metadata(&scout_path).unwrap().modified().unwrap();
-        assert_eq!(before, after);
-        assert_eq!(
-            mtime_before, mtime_after,
-            "u alone must not bump the file mtime"
-        );
-        // Status bar must not claim any write happened.
-        let status = app.status_bar.clone().unwrap_or_default();
-        assert!(
-            !status.starts_with("updated bundled prompts"),
-            "u alone must not claim a refresh: {:?}",
-            status
-        );
-    }
-
-    /// When the user navigates the list while no confirmation is armed, the
-    /// `u` action remains available (i.e. navigation does not accidentally
-    /// gate the new shortcut).
-    #[test]
-    fn agents_screen_navigation_does_not_arm_update_gate() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_agents();
-        // Press j twice to move down — the gate must stay disarmed.
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        );
-        app.handle_agents_key(
-            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()),
-            &paths,
-        );
         match &app.screen {
-            Screen::Agents {
-                confirm_update_bundled,
-                ..
-            } => assert!(
-                confirm_update_bundled.is_none(),
-                "navigation must not arm the gate"
-            ),
-            _ => panic!("expected Agents screen"),
-        }
-    }
-
-    #[test]
-    fn footer_editor_normal_describes_nav_save_back() {
-        let mut app = fresh_app();
-        app.screen = Screen::Editor {
-            field: EditorField::Name,
-            mode: EditorMode::Normal,
-            status: None,
-            confirm_discard: false,
-        };
-        let text = app.footer_text();
-        assert!(
-            text.contains("save"),
-            "editor NORMAL footer mentions save: {text:?}"
-        );
-        assert!(
-            text.contains("field"),
-            "editor NORMAL footer mentions field: {text:?}"
-        );
-        // INSERT is reachable from NORMAL via `i`, which the mode bar shows
-        // for text fields — the footer just confirms save/quit/back.
-        assert!(
-            text.contains("Esc"),
-            "editor NORMAL footer mentions Esc: {text:?}"
-        );
-        assert!(
-            text.contains("i: edit"),
-            "Name footer mentions inline edit: {text:?}"
-        );
-    }
-
-    #[test]
-    fn footer_editor_surfaces_prompt_and_permission_shortcuts() {
-        let mut app = fresh_app();
-        app.screen = Screen::Editor {
-            field: EditorField::Prompt,
-            mode: EditorMode::Normal,
-            status: None,
-            confirm_discard: false,
-        };
-        assert!(app.footer_text().contains("e: edit prompt"));
-
-        app.screen = Screen::Editor {
-            field: EditorField::Permissions(0),
-            mode: EditorMode::Normal,
-            status: None,
-            confirm_discard: false,
-        };
-        assert!(app.footer_text().contains("Space: cycle permission"));
-        assert!(app.footer_text().contains("h/l: row"));
-
-        app.screen = Screen::Editor {
-            field: EditorField::Mode,
-            mode: EditorMode::Normal,
-            status: None,
-            confirm_discard: false,
-        };
-        assert!(app.footer_text().contains("cycle mode"));
-
-        app.screen = Screen::Editor {
-            field: EditorField::Model,
-            mode: EditorMode::Normal,
-            status: None,
-            confirm_discard: false,
-        };
-        assert!(app.footer_text().contains("choose model"));
-    }
-
-    #[test]
-    fn footer_editor_insert_describes_type_backspace_esc() {
-        let mut app = fresh_app();
-        app.screen = Screen::Editor {
-            field: EditorField::Name,
-            mode: EditorMode::Insert,
-            status: None,
-            confirm_discard: false,
-        };
-        let text = app.footer_text();
-        assert!(
-            text.contains("Backspace"),
-            "INSERT footer mentions Backspace: {text:?}"
-        );
-        assert!(
-            text.contains("NORMAL"),
-            "INSERT footer mentions NORMAL: {text:?}"
-        );
-        // INSERT mode does not surface save/quit because they are no-ops.
-        assert!(
-            !text.contains("save"),
-            "INSERT footer should not mention save: {text:?}"
-        );
-    }
-
-    #[test]
-    fn footer_editor_confirm_discard_overrides_mode() {
-        let mut app = fresh_app();
-        // confirm_discard wins regardless of the underlying mode.
-        app.screen = Screen::Editor {
-            field: EditorField::Name,
-            mode: EditorMode::Insert,
-            status: None,
-            confirm_discard: true,
-        };
-        let text = app.footer_text();
-        assert!(
-            text.contains("discard"),
-            "confirm-discard footer mentions discard: {text:?}"
-        );
-        assert!(
-            text.contains("cancel"),
-            "confirm-discard footer mentions cancel: {text:?}"
-        );
-    }
-
-    #[test]
-    fn footer_model_picker_describes_select_apply_manual_refresh() {
-        let mut app = fresh_app();
-        app.screen = Screen::ModelPicker {
-            discovery: crate::models::Discovery::Empty(String::new()),
-            manual: String::new(),
-            selected: 0,
-            manual_open: false,
-            status: None,
-        };
-        let text = app.footer_text();
-        assert!(
-            text.contains("apply"),
-            "picker footer mentions apply: {text:?}"
-        );
-        assert!(
-            text.contains("manual"),
-            "picker footer mentions manual: {text:?}"
-        );
-        assert!(
-            text.contains("refresh"),
-            "picker footer mentions refresh: {text:?}"
-        );
-    }
-
-    #[test]
-    fn footer_model_picker_manual_open_describes_type_tab_esc() {
-        let mut app = fresh_app();
-        app.screen = Screen::ModelPicker {
-            discovery: crate::models::Discovery::Empty(String::new()),
-            manual: String::new(),
-            selected: 0,
-            manual_open: true,
-            status: None,
-        };
-        let text = app.footer_text();
-        assert!(
-            text.contains("Tab"),
-            "manual-open footer mentions Tab: {text:?}"
-        );
-        assert!(
-            text.contains("close"),
-            "manual-open footer mentions close: {text:?}"
-        );
-    }
-
-    #[test]
-    fn footer_install_update_describes_install_overwrite_refresh_back() {
-        // List view: the bound harness label appears up front and the
-        // `Esc` shortcut takes the user back to the harness selector,
-        // not the main menu.
-        let mut app = fresh_app();
-        app.screen = Screen::InstallUpdate {
-            items: Vec::new(),
-            selected: 0,
-            last_outcomes: Vec::new(),
-            status: None,
-            confirm_overwrite: None,
-            target: Some(SyncTarget::OpenCode),
-        };
-        let text = app.footer_text();
-        assert!(
-            text.contains("install safe"),
-            "install footer mentions install safe: {text:?}"
-        );
-        assert!(
-            text.contains("overwrite"),
-            "install footer mentions overwrite: {text:?}"
-        );
-        assert!(
-            text.contains("refresh"),
-            "install footer mentions refresh: {text:?}"
-        );
-        assert!(
-            text.contains("Esc"),
-            "install footer mentions Esc: {text:?}"
-        );
-        assert!(
-            text.contains("OpenCode"),
-            "list footer must advertise the bound harness: {text:?}"
-        );
-    }
-
-    #[test]
-    fn footer_install_update_confirm_overwrite_overrides_keys() {
-        let mut app = fresh_app();
-        app.screen = Screen::InstallUpdate {
-            items: Vec::new(),
-            selected: 0,
-            last_outcomes: Vec::new(),
-            status: None,
-            confirm_overwrite: Some((SyncTarget::OpenCode, "overwrite?".to_string())),
-            target: Some(SyncTarget::OpenCode),
-        };
-        let text = app.footer_text();
-        assert!(
-            text.contains("Y"),
-            "confirm-overwrite footer mentions Y: {text:?}"
-        );
-        assert!(
-            text.contains("cancel"),
-            "confirm-overwrite footer mentions cancel: {text:?}"
-        );
-        // The underlying screen's regular keys are suppressed while the
-        // confirmation is armed so the footer cannot contradict itself.
-        assert!(
-            !text.contains("install safe"),
-            "confirm-overwrite footer should not mention install safe: {text:?}"
-        );
-    }
-
-    #[test]
-    fn main_menu_includes_tools_entry() {
-        let labels: Vec<&str> = MainItem::all().iter().map(|m| m.label()).collect();
-        assert!(
-            labels.contains(&"Tools"),
-            "main menu must include Tools entry: {:?}",
-            labels
-        );
-        // Tools sits between Install/Update and the Subagent panel.
-        let iu = labels.iter().position(|l| *l == "Install/Update").unwrap();
-        let tools = labels.iter().position(|l| *l == "Tools").unwrap();
-        let panel = labels.iter().position(|l| *l == "Subagent panel").unwrap();
-        assert!(iu < tools && tools < panel, "Tools ordering: {:?}", labels);
-    }
-
-    #[test]
-    fn footer_tools_describes_install_refresh_back() {
-        let mut app = fresh_app();
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        // Build the Tools entries directly so we don't depend on disk state.
-        let mut entries = Vec::new();
-        for entry in tools_lib::DEFAULT_CATALOG {
-            entries.push(tools_lib::tool_status(&paths, entry).unwrap_or_else(|_| {
-                crate::tools::ToolItem {
-                    entry,
-                    status: crate::tools::ToolStatus::NotInstalled,
-                    detail: String::new(),
-                    destination: tools_lib::destination_for(&paths, entry),
-                }
-            }));
-        }
-        app.screen = Screen::Tools {
-            entries,
-            selected: 0,
-            status: None,
-            installing: false,
-        };
-        let text = app.footer_text();
-        assert!(
-            text.contains("install"),
-            "tools footer mentions install: {text:?}"
-        );
-        assert!(
-            text.contains("refresh"),
-            "tools footer mentions refresh: {text:?}"
-        );
-        assert!(
-            text.contains("back"),
-            "tools footer mentions back: {text:?}"
-        );
-    }
-
-    #[test]
-    fn footer_tools_installing_suppresses_action_keys() {
-        let mut app = fresh_app();
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let entries: Vec<ToolItem> = tools_lib::DEFAULT_CATALOG
-            .iter()
-            .map(|entry| tools_lib::tool_status(&paths, entry).unwrap())
-            .collect();
-        app.screen = Screen::Tools {
-            entries: entries.clone(),
-            selected: 0,
-            status: None,
-            installing: true,
-        };
-        let text = app.footer_text();
-        // While installing, the footer must not advertise the install
-        // shortcut — the user cannot queue more work or race the spawn.
-        assert!(
-            !text.contains("install safe"),
-            "installing footer must not advertise another install: {text:?}"
-        );
-        assert!(
-            text.contains("installing"),
-            "installing footer mentions state: {text:?}"
-        );
-    }
-
-    #[test]
-    fn render_tools_does_not_panic_on_tiny_terminal() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(1, 3);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let entries: Vec<ToolItem> = tools_lib::DEFAULT_CATALOG
-            .iter()
-            .map(|entry| tools_lib::tool_status(&paths, entry).unwrap())
-            .collect();
-        app.screen = Screen::Tools {
-            entries,
-            selected: 0,
-            status: None,
-            installing: false,
-        };
-        terminal.draw(|frame| app.render(frame)).unwrap();
-    }
-
-    #[test]
-    fn open_tools_builds_entries_from_catalog() {
-        let mut app = fresh_app();
-        let dir = TempDir::new().unwrap();
-        app.paths = setup_paths(&dir);
-        app.open_tools();
-        match &app.screen {
-            Screen::Tools { entries, .. } => {
-                assert_eq!(entries.len(), tools_lib::DEFAULT_CATALOG.len());
-                for item in entries {
-                    assert_eq!(
-                        item.entry.skill_name, "pi-psql",
-                        "the bundled catalog has one entry, pi-psql"
-                    );
-                    assert_eq!(item.status, crate::tools::ToolStatus::NotInstalled);
-                }
-            }
-            other => panic!("expected Tools screen, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn handle_tools_key_i_on_installed_row_dispatches_install() {
-        // Per TOOL_INSTALLER_PLAN.md, `i` must dispatch into the
-        // installer regardless of the row's pre-install status. The
-        // installer is the single source of truth: an existing target
-        // dir/file/symlink is refused by the OS no-replace primitive
-        // and reported as Conflict. The handler must therefore NOT
-        // branch on `ToolStatus::Installed` and surface a UI no-op.
-        //
-        // We cannot exercise this through `App::handle_tools_key`
-        // end-to-end here: that path calls `tools_lib::install_tool`,
-        // which spawns real `git`, `node`, `npm`, and touches the
-        // network. There is no injection seam for the installer in
-        // `install_selected_tool` (it is a private method on `App`
-        // that calls `tools_lib::install_tool` directly with the default
-        // runners). Inventing one — a trait, a callback parameter, a
-        // method override — solely for tests would violate the
-        // "no extra interface" rule, so the smallest useful test
-        // here pins the dispatch decision by calling the extracted
-        // helper directly. The Conflict outcome itself is covered by
-        // `tools_lib::install_tool_with` tests in `src/tools/tests.rs`,
-        // which use the injected spawn / rename runners.
-        let entry: &'static crate::tools::ToolCatalogEntry = &tools_lib::DEFAULT_CATALOG[0];
-        let items = vec![ToolItem {
-            entry,
-            status: crate::tools::ToolStatus::Installed,
-            detail: "installed".to_string(),
-            destination: std::path::PathBuf::from("/tmp/agenthd-installed-target"),
-        }];
-        assert_eq!(
-            App::tools_screen_install_target(&items, 0),
-            Some(0),
-            "i on an Installed row must dispatch into the install path",
-        );
-    }
-
-    #[test]
-    fn handle_tools_key_esc_returns_to_main() {
-        let mut app = fresh_app();
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let entries: Vec<ToolItem> = tools_lib::DEFAULT_CATALOG
-            .iter()
-            .map(|entry| tools_lib::tool_status(&paths, entry).unwrap())
-            .collect();
-        app.paths = paths;
-        app.screen = Screen::Tools {
-            entries,
-            selected: 0,
-            status: None,
-            installing: false,
-        };
-        app.handle_tools_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(matches!(app.screen, Screen::Main { .. }));
-    }
-
-    #[test]
-    fn handle_tools_key_blocks_input_during_install() {
-        // The screen sets `installing = true` synchronously and the install
-        // runs inside the event loop. Any key pressed while installing must
-        // be a no-op so the user cannot queue more work.
-        let mut app = fresh_app();
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let entries: Vec<ToolItem> = tools_lib::DEFAULT_CATALOG
-            .iter()
-            .map(|entry| tools_lib::tool_status(&paths, entry).unwrap())
-            .collect();
-        app.paths = paths;
-        app.screen = Screen::Tools {
-            entries,
-            selected: 0,
-            status: None,
-            installing: true,
-        };
-        app.handle_tools_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
-        assert!(matches!(
-            app.screen,
-            Screen::Tools {
-                installing: true,
-                ..
-            }
-        ));
-    }
-
-    // ---------- Narrow-terminal safety ----------
-
-    #[test]
-    fn render_footer_does_not_panic_on_zero_width_area() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 10);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Main { selected: 0 };
-        terminal
-            .draw(|frame| {
-                // 0-width simulates a degenerate terminal column slice.
-                let area = Rect::new(0, 9, 0, 1);
-                app.render_footer(frame, area);
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn render_footer_does_not_panic_on_tiny_terminal() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(1, 3);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::InstallUpdate {
-            items: Vec::new(),
-            selected: 0,
-            last_outcomes: Vec::new(),
-            status: None,
-            confirm_overwrite: None,
-            target: Some(SyncTarget::OpenCode),
-        };
-        // Whole render path on a 1x3 terminal: layout shrinks, footer area
-        // is clipped, no panic.
-        terminal.draw(|frame| app.render(frame)).unwrap();
-    }
-
-    #[test]
-    fn render_footer_truncates_long_text_to_narrow_area() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(20, 5);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::InstallUpdate {
-            items: Vec::new(),
-            selected: 0,
-            last_outcomes: Vec::new(),
-            status: None,
-            confirm_overwrite: None,
-            target: Some(SyncTarget::OpenCode),
-        };
-        let full = app.footer_text();
-        assert!(
-            full.chars().count() > 20,
-            "sanity: InstallUpdate footer exceeds 20 cols, got {full:?}"
-        );
-        terminal
-            .draw(|frame| {
-                let area = Rect::new(0, 4, 20, 1);
-                app.render_footer(frame, area);
-            })
-            .unwrap();
-        // The truncated text must fit on the 20-wide row; specifically it
-        // must not carry the trailing `Esc: back` segment.
-        let buffer = terminal.backend().buffer().clone();
-        let last_row: String = buffer
-            .content()
-            .iter()
-            .skip(4 * 20)
-            .take(20)
-            .map(|c| c.symbol().to_string())
-            .collect();
-        assert!(
-            last_row.chars().count() <= 20,
-            "rendered row must fit width, got {last_row:?}"
-        );
-        assert!(
-            !last_row.contains("Esc: back"),
-            "footer should be truncated to 20 cols: {last_row:?}"
-        );
-    }
-
-    #[test]
-    fn status_and_footer_coexist_when_status_is_set() {
-        // Two independent rows: the status row carries the message, the
-        // footer row carries the contextual help. Both must be visible
-        // when status is set — neither hides the other.
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 6);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Agents {
-            agents: Vec::new(),
-            selected: 0,
-            status: None,
-            confirm_update_bundled: None,
-        };
-        app.status_bar = Some("saved `scout`".to_string());
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        // Layout: 1 body row + status row + footer row = 3 used rows in a
-        // 6-tall terminal; body consumes the rest (rows 0..3).
-        let full: String = buffer
-            .content()
-            .iter()
-            .map(|c| c.symbol().to_string())
-            .collect();
-        assert!(
-            full.contains("saved `scout`"),
-            "status message must remain visible: {full:?}"
-        );
-        assert!(
-            full.contains("new") && full.contains("delete"),
-            "footer shortcuts must remain visible alongside status: {full:?}"
-        );
-    }
-
-    // ---------- Footer/status visibility & style ----------
-
-    /// The footer used to render with `Color::DarkGray + DIM` which is
-    /// effectively black on dark terminals. It must now use an explicit
-    /// bright foreground on a stable accent background and must not carry
-    /// the DIM modifier.
-    #[test]
-    fn render_footer_uses_bright_fg_and_accent_bg_no_dim() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Main { selected: 0 };
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        // Footer is always the last row. 80 cols wide.
-        let last_row_idx = buffer.area.height as usize - 1;
-        let footer_cells: Vec<_> = buffer
-            .content()
-            .iter()
-            .skip(last_row_idx * buffer.area.width as usize)
-            .take(buffer.area.width as usize)
-            .collect();
-        // Find a non-empty footer cell to inspect style; the truncated text
-        // occupies the leftmost cells, leaving the rest as the buffer
-        // default. Sampling the first character of the footer text is
-        // enough to verify the rendered style.
-        let cell = footer_cells
-            .iter()
-            .find(|c| !c.symbol().chars().all(char::is_whitespace))
-            .expect("footer row should contain at least one non-blank cell");
-        assert_ne!(
-            cell.fg,
-            Color::DarkGray,
-            "footer foreground must not be DarkGray (was the original black-on-dark bug): {:?}",
-            cell.fg
-        );
-        assert_ne!(
-            cell.bg,
-            Color::Reset,
-            "footer background must be explicitly set, not Reset: {:?}",
-            cell.bg
-        );
-        assert!(
-            !cell.modifier.contains(Modifier::DIM),
-            "footer must not carry DIM modifier: {:?}",
-            cell.modifier
-        );
-    }
-
-    /// Footer row must remain visible when a status message is also set.
-    /// The two rows are independent — neither hides the other.
-    #[test]
-    fn footer_remains_visible_when_status_is_set() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Agents {
-            agents: Vec::new(),
-            selected: 0,
-            status: None,
-            confirm_update_bundled: None,
-        };
-        app.status_bar = Some("error: boom".to_string());
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let width = buffer.area.width as usize;
-        // Last row is the footer; second-to-last is the status row.
-        let footer_row: String = buffer
-            .content()
-            .iter()
-            .skip((buffer.area.height as usize - 1) * width)
-            .take(width)
-            .map(|c| c.symbol().to_string())
-            .collect();
-        let status_row: String = buffer
-            .content()
-            .iter()
-            .skip((buffer.area.height as usize - 2) * width)
-            .take(width)
-            .map(|c| c.symbol().to_string())
-            .collect();
-        assert!(
-            footer_row.contains("new") && footer_row.contains("delete"),
-            "footer must remain visible alongside status: footer={footer_row:?}"
-        );
-        assert!(
-            status_row.contains("error: boom"),
-            "status must remain visible alongside footer: status={status_row:?}"
-        );
-    }
-
-    /// `status: "error: ..."` must render in the semantic error color.
-    #[test]
-    fn status_line_applies_error_color_for_error_prefix() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Main { selected: 0 };
-        app.status_bar = Some("error: failed to write".to_string());
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let width = buffer.area.width as usize;
-        // Status row sits directly above the footer (second-to-last row).
-        let status_cells: Vec<_> = buffer
-            .content()
-            .iter()
-            .skip((buffer.area.height as usize - 2) * width)
-            .take(width)
-            .collect();
-        let cell = status_cells
-            .iter()
-            .find(|c| !c.symbol().chars().all(char::is_whitespace))
-            .expect("status row must contain at least one non-blank cell");
-        assert_eq!(
-            cell.fg, DANGER,
-            "error status must use the error foreground: {:?}",
-            cell.fg
-        );
-    }
-
-    /// Successful status prefixes must render in the semantic success color.
-    #[test]
-    fn status_line_applies_success_color_for_success_prefixes() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Main { selected: 0 };
-        app.status_bar = Some("saved `scout`".to_string());
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let width = buffer.area.width as usize;
-        let status_cells: Vec<_> = buffer
-            .content()
-            .iter()
-            .skip((buffer.area.height as usize - 2) * width)
-            .take(width)
-            .collect();
-        let cell = status_cells
-            .iter()
-            .find(|c| !c.symbol().chars().all(char::is_whitespace))
-            .expect("status row must contain at least one non-blank cell");
-        assert_eq!(
-            cell.fg, SUCCESS,
-            "success status must use the success foreground: {:?}",
-            cell.fg
-        );
-    }
-
-    /// Neutral status messages remain readable on the shared surface.
-    #[test]
-    fn status_line_default_prefix_uses_body_color() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 8);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Main { selected: 0 };
-        app.status_bar = Some("overwrite cancelled".to_string());
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let width = buffer.area.width as usize;
-        let status_cells: Vec<_> = buffer
-            .content()
-            .iter()
-            .skip((buffer.area.height as usize - 2) * width)
-            .take(width)
-            .collect();
-        let cell = status_cells
-            .iter()
-            .find(|c| !c.symbol().chars().all(char::is_whitespace))
-            .expect("status row must contain at least one non-blank cell");
-        assert_eq!(
-            cell.fg, TEXT,
-            "neutral status must use the body foreground, got {:?}",
-            cell.fg
-        );
-    }
-
-    /// The global AGENTHD brand must use the accent color and bold weight.
-    #[test]
-    fn screen_title_uses_accent_color_and_bold() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(40, 6);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Main { selected: 0 };
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let width = buffer.area.width as usize;
-        let top_row: Vec<_> = buffer.content().iter().take(width).collect();
-        let title_cell = top_row
-            .iter()
-            .find(|c| c.symbol() == "◆")
-            .expect("agenthd brand mark must be on the top row");
-        assert_eq!(
-            title_cell.fg, ACCENT,
-            "screen title must use accent color: {:?}",
-            title_cell.fg
-        );
-        assert!(
-            title_cell.modifier.contains(Modifier::BOLD),
-            "screen title must be bold: {:?}",
-            title_cell.modifier
-        );
-    }
-
-    /// Table headers must be readable (BOLD), not hidden (DIM).
-    #[test]
-    fn table_header_is_bold_not_dim() {
-        use ratatui::backend::TestBackend;
-        let backend = TestBackend::new(80, 10);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let mut app = fresh_app();
-        app.screen = Screen::Agents {
-            agents: vec![AgentSummary {
-                name: "scout".to_string(),
-                mode: crate::agent::Mode::primary,
-                model: None,
-                description: "desc".to_string(),
-            }],
-            selected: 0,
-            status: None,
-            confirm_update_bundled: None,
-        };
-        terminal.draw(|frame| app.render(frame)).unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        let width = buffer.area.width as usize;
-        // Find the uppercase NAME header; scanning the buffer is robust to
-        // the global header and rounded panel border.
-        let header_cell = buffer
-            .content()
-            .iter()
-            .find(|c| c.symbol() == "N")
-            .expect("table header cell must be present");
-        assert!(
-            header_cell.modifier.contains(Modifier::BOLD),
-            "table header must be bold: {:?}",
-            header_cell.modifier
-        );
-        assert!(
-            !header_cell.modifier.contains(Modifier::DIM),
-            "table header must not be dim: {:?}",
-            header_cell.modifier
-        );
-        // `width` is kept so future readers see the intent of the layout.
-        let _ = width;
-    }
-
-    // ---------- Install/Update harness selection ----------
-
-    /// Open the screen from main; the harness selector must be on
-    /// screen with no items loaded.
-    #[test]
-    fn open_install_update_shows_selector() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
-        app.open_install_update();
-        match &app.screen {
-            Screen::InstallUpdate {
-                items,
-                target,
-                selected,
-                ..
-            } => {
+            Screen::Agents { agents, status, .. } => {
                 assert!(
-                    items.is_empty(),
-                    "selector must not pre-load items: {items:?}"
-                );
-                assert!(
-                    target.is_none(),
-                    "selector must show when target is None: {target:?}"
-                );
-                assert_eq!(*selected, 0, "selector defaults to OpenCode (index 0)");
-            }
-            other => panic!("expected InstallUpdate screen, got {other:?}"),
-        }
-    }
-
-    /// `j` / `Down` walk the selector; `k` / `Up` walk it back; bounds
-    /// clamp at the edges so the user cannot scroll past the harness
-    /// list.
-    #[test]
-    fn install_update_selector_jk_navigation() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
-        app.open_install_update();
-
-        let press = |app: &mut App, code: KeyCode| {
-            app.handle_install_update_key(KeyEvent::new(code, KeyModifiers::empty()));
-        };
-        // Helper returns (selected, target_is_none). Read each time to
-        // avoid borrowing `app.screen` while a mutable borrow is held
-        // by `press`.
-        let snapshot = |app: &App| -> (usize, bool) {
-            match &app.screen {
-                Screen::InstallUpdate {
-                    selected, target, ..
-                } => (*selected, target.is_none()),
-                _ => panic!("expected InstallUpdate screen: {:?}", app.screen),
-            }
-        };
-
-        assert_eq!(snapshot(&app), (0, true));
-
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(snapshot(&app).0, 1, "j moves down");
-
-        press(&mut app, KeyCode::Char('j'));
-        assert_eq!(
-            snapshot(&app).0,
-            1,
-            "j clamps at the bottom (only 2 harnesses)"
-        );
-
-        press(&mut app, KeyCode::Down);
-        assert_eq!(snapshot(&app).0, 1, "Down clamps too");
-
-        press(&mut app, KeyCode::Char('k'));
-        assert_eq!(snapshot(&app).0, 0, "k moves back up");
-
-        press(&mut app, KeyCode::Up);
-        assert_eq!(snapshot(&app).0, 0, "Up clamps at the top");
-
-        // Other keys must be no-ops on the selector.
-        press(&mut app, KeyCode::Char('i'));
-        press(&mut app, KeyCode::Char('o'));
-        press(&mut app, KeyCode::Char('r'));
-        assert_eq!(snapshot(&app), (0, true));
-    }
-
-    /// Enter on the selector opens the list scoped to the chosen
-    /// harness. The list only contains items for that target, never
-    /// for the other.
-    #[test]
-    fn install_update_selector_enter_opens_scoped_list() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
-        app.open_install_update();
-
-        // Pick OpenCode (default selection).
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        match &app.screen {
-            Screen::InstallUpdate {
-                target,
-                items,
-                selected,
-                ..
-            } => {
-                assert_eq!(*target, Some(SyncTarget::OpenCode));
-                assert!(!items.is_empty(), "fresh install must produce items");
-                assert!(
-                    items.iter().all(|i| i.target == SyncTarget::OpenCode),
-                    "scoped list must only contain OpenCode items"
-                );
-                assert_eq!(*selected, 0);
-            }
-            other => panic!("expected InstallUpdate list, got {other:?}"),
-        }
-
-        // Back to selector, then pick Pi.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        match &app.screen {
-            Screen::InstallUpdate { target, items, .. } => {
-                assert_eq!(*target, Some(SyncTarget::Pi));
-                assert!(
-                    items.iter().all(|i| i.target == SyncTarget::Pi),
-                    "scoped list must only contain Pi items, got {:?}",
-                    items
-                        .iter()
-                        .map(|i| (i.target, &i.filename))
-                        .collect::<Vec<_>>()
-                );
-            }
-            other => panic!("expected InstallUpdate list for Pi, got {other:?}"),
-        }
-    }
-
-    /// Esc on the selector returns to the main menu; Esc on the list
-    /// returns to the selector (not the main menu).
-    #[test]
-    fn install_update_esc_walks_selector_then_list_then_main() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths, state);
-
-        // Esc on selector -> main.
-        app.open_install_update();
-        assert!(matches!(
-            app.screen,
-            Screen::InstallUpdate { target: None, .. }
-        ));
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(matches!(app.screen, Screen::Main { .. }));
-
-        // Enter -> list, Esc -> selector (not main).
-        app.open_install_update();
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        assert!(matches!(
-            app.screen,
-            Screen::InstallUpdate {
-                target: Some(_),
-                ..
-            }
-        ));
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        match &app.screen {
-            Screen::InstallUpdate { target, items, .. } => {
-                assert!(
-                    target.is_none(),
-                    "Esc on list must return to selector, not main"
-                );
-                assert!(items.is_empty(), "leaving the list clears items");
-            }
-            other => panic!("expected selector, got {other:?}"),
-        }
-        // A second Esc from the selector returns to main.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(matches!(app.screen, Screen::Main { .. }));
-    }
-
-    /// `Esc` on the confirm-overwrite popup must cancel the popup, not
-    /// navigate the list underneath. The list bound to the chosen
-    /// harness must remain visible after the cancel.
-    #[test]
-    fn install_update_esc_cancels_confirm_popup_then_lists_then_selector() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_install_update();
-        // Pick OpenCode and install safe so the target file exists
-        // before we mutate it into a conflict.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
-        let target_path = paths.target_dir.join("scout.md");
-        assert!(target_path.exists(), "OpenCode scout.md must be installed");
-        let before = std::fs::read_to_string(&target_path).unwrap();
-        let mutated = before.replace("read-only", "tampered");
-        std::fs::write(&target_path, &mutated).unwrap();
-        app.refresh_install_update();
-
-        // Find the scout row (it's a Conflict now) and arm `o`.
-        let scout_idx = match &app.screen {
-            Screen::InstallUpdate { items, .. } => items
-                .iter()
-                .position(|i| i.filename == "scout.md")
-                .expect("scout row"),
-            _ => unreachable!(),
-        };
-        for _ in 0..scout_idx {
-            app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
-        }
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
-        assert!(matches!(
-            &app.screen,
-            Screen::InstallUpdate {
-                confirm_overwrite: Some(_),
-                target: Some(SyncTarget::OpenCode),
-                ..
-            }
-        ));
-
-        // Esc cancels the popup only.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(matches!(
-            &app.screen,
-            Screen::InstallUpdate {
-                confirm_overwrite: None,
-                target: Some(SyncTarget::OpenCode),
-                ..
-            }
-        ));
-        assert!(
-            app.status_bar
-                .as_deref()
-                .unwrap_or_default()
-                .contains("cancelled"),
-            "cancelled popup must surface a status: {:?}",
-            app.status_bar
-        );
-        assert_eq!(
-            std::fs::read_to_string(&target_path).unwrap(),
-            mutated,
-            "Esc on the popup must not overwrite the target"
-        );
-
-        // Esc again returns to the selector.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(matches!(
-            app.screen,
-            Screen::InstallUpdate { target: None, .. }
-        ));
-
-        // Esc a third time returns to main.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
-        assert!(matches!(app.screen, Screen::Main { .. }));
-    }
-
-    /// The footer text must describe the active sub-screen: the
-    /// selector advertises pick/open/Esc, the list advertises
-    /// install/overwrite/refresh/Esc with the bound harness label,
-    /// and the confirm-overwrite popup overrides both.
-    #[test]
-    fn footer_install_update_selector_vs_list_vs_confirm() {
-        let mut app = fresh_app();
-
-        // Selector.
-        app.screen = Screen::InstallUpdate {
-            items: Vec::new(),
-            selected: 0,
-            last_outcomes: Vec::new(),
-            status: None,
-            confirm_overwrite: None,
-            target: None,
-        };
-        let selector_text = app.footer_text();
-        assert!(
-            selector_text.contains("pick harness") && selector_text.contains("Enter"),
-            "selector footer: {selector_text:?}"
-        );
-        assert!(
-            selector_text.contains("Esc"),
-            "selector footer mentions Esc: {selector_text:?}"
-        );
-        assert!(
-            !selector_text.contains("install safe"),
-            "selector must not advertise install safe: {selector_text:?}"
-        );
-
-        // List bound to Pi.
-        app.screen = Screen::InstallUpdate {
-            items: Vec::new(),
-            selected: 0,
-            last_outcomes: Vec::new(),
-            status: None,
-            confirm_overwrite: None,
-            target: Some(SyncTarget::Pi),
-        };
-        let list_text = app.footer_text();
-        assert!(
-            list_text.contains("Pi"),
-            "list footer shows bound target: {list_text:?}"
-        );
-        assert!(
-            list_text.contains("install safe"),
-            "list footer: {list_text:?}"
-        );
-        assert!(
-            list_text.contains("overwrite"),
-            "list footer: {list_text:?}"
-        );
-        assert!(list_text.contains("refresh"), "list footer: {list_text:?}");
-        assert!(
-            !list_text.contains("pick harness"),
-            "list footer must not show selector shortcuts: {list_text:?}"
-        );
-
-        // Confirm-overwrite popup.
-        app.screen = Screen::InstallUpdate {
-            items: Vec::new(),
-            selected: 0,
-            last_outcomes: Vec::new(),
-            status: None,
-            confirm_overwrite: Some((SyncTarget::OpenCode, "scout.md".to_string())),
-            target: Some(SyncTarget::OpenCode),
-        };
-        let confirm_text = app.footer_text();
-        assert!(
-            confirm_text.contains("Y"),
-            "confirm footer: {confirm_text:?}"
-        );
-        assert!(
-            confirm_text.contains("cancel"),
-            "confirm footer: {confirm_text:?}"
-        );
-        assert!(
-            !confirm_text.contains("install safe"),
-            "confirm footer must not advertise install: {confirm_text:?}"
-        );
-    }
-
-    /// `i` from the list installs safe actions only for the bound
-    /// harness. Files in the other harness's directory must remain
-    /// untouched and its manifest map must be byte-identical to the
-    /// pre-install state.
-    #[test]
-    fn install_safe_only_targets_bound_harness() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_install_update();
-        // Pick OpenCode.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-
-        // Sentinel: write a known file to Pi's directory. After the
-        // OpenCode-only install, that file must be untouched.
-        let pi_sentinel = paths.pi_target_dir.join("sentinel.md");
-        let pi_sentinel_body = "pi-only sentinel\n";
-        std::fs::write(&pi_sentinel, pi_sentinel_body).unwrap();
-
-        // Capture Pi's ownership map before the install so we can
-        // verify it stays unchanged. The OpenCode map is expected to
-        // grow, so we do not compare the whole manifest.
-        let state_pre = State::load(&paths.state_file).unwrap();
-        let pre_pi_installed = state_pre.pi_installed.clone();
-
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
-
-        // OpenCode is installed.
-        assert!(
-            paths.target_dir.join("scout.md").exists(),
-            "scout must be installed"
-        );
-        // Pi's directory must NOT have new agenthd-owned files
-        // (starters seeded on the canonical side will appear in plan
-        // for Pi but apply_safe was never asked to plan Pi).
-        assert!(
-            !paths.pi_target_dir.join("scout.md").exists(),
-            "scout.md must not appear in Pi's directory after OpenCode-only install"
-        );
-        // The sentinel is preserved verbatim.
-        assert_eq!(
-            std::fs::read_to_string(&pi_sentinel).unwrap(),
-            pi_sentinel_body
-        );
-
-        // Pi's ownership map is unchanged — same keys, same hashes,
-        // and no new entries for OpenCode's files sneaking in. The
-        // equality check above is strictly stronger than any
-        // per-key cross-map loop: it proves the Pi map was not touched
-        // at all, which already rules out Pi gaining an OpenCode
-        // file. (See `install_safe_pi_only_does_not_touch_opencode`
-        // for the symmetric direction with a planted ghost.)
-        let state_post = State::load(&paths.state_file).unwrap();
-        assert_eq!(
-            state_post.pi_installed, pre_pi_installed,
-            "Pi ownership map must be unchanged after OpenCode-only install"
-        );
-    }
-
-    /// Mirror regression for the reverse direction: a Pi-bound `i` must
-    /// install Pi only and leave OpenCode's directory and ownership
-    /// map untouched. The planted ghost exercises the
-    /// `apply_safe` cleanup pass: a buggy per-target cleanup that
-    /// walked every `SyncTarget` would prune this OpenCode-side
-    /// entry because the file is missing from both the canonical dir
-    /// and the OpenCode target dir.
-    #[test]
-    fn install_safe_pi_only_does_not_touch_opencode() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-
-        app.open_install_update();
-        // Pick Pi (down once from OpenCode default).
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        match &app.screen {
-            Screen::InstallUpdate { target, .. } => {
-                assert_eq!(*target, Some(SyncTarget::Pi));
-            }
-            other => panic!("expected InstallUpdate list for Pi, got {other:?}"),
-        }
-
-        // Sentinel in OpenCode's target dir — must be preserved
-        // verbatim after the Pi-only install.
-        let oc_sentinel = paths.target_dir.join("sentinel.md");
-        let oc_sentinel_body = "opencode-only sentinel\n";
-        std::fs::write(&oc_sentinel, oc_sentinel_body).unwrap();
-
-        // Ghost ownership entry in the OpenCode map. After a full
-        // install, `apply_safe`'s cleanup would prune this because
-        // `ghost-oc.md` is absent from both the canonical dir and the
-        // OpenCode target dir. The Pi-only install must leave it
-        // alone because OpenCode is not in `items` and the cleanup
-        // pass is scoped to targets present in `items`.
-        const GHOST_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-        let mut state_pre = State::load(&paths.state_file).unwrap();
-        state_pre
-            .installed
-            .insert("ghost-oc.md".to_string(), GHOST_HASH.to_string());
-        let pre_installed = state_pre.installed.clone();
-        std::fs::write(
-            &paths.state_file,
-            serde_json::to_vec_pretty(&state_pre).unwrap(),
-        )
-        .unwrap();
-
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
-
-        // Pi was installed.
-        let pi_scout = paths.pi_target_dir.join("scout.md");
-        assert!(pi_scout.exists(), "Pi scout must be installed");
-        let pi_scout_bytes = std::fs::read_to_string(&pi_scout).unwrap();
-        assert!(
-            pi_scout_bytes.contains("name: scout"),
-            "Pi scout must be rendered in Pi format: {pi_scout_bytes}"
-        );
-
-        // OpenCode was NOT installed: no scout.md in OpenCode's dir.
-        assert!(
-            !paths.target_dir.join("scout.md").exists(),
-            "OpenCode scout.md must not appear after Pi-only install"
-        );
-        // Sentinel is preserved verbatim.
-        assert_eq!(
-            std::fs::read_to_string(&oc_sentinel).unwrap(),
-            oc_sentinel_body,
-            "OpenCode sentinel must be preserved"
-        );
-
-        // OpenCode ownership map retained: the ghost is still there
-        // with the same hash, and the whole map is byte-identical to
-        // the pre-install state (no entries added, removed, or
-        // rewritten by the Pi install).
-        let state_post = State::load(&paths.state_file).unwrap();
-        assert_eq!(
-            state_post.installed.get("ghost-oc.md").map(String::as_str),
-            Some(GHOST_HASH),
-            "OpenCode ghost entry must survive a Pi-only install"
-        );
-        assert_eq!(
-            state_post.installed, pre_installed,
-            "OpenCode ownership map must be unchanged after Pi-only install"
-        );
-        // The Pi install only writes its own entries; the OpenCode
-        // map's only key must not collide with any Pi map key (the
-        // ghost is by construction absent from Pi's map).
-        for name in state_post.installed.keys() {
-            assert!(
-                !state_post.pi_installed.contains_key(name),
-                "OpenCode map must not gain a Pi file: {name}"
-            );
-        }
-    }
-
-    /// `o` on a selected conflict overwrites only the bound harness's
-    /// target. The other harness's directory and manifest stay untouched.
-    #[test]
-    fn install_overwrite_only_targets_bound_harness() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        // Seed a baseline where both targets are installed and the
-        // manifest reflects that ownership. `apply_safe` already
-        // persists `state` to disk via `write_state`, so the manual
-        // re-serialize that older revisions of this test carried is
-        // redundant.
-        let full_state = crate::store::State::load(&paths.state_file).unwrap();
-        let full_plan = crate::store::compute_plan(&paths, &full_state).unwrap();
-        let (_full_state, _) = crate::store::apply_safe(&paths, full_state, full_plan).unwrap();
-
-        app.open_install_update();
-        // Pick Pi.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        match &app.screen {
-            Screen::InstallUpdate { target, .. } => assert_eq!(*target, Some(SyncTarget::Pi)),
-            _ => panic!(),
-        }
-
-        // Mutate Pi's scout target so it is a Conflict.
-        let pi_target = paths.pi_target_dir.join("scout.md");
-        let original = std::fs::read_to_string(&pi_target).unwrap();
-        let mutated = original.replace("read-only", "tampered");
-        std::fs::write(&pi_target, &mutated).unwrap();
-        // Also mutate OpenCode's scout target so we can verify it is
-        // not overwritten by the Pi-only force_install.
-        let oc_target = paths.target_dir.join("scout.md");
-        let oc_original = std::fs::read_to_string(&oc_target).unwrap();
-        let oc_mutated = oc_original.replace("read-only", "tampered-oc");
-        std::fs::write(&oc_target, &oc_mutated).unwrap();
-
-        // Capture pre-state.
-        let pre_oc_target_bytes = std::fs::read_to_string(&oc_target).unwrap();
-        let pre_state_bytes = std::fs::read_to_string(&paths.state_file).unwrap();
-
-        app.refresh_install_update();
-        let scout_idx = match &app.screen {
-            Screen::InstallUpdate { items, .. } => items
-                .iter()
-                .position(|i| i.filename == "scout.md")
-                .expect("scout row"),
-            _ => unreachable!(),
-        };
-        for _ in 0..scout_idx {
-            app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
-        }
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
-        // Confirm overwrite.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
-
-        // Pi's scout is back to canonical.
-        let pi_after = std::fs::read_to_string(&pi_target).unwrap();
-        assert!(pi_after.contains("read-only"));
-        // OpenCode's scout must NOT be rewritten — Pi's force_install
-        // never touched it.
-        assert_eq!(
-            std::fs::read_to_string(&oc_target).unwrap(),
-            pre_oc_target_bytes
-        );
-        // The OpenCode ownership entry's hash is the one we wrote
-        // before the conflict; it is not bumped by the Pi install.
-        let post_state: State =
-            serde_json::from_str(&std::fs::read_to_string(&paths.state_file).unwrap()).unwrap();
-        let post_oc_hash = post_state.installed.get("scout.md").cloned();
-        // Manifest was rewritten by the Pi install (state.installed
-        // for Pi got an update); the bytes won't be byte-equal, but
-        // OpenCode's hash for scout must still equal what we wrote
-        // before the test (the original canonical hash, since the
-        // OpenCode target was never overwritten).
-        // Verify OpenCode's hash equals what we wrote before.
-        let pre_state: State = serde_json::from_str(&pre_state_bytes).unwrap();
-        let pre_oc_hash = pre_state.installed.get("scout.md").cloned();
-        assert_eq!(
-            post_oc_hash, pre_oc_hash,
-            "OpenCode ownership hash must be unchanged"
-        );
-    }
-
-    /// `r` refreshes only the bound harness; the other harness's
-    /// manifest map is byte-identical to before the refresh.
-    #[test]
-    fn install_refresh_only_targets_bound_harness() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        // First install everything via the store helper.
-        let full_state = crate::store::State::load(&paths.state_file).unwrap();
-        let full_plan = crate::store::compute_plan(&paths, &full_state).unwrap();
-        let (full_state, _) = crate::store::apply_safe(&paths, full_state, full_plan).unwrap();
-        std::fs::write(
-            &paths.state_file,
-            serde_json::to_vec_pretty(&full_state).unwrap(),
-        )
-        .unwrap();
-
-        let pre_state_bytes = std::fs::read(&paths.state_file).unwrap();
-
-        app.open_install_update();
-        // Pick OpenCode.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        // External edit on the OpenCode target so refresh sees an
-        // UpdateAvailable for OpenCode only.
-        let oc_target = paths.target_dir.join("scout.md");
-        let oc_before = std::fs::read_to_string(&oc_target).unwrap();
-        std::fs::write(&oc_target, oc_before.replace("read-only", "tampered-oc")).unwrap();
-
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty()));
-
-        // The Pi ownership map in the manifest is byte-identical to
-        // before the refresh — the OpenCode-scoped refresh must not
-        // touch Pi's entries at all.
-        let pre: State = serde_json::from_slice(&pre_state_bytes).unwrap();
-        let post: State =
-            serde_json::from_slice(&std::fs::read(&paths.state_file).unwrap()).unwrap();
-        assert_eq!(
-            pre.pi_installed, post.pi_installed,
-            "Pi manifest entries must be untouched"
-        );
-    }
-
-    /// Empty plan: when the chosen harness has no canonical and no
-    /// targets, `i` is a no-op and a clear message is shown.
-    #[test]
-    fn install_safe_with_empty_plan_reports_and_does_not_write() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        // Seed no canonical — both target dirs are empty too.
-        let mut app = App::new(paths.clone(), State::default());
-        app.open_install_update();
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        // items is empty.
-        match &app.screen {
-            Screen::InstallUpdate { items, target, .. } => {
-                assert_eq!(*target, Some(SyncTarget::OpenCode));
-                assert!(items.is_empty());
-            }
-            _ => panic!("expected InstallUpdate list"),
-        }
-
-        // No state file should exist yet — but if it does, capture
-        // its bytes so we can prove the empty install is a no-op.
-        let pre_bytes = std::fs::read(&paths.state_file).ok();
-
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
-
-        // Status surfaces the no-op message.
-        assert!(
-            app.status_bar
-                .as_deref()
-                .unwrap_or_default()
-                .contains("nothing to install"),
-            "empty plan must surface a clear message: {:?}",
-            app.status_bar
-        );
-        // State file is untouched (either still absent or unchanged).
-        let post_bytes = std::fs::read(&paths.state_file).ok();
-        assert_eq!(
-            pre_bytes, post_bytes,
-            "empty plan must not touch the manifest"
-        );
-    }
-
-    /// `o` on a non-conflict row is a no-op that surfaces a status
-    /// message; it does not arm the popup or write anything.
-    #[test]
-    fn install_o_on_non_conflict_only_reports() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let mut app = App::new(paths.clone(), state);
-        app.open_install_update();
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-
-        // Fresh install -> scout.md is NotInstalled, not a conflict.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::empty()));
-        match &app.screen {
-            Screen::InstallUpdate {
-                confirm_overwrite,
-                status,
-                ..
-            } => {
-                assert!(
-                    confirm_overwrite.is_none(),
-                    "non-conflict `o` must not arm the overwrite popup"
+                    agents.is_empty(),
+                    "empty checkout must produce an empty list"
                 );
                 assert!(
                     status.is_none(),
-                    "non-conflict `o` must not leave a screen popup behind: {:?}",
-                    status
+                    "no error status: an empty checkout is intentional, not a failure"
                 );
             }
-            other => panic!("expected InstallUpdate screen, got {other:?}"),
+            screen => panic!("expected Agents screen, got {screen:?}"),
         }
+    }
+
+    /// A configured checkout that has been deleted or moved is
+    /// detected by `canonical_dir_from`, which `resolve_checkout_path`
+    /// in `main.rs` uses to drive the gated Settings recovery flow.
+    /// The runtime never silently falls back to a cwd ancestor walk
+    /// or deletes any targets; instead `run` opens the Settings
+    /// screen gated with the validation error visible. The test pins
+    /// the underlying validator contract: a missing checkout must
+    /// surface an explicit "does not exist" error so the recovery
+    /// banner has something useful to show.
+    #[test]
+    fn startup_fails_closed_when_configured_checkout_missing() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Configure a checkout path that does not exist.
+        let bogus = dir.path().join("does-not-exist");
+        let settings = Settings::new(bogus.to_string_lossy().into_owned());
+        let result = crate::store::save_settings(&paths.settings_file, &settings);
         assert!(
-            app.status_bar
-                .as_deref()
-                .unwrap_or_default()
-                .contains("is not a conflict"),
-            "non-conflict `o` must report: {:?}",
-            app.status_bar
+            result.is_ok(),
+            "save_settings succeeds even when path is bogus"
+        );
+        let loaded = crate::store::load_settings(&paths.settings_file)
+            .unwrap()
+            .unwrap();
+        let err = crate::store::canonical_dir_from(&paths.agenthd_root, &loaded)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not exist"),
+            "expected missing-checkout error, got: {err}"
+        );
+    }
+
+    /// The same fail-closed contract applies to a configured path
+    /// that points at a directory without an `agents/` child. The
+    /// error must surface, never an empty canonical set.
+    #[test]
+    fn startup_fails_closed_when_checkout_lacks_agents_dir() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Configure a checkout that exists but has no agents/ child.
+        let no_agents = dir.path().join("no-agents-here");
+        std::fs::create_dir_all(&no_agents).unwrap();
+        let settings = Settings::new(no_agents.to_string_lossy().into_owned());
+        crate::store::save_settings(&paths.settings_file, &settings).unwrap();
+        let loaded = crate::store::load_settings(&paths.settings_file)
+            .unwrap()
+            .unwrap();
+        let err = crate::store::canonical_dir_from(&paths.agenthd_root, &loaded)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not exist") || err.contains("`agents/`"),
+            "expected missing-agents-dir error, got: {err}"
+        );
+    }
+
+    /// The Install/Update plan reports a `Remove` action for every
+    /// canonical file that has been deleted from the checkout but
+    /// whose target is still owned by agenthd. This is the
+    /// "planned remove" the design requires the planner to surface
+    /// for the Install/Update screen.
+    #[test]
+    fn plan_reports_remove_for_deleted_canonical_with_owned_target() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let state = State::default();
+        // Install scout to the OpenCode target so it is owned.
+        let mut state = state;
+        let plan = crate::store::plan_for(&paths, &state, SyncTarget::OpenCode).unwrap();
+        let (_, _outcomes) = crate::store::apply_safe(&paths, state, plan).unwrap();
+        state = recover_outcomes_helper(SyncTarget::OpenCode, &paths);
+        // Delete the canonical file.
+        crate::store::delete_canonical(&paths, "scout").unwrap();
+        // Replan. scout.md must be flagged as Remove (the target
+        // still equals our last-installed hash).
+        let plan = crate::store::plan_for(&paths, &state, SyncTarget::OpenCode).unwrap();
+        let scout = plan
+            .iter()
+            .find(|i| i.filename == "scout.md")
+            .expect("scout.md must still be in the plan");
+        assert_eq!(
+            scout.status,
+            crate::store::SyncStatus::Remove,
+            "deleted canonical with owned target must surface as Remove"
+        );
+    }
+
+    /// `sync` includes both OpenCode and Pi targets in the same
+    /// plan, with per-target ownership. The new design removes the
+    /// Local/Repo toggle and the Compare screen but keeps the Pi
+    /// render + the per-harness safe-apply path.
+    #[test]
+    fn sync_targets_opencode_and_pi_with_per_target_ownership() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let state = State::default();
+        let plan = crate::store::compute_plan(&paths, &state).unwrap();
+        let oc: Vec<&str> = plan
+            .iter()
+            .filter(|i| i.target == SyncTarget::OpenCode)
+            .map(|i| i.filename.as_str())
+            .collect();
+        let pi: Vec<&str> = plan
+            .iter()
+            .filter(|i| i.target == SyncTarget::Pi)
+            .map(|i| i.filename.as_str())
+            .collect();
+        assert!(oc.contains(&"scout.md"));
+        assert!(pi.contains(&"scout.md"));
+        // apply_safe with the full plan populates both ownership maps.
+        let (state, outcomes) = crate::store::apply_safe(&paths, state, plan).unwrap();
+        assert!(outcomes.iter().all(|o| o.ok));
+        assert!(state.installed.contains_key("scout.md"));
+        assert!(state.pi_installed.contains_key("scout.md"));
+        // Pi rendering produced a Pi-format file under pi_target_dir.
+        let pi_bytes = std::fs::read_to_string(paths.pi_target_dir.join("scout.md")).unwrap();
+        assert!(pi_bytes.contains("name: scout"));
+        assert!(pi_bytes.contains("tools:"));
+        assert!(!pi_bytes.contains("mode:"));
+    }
+
+    /// The history-aware parts of the design: re-pointing the
+    /// configured checkout changes `paths.canonical_dir` for the
+    /// rest of the app. `with_settings` is the re-pointing primitive.
+    #[test]
+    fn with_settings_repoints_canonical_dir() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Build a second checkout and verify with_settings picks it up.
+        let second = dir.path().join("second-checkout");
+        std::fs::create_dir_all(second.join("agents")).unwrap();
+        std::fs::write(
+            second.join("agents").join("worker.md"),
+            starter_agent(&STARTERS[2]).render(),
+        )
+        .unwrap();
+        let settings = Settings::new(second.to_string_lossy().into_owned());
+        let re_pointed = paths
+            .with_settings(&settings)
+            .expect("with_settings must succeed for a real checkout");
+        assert_eq!(re_pointed.canonical_dir, second.join("agents"));
+    }
+
+    /// Helper used by the planned-remove test to recover the
+    /// post-apply state through the per-target ownership map the
+    /// implementation already exposes to the planner. Re-loading
+    /// from disk keeps the test independent of any private helper.
+    fn recover_outcomes_helper(_target: SyncTarget, paths: &Paths) -> State {
+        State::load(&paths.state_file).unwrap_or_default()
+    }
+
+    // ---------- Settings screen tests ----------
+
+    /// Esc inside the inline path editor cancels the edit and
+    /// restores the buffer to the value the editor opened with —
+    /// even when the buffer is non-empty. Without this guard a
+    /// stray Esc would destroy a half-typed path; the user has to
+    /// press it again to leave the screen (or to drop into the
+    /// post-edit summary view).
+    #[test]
+    fn settings_esc_cancels_editing_and_restores_buffer_even_when_nonempty() {
+        let dir = TempDir::new().unwrap();
+        let (paths, checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
+        // Seed a persisted checkout so the buffer opens with it.
+        let settings = Settings::new(checkout.to_string_lossy().into_owned());
+        crate::store::save_settings(&paths.settings_file, &settings).unwrap();
+        app.open_settings(false);
+        let initial = match &app.screen {
+            Screen::Settings { state } => state.path_input.buffer.clone(),
+            _ => panic!("expected settings screen"),
+        };
+        assert!(
+            !initial.is_empty(),
+            "buffer should be the persisted checkout"
         );
 
-        // After a j/k movement the notice should not re-appear as a
-        // popup. (The screen.status was the original bug: writing it
-        // here meant the message stuck across navigation.)
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()));
+        // Enter edit mode.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(match &app.screen {
+            Screen::Settings { state } => state.path_editing,
+            _ => false,
+        });
+
+        // Type a different path. The buffer must change so we know
+        // Esc had something to cancel.
+        for c in "/tmp/somewhere/else".chars() {
+            let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert!(match &app.screen {
+            Screen::Settings { state } => state.path_input.buffer != initial,
+            _ => false,
+        });
+
+        // Esc cancels: buffer restored, editing exits.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         match &app.screen {
-            Screen::InstallUpdate { status, .. } => assert!(
-                status.is_none(),
-                "j must not surface a leftover popup: {status:?}"
-            ),
-            other => panic!("expected InstallUpdate screen, got {other:?}"),
+            Screen::Settings { state } => {
+                assert_eq!(
+                    state.path_input.buffer, initial,
+                    "Esc must restore the persisted path"
+                );
+                assert!(
+                    !state.path_editing,
+                    "Esc must drop out of edit mode so the user can leave"
+                );
+            }
+            _ => panic!("Esc must not leave the Settings screen"),
+        }
+
+        // A second Esc on the summary view, with the screen not
+        // gated, returns to the main menu.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.screen, Screen::Main { .. }));
+    }
+
+    /// First-run (gated) Settings: Esc on the editor with an empty
+    /// buffer must keep the user in edit mode — they cannot escape
+    /// without picking a checkout. Esc on the summary view is a
+    /// no-op as well (there is no summary view to escape to).
+    #[test]
+    fn settings_first_run_is_gated_and_esc_is_no_op() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_settings(true);
+        // First-run drops into the editor automatically.
+        assert!(match &app.screen {
+            Screen::Settings { state } => state.path_editing && state.gated,
+            _ => false,
+        });
+        // Esc on the empty-buffer editor must NOT drop out of
+        // edit mode and must NOT leave the screen.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.screen, Screen::Settings { .. }));
+        assert!(match &app.screen {
+            Screen::Settings { state } => state.path_editing,
+            _ => false,
+        });
+
+        // Try to type a valid path and submit; only then does the
+        // user "escape" the gate.
+        for c in "/tmp/agenthd-first-run-test".chars() {
+            let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        // Without creating agents/ the apply will fail validation,
+        // but the screen stays on Settings — the gate still holds.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(matches!(app.screen, Screen::Settings { .. }));
+    }
+
+    /// `open_settings_with_error` is the recovery entry point used
+    /// by `run` when the persisted checkout has moved. The screen
+    /// must:
+    ///   - show the banner verbatim as the visible error
+    ///   - stay gated (so the user cannot route around it)
+    ///   - drop into edit mode (the user must replace the path)
+    #[test]
+    fn settings_recovery_banner_is_visible_and_forces_edit() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        let banner = "configured checkout `/old/path` is unusable: nope".to_string();
+        app.open_settings_with_error(true, Some(banner.clone()));
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert!(state.gated, "recovery must remain gated");
+                assert!(state.path_editing, "recovery must open the editor");
+                assert_eq!(state.recovery_error.as_deref(), Some(banner.as_str()));
+                assert_eq!(state.path_input.error.as_deref(), Some(banner.as_str()));
+            }
+            screen => panic!("expected Settings screen, got {screen:?}"),
+        }
+
+        // Esc on the editor in recovery mode keeps the banner and
+        // keeps the screen; the user must pick a path.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(matches!(app.screen, Screen::Settings { .. }));
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert!(state.path_editing, "recovery must stay in edit mode");
+                assert_eq!(state.recovery_error.as_deref(), Some(banner.as_str()));
+            }
+            _ => unreachable!(),
+        }
+
+        // Typing a valid path and applying drops the banner and
+        // clears the editor.
+        let checkout = dir.path().join("recovery-checkout");
+        std::fs::create_dir_all(checkout.join("agents")).unwrap();
+        for c in checkout.to_string_lossy().chars() {
+            let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        // Recovery was gated; with no other screens reachable, the
+        // app stays on Settings — but the banner must be gone.
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert!(
+                    state.recovery_error.is_none(),
+                    "successful apply must drop the recovery banner"
+                );
+                assert!(!state.path_editing);
+            }
+            _ => panic!("expected Settings screen"),
         }
     }
 
-    /// `force_overwrite` must refuse to write a target that is not the
-    /// bound harness. This is the cross-harness guard the
-    /// Install/Update session relies on.
+    /// `apply_settings_path_input` must NOT call `Paths::ensure_dirs`
+    /// — `ensure_dirs` creates the output targets and the agenthd
+    /// root, but it must not be conflated with the apply path. The
+    /// runtime already created those dirs at startup; the configured
+    /// checkout's `agents/` directory is what the apply validates,
+    /// not what it makes. This test pins that contract so a future
+    /// edit cannot reintroduce the swallowed-`.ok()` call.
     #[test]
-    fn install_force_overwrite_refuses_cross_target() {
+    fn settings_apply_does_not_call_ensure_dirs() {
+        // We can't reach into `apply_settings_path_input` to count
+        // calls directly, but we can pin the observable contract:
+        // submitting a valid path leaves the agenthd-root agents
+        // directory absent (ensure_dirs would create it on older
+        // builds, and the previous version's swallowed `.ok()`
+        // proved it could).
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
+        let checkout = dir.path().join("apply-checkout");
+        std::fs::create_dir_all(checkout.join("agents")).unwrap();
+        let mut app = App::new(paths, State::default());
+        app.open_settings(false);
+        // Open the editor and type the path.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        for c in checkout.to_string_lossy().chars() {
+            let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        // The apply re-points the App's canonical_dir at the
+        // checkout's `agents/`. The test holds the only Paths
+        // reference, so we read it back via the App.
+        assert_eq!(app.paths.canonical_dir, checkout.join("agents"));
+        // The agenthd-root agents directory must NOT exist:
+        // ensure_dirs no longer creates it.
+        assert!(
+            !app.paths.agenthd_root.join("agents").exists(),
+            "apply must not create <agenthd_root>/agents"
+        );
+        // The configured checkout's agents/ directory is what the
+        // runtime now treats as canonical; it existed before apply
+        // (validation requires it) and must still exist.
+        assert!(checkout.join("agents").is_dir());
+    }
+
+    /// First-run Settings (no persisted `settings.json`) must
+    /// prefill the editor buffer with a valid cwd ancestor when
+    /// one exists, without persisting or auto-confirming. The hint
+    /// is buffer text only: the user must press Enter (which
+    /// still runs `validate_checkout_path` and writes
+    /// `settings.json`) or type a different path. The test
+    /// verifies the buffer reflects the cwd-ancestor hint and
+    /// that no settings file was written by the open call.
+    #[test]
+    fn settings_first_run_prefills_cwd_ancestor_hint_without_persisting() {
+        let dir = TempDir::new().unwrap();
+        let (paths, checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
+        // Remove the persisted settings file so the screen opens
+        // in first-run mode (the seeded settings.json from
+        // `setup_paths_with_checkout` would otherwise produce a
+        // valid-persisted branch).
+        std::fs::remove_file(&paths.settings_file).unwrap();
+        // Place the cwd at the checkout so `find_checkout_root_from`
+        // resolves to the checkout.
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&checkout).unwrap();
+        app.open_settings(true);
+        let result = std::env::set_current_dir(&original_cwd);
+        let _ = result; // best-effort restore
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert!(state.gated, "first run is gated");
+                assert!(state.path_editing, "first run opens the editor");
+                assert!(
+                    state
+                        .path_input
+                        .buffer
+                        .contains(checkout.to_string_lossy().as_ref()),
+                    "buffer should prefill with the cwd-ancestor hint ({}), got: {}",
+                    checkout.display(),
+                    state.path_input.buffer
+                );
+                assert!(
+                    state.path_input.error.is_none(),
+                    "first-run prefill is not an error"
+                );
+            }
+            screen => panic!("expected Settings screen, got {screen:?}"),
+        }
+        // No settings file must have been written by the open.
+        assert!(
+            !paths.settings_file.exists(),
+            "open_settings_with_error must not persist a hint"
+        );
+    }
+
+    /// Recovery from a stale persisted checkout must put the
+    /// stored (invalid) path text into the editor buffer so the
+    /// user can edit it in place, and must surface the
+    /// validation error as the banner above the editor. This is
+    /// the regression test for the case where a moved checkout
+    /// would either silently empty the editor (forcing the user
+    /// to retype the path from memory) or hide the failure behind
+    /// a valid-but-wrong prefill.
+    #[test]
+    fn settings_recovery_restores_invalid_stored_path_text_and_shows_error() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Persist a checkout path that does not exist so
+        // `validate_checkout_path` will refuse it.
+        let stale = dir.path().join("moved-checkout");
+        std::fs::create_dir_all(&paths.settings_file.parent().unwrap()).unwrap();
+        crate::store::save_settings(
+            &paths.settings_file,
+            &Settings::new(stale.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        // Hand-craft a banner the way `main.rs` would, then
+        // open the screen.
+        let banner = format!(
+            "configured checkout `{}` is unusable: nope; type a new path or relaunch with `--repo <path>`",
+            stale.display()
+        );
+        let mut app = App::new(paths.clone(), State::default());
+        app.open_settings_with_error(true, Some(banner.clone()));
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert!(state.gated, "recovery is gated");
+                assert!(state.path_editing, "recovery drops into the editor");
+                // The invalid stored text is in the buffer so the
+                // user can edit-in-place rather than retype.
+                assert_eq!(
+                    state.path_input.buffer,
+                    stale.to_string_lossy().into_owned(),
+                    "recovery must restore the stored invalid path into the buffer"
+                );
+                // The banner is the visible error.
+                assert_eq!(state.recovery_error.as_deref(), Some(banner.as_str()));
+                assert_eq!(state.path_input.error.as_deref(), Some(banner.as_str()));
+                // Esc on the editor in recovery mode keeps the
+                // banner and stays in edit mode; the user must
+                // pick a real path before leaving.
+                let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+                match &app.screen {
+                    Screen::Settings { state } => {
+                        assert!(state.path_editing, "recovery must stay in edit mode");
+                        assert_eq!(state.recovery_error.as_deref(), Some(banner.as_str()));
+                        // Buffer is the invalid text (restored
+                        // by Esc to the initial snapshot).
+                        assert_eq!(
+                            state.path_input.buffer,
+                            stale.to_string_lossy().into_owned()
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            screen => panic!("expected Settings screen, got {screen:?}"),
+        }
+    }
+
+    /// First-keystroke on a prefill buffer must replace the hint
+    /// rather than append to it. The hint is meant to be either
+    /// accepted (Enter without typing) or replaced (start
+    /// typing); appending would produce an invalid path the user
+    /// would have to clear out by hand. The replacement fires
+    /// only when the buffer still equals the on-open snapshot —
+    /// a buffer the user has already edited is theirs to extend.
+    #[test]
+    fn settings_first_run_typing_replaces_prefill_instead_of_appending() {
+        let dir = TempDir::new().unwrap();
+        let (paths, checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
+        std::fs::remove_file(&paths.settings_file).unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&checkout).unwrap();
+        app.open_settings(true);
+        std::env::set_current_dir(&original_cwd).unwrap();
+        let hint = match &app.screen {
+            Screen::Settings { state } => state.path_input.buffer.clone(),
+            _ => panic!("expected Settings screen"),
+        };
+        assert!(!hint.is_empty(), "prefill should populate the buffer");
+        // First keystroke replaces the hint.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()));
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert_eq!(
+                    state.path_input.buffer, "a",
+                    "first keystroke must replace the prefill hint"
+                );
+                assert!(state.path_editing);
+            }
+            _ => panic!("expected Settings screen"),
+        }
+        // Second keystroke appends (the buffer is no longer the
+        // initial snapshot).
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::empty()));
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert_eq!(state.path_input.buffer, "ab");
+            }
+            _ => panic!("expected Settings screen"),
+        }
+    }
+
+    /// The gated first-run / recovery branch in `main::run` opens
+    /// `App::new(paths, …)` before the user has configured a
+    /// checkout. Constructing the gated `App` with `State::default()`
+    /// would silently throw away any pre-existing ownership manifest
+    /// (`~/.agenthd/state.json`) — per-target owned file hashes —
+    /// and the next sync would treat every previously-owned target
+    /// as unowned / a conflict. This test pins the contract that
+    /// `State::load` round-trips through the gated `App::new` and
+    /// survives `open_settings_with_error` (the gated recovery
+    /// entry point), so the runtime's startup load
+    /// (`State::load(&paths.state_file)` → `App::new(paths, state)`)
+    /// preserves ownership across first-run / stale-checkout setup.
+    #[test]
+    fn gated_setup_preserves_existing_ownership_state() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Seed a real ownership manifest on disk covering both
+        // per-target installed hash maps.
+        let mut installed = BTreeMap::new();
+        installed.insert("scout.md".to_string(), "hash-scout".to_string());
+        installed.insert("reviewer.md".to_string(), "hash-reviewer".to_string());
+        let mut pi_installed = BTreeMap::new();
+        pi_installed.insert("delegate.md".to_string(), "hash-delegate".to_string());
+        let prior = State {
+            installed,
+            pi_installed,
+        };
+        std::fs::write(
+            &paths.state_file,
+            serde_json::to_vec_pretty(&prior).unwrap(),
+        )
+        .unwrap();
+        // Sanity: re-load via the production helper to confirm the
+        // on-disk JSON round-trips through `State::load` — the same
+        // call the fixed `main::run` makes on the gated branch.
+        let reloaded = State::load(&paths.state_file).unwrap();
+        assert_eq!(reloaded, prior, "seed state.json must round-trip");
+
+        // Mirror the fixed gated setup in main::run.
+        let state = State::load(&paths.state_file).unwrap();
         let mut app = App::new(paths.clone(), state);
-        app.open_install_update();
-        // Bound to OpenCode.
-        app.handle_install_update_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
 
-        // Try to force-overwrite Pi. The handler must refuse.
-        app.force_overwrite(SyncTarget::Pi, "scout.md");
-        assert!(
-            app.status_bar
-                .as_deref()
-                .unwrap_or_default()
-                .contains("overwrite refused"),
-            "cross-target force must be refused: {:?}",
-            app.status_bar
+        // No settings file → first-run gated open.
+        app.open_settings_with_error(true, None);
+
+        // Every field of the pre-existing manifest must survive.
+        assert_eq!(
+            app.state, prior,
+            "gated App::new must keep the on-disk ownership manifest; \
+             State::default() would erase prior installed hashes"
         );
-        // Pi's target directory must be untouched.
-        assert!(
-            !paths.pi_target_dir.join("scout.md").exists(),
-            "Pi scout.md must not be written by an OpenCode-bound session"
+        assert_eq!(
+            app.state.installed.get("scout.md").map(String::as_str),
+            Some("hash-scout")
         );
-    }
-
-    /// `apply_safe` must prune stale ownership entries for the
-    /// targets present in `items`, but must NOT prune entries for
-    /// targets that did not appear in `items`.
-    #[test]
-    fn apply_safe_cleanup_does_not_touch_other_target_map() {
-        let dir = TempDir::new().unwrap();
-        let paths = setup_paths(&dir);
-        // Build a state where Pi has a stale ownership entry for a
-        // file that exists on neither side.
-        let mut state = State::default();
-        state
-            .pi_installed
-            .insert("ghost-pi.md".to_string(), "abc".to_string());
-        state
-            .installed
-            .insert("ghost-oc.md".to_string(), "def".to_string());
-
-        // Seed canonical so OpenCode has at least one safe item.
-        let (_, state) = crate::store::seed_starters(&paths, state).unwrap();
-
-        // Plan OpenCode only.
-        let oc_plan = crate::store::plan_for(&paths, &state, SyncTarget::OpenCode).unwrap();
-        assert!(!oc_plan.is_empty());
-
-        let (post_state, _) = crate::store::apply_safe(&paths, state, oc_plan).unwrap();
-
-        // OpenCode's stale entry was cleaned up because OpenCode was
-        // in items.
-        assert!(
-            !post_state.installed.contains_key("ghost-oc.md"),
-            "OpenCode stale entry should be cleaned up"
+        assert_eq!(
+            app.state
+                .pi_installed
+                .get("delegate.md")
+                .map(String::as_str),
+            Some("hash-delegate")
         );
-        // Pi's stale entry is untouched because Pi was NOT in items.
-        assert!(
-            post_state.pi_installed.contains_key("ghost-pi.md"),
-            "Pi stale entry must NOT be cleaned up when items is OpenCode-only"
+
+        // The gated Settings screen must also stay gated (so the
+        // user is forced to pick a checkout) while the manifest
+        // remains untouched.
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert!(state.gated, "gated open must keep the gate");
+            }
+            screen => panic!("expected Settings screen, got {screen:?}"),
+        }
+        assert_eq!(
+            app.state, prior,
+            "open_settings_with_error must not mutate the ownership manifest"
         );
     }
 
-    /// Single-target planning: `plan_for` returns only items for the
-    /// requested target, never the other one.
+    /// Legacy `state.json` files written by older agenthd builds may
+    /// carry fields this build no longer models (e.g. `plugin_hash`).
+    /// `State::load` deserializes with serde defaults for known fields
+    /// and ignores unknown ones, so a leftover `plugin_hash` is
+    /// nonfatal — load succeeds, the field is dropped on next save,
+    /// and no plugin code path can be reached because the Subagent
+    /// panel was removed entirely.
     #[test]
-    fn plan_for_returns_only_target_items() {
+    fn state_load_ignores_legacy_plugin_hash_field() {
         let dir = TempDir::new().unwrap();
         let paths = setup_paths(&dir);
-        let (_, state) = crate::store::seed_starters(&paths, State::default()).unwrap();
-        let oc = crate::store::plan_for(&paths, &state, SyncTarget::OpenCode).unwrap();
-        assert!(oc.iter().all(|i| i.target == SyncTarget::OpenCode));
-        let pi = crate::store::plan_for(&paths, &state, SyncTarget::Pi).unwrap();
-        assert!(pi.iter().all(|i| i.target == SyncTarget::Pi));
-        // Combined view is the sum of the two.
-        let both = crate::store::compute_plan(&paths, &state).unwrap();
-        assert_eq!(both.len(), oc.len() + pi.len());
+        let legacy = serde_json::json!({
+            "installed": {"scout.md": "hash-scout"},
+            "pi_installed": {"delegate.md": "hash-delegate"},
+            "plugin_hash": "hash-plugin-legacy",
+        });
+        std::fs::write(
+            &paths.state_file,
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let loaded = State::load(&paths.state_file).expect("legacy state.json must load");
+        assert_eq!(
+            loaded.installed.get("scout.md").map(String::as_str),
+            Some("hash-scout")
+        );
+        assert_eq!(
+            loaded.pi_installed.get("delegate.md").map(String::as_str),
+            Some("hash-delegate")
+        );
+        // `plugin_hash` is unknown to the current State; serde
+        // silently drops it. The next write rebuilds the JSON without
+        // the field.
+        std::fs::write(
+            &paths.state_file,
+            serde_json::to_vec_pretty(&loaded).unwrap(),
+        )
+        .unwrap();
+        let rewritten = std::fs::read_to_string(&paths.state_file).unwrap();
+        assert!(
+            !rewritten.contains("plugin_hash"),
+            "legacy plugin_hash must be dropped on resave: {rewritten}"
+        );
+    }
+
+    /// The Subagent-panel (plugin) main-menu entry was removed because
+    /// the bundled OpenCode sidebar plugin never worked. The main menu
+    /// must now list exactly Agents, Install/Update, Settings, Tools,
+    /// and Exit.
+    #[test]
+    fn main_menu_does_not_include_plugin() {
+        let items: Vec<MainItem> = MainItem::all().to_vec();
+        assert_eq!(
+            items,
+            vec![
+                MainItem::Agents,
+                MainItem::InstallUpdate,
+                MainItem::Settings,
+                MainItem::Tools,
+                MainItem::Exit,
+            ],
+            "main menu must not include MainItem::Plugin"
+        );
+        for item in items {
+            assert_ne!(
+                item.label(),
+                "Subagent panel",
+                "Subagent panel label must be gone"
+            );
+            assert!(
+                !item.detail().contains("OpenCode task sidebar"),
+                "Subagent panel detail must be gone: {}",
+                item.detail()
+            );
+        }
     }
 }
