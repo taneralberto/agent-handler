@@ -115,9 +115,12 @@ entra como segundo cliente.
    invariants` comprobados estáticamente contra el código, no fila
    por fila. Revisión estática en Windows; conteos históricos de
    tests Linux (256 + 178; 1 ignored) no re-ejecutados.
-2. Evaluar si el boot de `main.rs` (TerminalGuard, panic hook,
-   ciclo TUI, argv) debe aislarse del guard TUI-coupling; solo si
-   reduce dependencia real.
+2. **(Evaluada — sin extracción.)** `launcher.rs` ya aísla el parseo de argv
+   y la resolución del checkout respecto a la TUI; `main.rs` lee `env::args`
+   como entrada genérica, y mantiene `TerminalGuard`, panic hook y ciclo
+   de `ratatui` como TUI-específicos. Moverlos no reduce dependencias
+   reales de cara a la GUI. Bloques de terminal duplicados: limpieza TUI
+   aparte, no prerrequisito de GUI; reevaluar tras D1/D2.
 3. No introducir `g` / `i` ni `--repo` GUI hasta cerrar D2.
 
 ## Validación y plataforma
