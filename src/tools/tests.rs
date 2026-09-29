@@ -491,8 +491,9 @@ fn npm_program_resolves_to_platform_specific_launcher() {
     //
     // Note: the previous iteration of this fix resolved to
     // `npm.cmd` on Windows. That approach is rejected because
-    // `Command::new("npm.cmd")` internally invokes cmd.exe — see
-    // TOOL_INSTALLER_PLAN.md:219 for the strict no-shell rule.
+    // `Command::new("npm.cmd")` internally invokes cmd.exe, which
+    // violates the project's strict no-shell contract (no shell of
+    // any kind at the spawn boundary).
     #[cfg(target_os = "windows")]
     assert_eq!(npm_program(), "node");
     #[cfg(not(target_os = "windows"))]

@@ -357,8 +357,9 @@ pub fn install_tool_at(
 fn npm_program() -> &'static str {
     // npm is launched via `node <abs-path-to-npm-cli.js> ...`. The npm
     // shim `npm.cmd` is deliberately NOT used because Windows would
-    // invoke `cmd.exe /c` to interpret it, violating the strict
-    // no-shell contract documented at TOOL_INSTALLER_PLAN.md:219.
+    // invoke `cmd.exe /c` to interpret it, violating the project's
+    // strict no-shell contract (no `cmd.exe /c`, no PowerShell, no
+    // shell of any kind at the spawn boundary).
     "node"
 }
 
@@ -371,8 +372,9 @@ fn npm_program() -> &'static str {
 ///
 /// On Windows, the installer avoids the `npm.cmd` shim entirely (Windows
 /// would invoke `cmd.exe /c` to interpret it, which violates the
-/// project's strict no-shell contract — see `TOOL_INSTALLER_PLAN.md`
-/// § Install path). Instead, this function spawns `node` with the
+/// project's strict no-shell contract — no `cmd.exe /c`, no
+/// PowerShell, no shell of any kind at the spawn boundary). Instead,
+/// this function spawns `node` with the
 /// absolute path to `npm-cli.js` as `argv[0]`. The path is resolved by
 /// walking PATH for `npm.cmd` entries and using each launcher's parent
 /// directory to derive `<parent>/node_modules/npm/bin/npm-cli.js` — see

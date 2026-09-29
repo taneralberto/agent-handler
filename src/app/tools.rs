@@ -159,12 +159,11 @@ impl App {
                     KeyCode::Down | KeyCode::Char('j') => Op::Move(1),
                     KeyCode::Char('r') => Op::Refresh,
                     KeyCode::Char('i') => {
-                        // `i` always dispatches into the installer, per
-                        // TOOL_INSTALLER_PLAN.md: the row's pre-install
-                        // status is informational only. Any existing
-                        // target dir/file/symlink (including a row that
-                        // reads `Installed`) is a Conflict the OS
-                        // no-replace primitive must refuse, surfaced
+                        // `i` always dispatches into the installer. The
+                        // row's pre-install status is informational only.
+                        // Any existing target dir/file/symlink (including
+                        // a row that reads `Installed`) is a Conflict the
+                        // OS no-replace primitive must refuse, surfaced
                         // as the status message. We therefore do not
                         // branch on `ToolStatus::Installed` here —
                         // `install_selected_tool` is the single source
