@@ -122,6 +122,12 @@ entra como segundo cliente.
    reales de cara a la GUI. Bloques de terminal duplicados: limpieza TUI
    aparte, no prerrequisito de GUI; reevaluar tras D1/D2.
 3. No introducir `g` / `i` ni `--repo` GUI hasta cerrar D2.
+4. **Acción siguiente (Fase 2).** Evaluar los flows pendientes listados en
+   la Fase 2 (`install_update`, `skills_list`, `editor`, `tools`, dispatch en
+   `app/mod.rs`) y extraer **uno** de ellos preservando comportamiento,
+   con tests focales (reusar el patrón de
+   `read_checkout` / `apply_checkout` / `list_canonical_agents`).
+   Sin cambios de contrato CLI/GUI.
 
 ## Validación y plataforma
 
@@ -139,14 +145,18 @@ entra como segundo cliente.
 
 ## Handoff (importante)
 
-Este documento y `REUSABLE_API_COVERAGE.md` están commiteados en
-`origin/main`. El siguiente agente en otra PC:
-
-1. Sincronizar: `git pull origin main`.
-2. Verificar estado: `git status` debe estar limpio salvo por
-   cambios intencionales propios; `git rev-parse HEAD` debe
-   coincidir con `origin/main`.
-3. Proceder usando este documento y `REUSABLE_API_COVERAGE.md`
-   como referencia canónica. No restaurar ni re-crear
-   `PLAN.md` ni `TOOL_INSTALLER_PLAN.md` — su retirada es
-   deliberada.
+> El siguiente agente, en otra PC, debe ejecutar `git fetch` y
+> `git pull origin main` **después** de que el usuario haya
+> publicado el push. Tras la actualización local:
+>
+> - `git status` debe estar limpio.
+> - `git log` debe incluir la auditoría de fase 1 (`4327db2`),
+>   la evaluación de boot (`2a63b15`) y la última actualización
+>   de este roadmap.
+> - En un handoff remoto normal, `HEAD` debe coincidir con
+>   `origin/main`.
+>
+> Si el push falla, **no** afirmar que la documentación está
+> publicada; notificar el fallo y esperar a que el usuario lo
+> resuelva. No restaurar `PLAN.md` ni `TOOL_INSTALLER_PLAN.md` —
+> su retirada es deliberada.
