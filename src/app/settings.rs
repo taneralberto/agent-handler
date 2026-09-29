@@ -28,15 +28,13 @@
 //!   - `Enter` validates + applies (and writes `settings.json`)
 //!   - `Esc` cancels the edit
 
-use super::{panel, selected_style, App, Screen};
-use crate::store::{
-    canonical_dir_from, find_checkout_root_from, load_settings, save_settings,
-    validate_checkout_path, Settings,
-};
+use super::{panel, selected_style, App, Screen, DANGER};
+use crate::store::find_checkout_root_from;
+use crate::workflows::{self, CheckoutStatus};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Modifier, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -149,52 +147,59 @@ impl App {
     /// visibly inside the screen rather than as a hard startup
     /// error, and `--repo` is still available to repair it.
     pub fn open_settings_with_error(&mut self, gated: bool, error: Option<String>) {
-        // Pull the persisted path through the store loader so the
-        // editor reflects the on-disk truth; an in-memory cached
-        // value would be wrong if the user re-launched with --repo.
-        // The raw (un-validated) value is what the recovery banner
-        // is about, so we keep it in the buffer (so the user can see
-        // the now-invalid path they had configured) and surface the
-        // error above the editor. On the first-run branch (no
-        // persisted settings), we still want a helpful starting
-        // point: if the user launched agenthd from inside a tree
-        // whose cwd ancestor carries an `agents/` directory, suggest
-        // that path as the initial buffer text. The suggestion is
+        // Pull the persisted path through the shared workflow so
+        // the editor reflects the on-disk truth; an in-memory
+        // cached value would be wrong if the user re-launched
+        // with --repo. The raw (un-validated) value is what the
+        // recovery banner is about, so we keep it in the buffer
+        // (so the user can see the now-invalid path they had
+        // configured) and surface the error above the editor.
+        //
+        // Both a missing settings file and a load error fall
+        // through to the cwd-ancestor hint: the workflow surfaces
+        // `Empty` for the former and `Err` for the latter, and the
+        // TUI treats both as first-run (matching the historical
+        // "fallback on load error" behavior). On the first-run
+        // branch we still want a helpful starting point: if the
+        // user launched agenthd from inside a tree whose cwd
+        // ancestor carries an `agents/` directory, suggest that
+        // path as the initial buffer text. The suggestion is
         // local to the editor — it is NOT persisted to
-        // `settings.json`, and it does NOT auto-confirm: the user
-        // must still press Enter (or type a different path) before
-        // the runtime writes anything.
-        let (initial, initial_raw_invalid) = match load_settings(&self.paths.settings_file) {
-            Ok(Some(s)) => {
-                let p = PathBuf::from(&s.checkout_path);
-                if validate_checkout_path(&p).is_ok() {
-                    (Some(p), None)
-                } else {
-                    // Stored path is invalid (e.g. the checkout was
-                    // moved). Put the raw invalid text into the
-                    // editor buffer so the user can edit it in
-                    // place; the supplied banner above the editor
-                    // carries the underlying validation error.
-                    (None, Some(p))
+        // `settings.json`, and it does NOT auto-confirm: the
+        // user must still press Enter (or type a different path)
+        // before the runtime writes anything.
+        let (initial, initial_raw_invalid) =
+            match workflows::read_checkout(&self.paths.settings_file) {
+                Ok(CheckoutStatus::Ready(p)) => (Some(p), None),
+                Ok(CheckoutStatus::Stale { raw, .. }) => {
+                    // Stored path is invalid (e.g. the checkout
+                    // was moved). Put the raw invalid text into
+                    // the editor buffer so the user can edit it
+                    // in place; the supplied banner above the
+                    // editor carries the underlying validation
+                    // error.
+                    (None, Some(raw))
                 }
-            }
-            _ => {
-                // No persisted settings yet — first run. Try to
-                // prefill from a cwd ancestor with an `agents/`
-                // child. The walk is cheap and side-effect free;
-                // `find_checkout_root_from` is intentionally
-                // permissive (it does not insist on absolute path
-                // or non-symlink); the editor's submit step still
-                // runs `validate_checkout_path` before persisting,
-                // so a non-absolute or symlinked suggestion is
-                // refused at apply time. We never persist the
-                // suggestion automatically.
-                let hint = std::env::current_dir().ok().and_then(|cwd| {
-                    find_checkout_root_from(&cwd).map(|root| root.to_string_lossy().into_owned())
-                });
-                (hint.map(PathBuf::from), None)
-            }
-        };
+                Ok(CheckoutStatus::Empty) | Err(_) => {
+                    // No persisted settings yet (or the file is
+                    // unreadable / malformed) — first run. Try
+                    // to prefill from a cwd ancestor with an
+                    // `agents/` child. The walk is cheap and
+                    // side-effect free; `find_checkout_root_from`
+                    // is intentionally permissive (it does not
+                    // insist on absolute path or non-symlink);
+                    // the editor's submit step still runs
+                    // `validate_checkout_path` before persisting,
+                    // so a non-absolute or symlinked suggestion
+                    // is refused at apply time. We never persist
+                    // the suggestion automatically.
+                    let hint = std::env::current_dir().ok().and_then(|cwd| {
+                        find_checkout_root_from(&cwd)
+                            .map(|root| root.to_string_lossy().into_owned())
+                    });
+                    (hint.map(PathBuf::from), None)
+                }
+            };
         let state = SettingsState::new(gated, initial, initial_raw_invalid, error);
         self.screen = Screen::Settings { state };
     }
@@ -387,75 +392,43 @@ impl App {
     }
 
     fn apply_settings_path_input(&mut self) -> Result<()> {
+        // Snapshot the buffer; the workflow may set
+        // `state.path_input.error` on the way out, which would
+        // invalidate the immutable borrow we hold here.
         let buffer = match &self.screen {
-            Screen::Settings { state } => state.path_input.buffer.trim().to_string(),
+            Screen::Settings { state } => state.path_input.buffer.clone(),
             _ => return Ok(()),
         };
-        if buffer.is_empty() {
-            if let Screen::Settings { state } = &mut self.screen {
-                state.path_input.error =
-                    Some("checkout path is empty; type the absolute path".to_string());
-            }
-            return Ok(());
-        }
-        let path = PathBuf::from(&buffer);
-        if !path.is_absolute() {
-            if let Screen::Settings { state } = &mut self.screen {
-                state.path_input.error =
-                    Some(format!("`{}` is not an absolute path", path.display()));
-            }
-            return Ok(());
-        }
-        if let Err(e) = validate_checkout_path(&path) {
-            if let Screen::Settings { state } = &mut self.screen {
-                state.path_input.error = Some(e.to_string());
-            }
-            return Ok(());
-        }
-        // Persist the validated path through the store loader so the
-        // failure modes (write, mkdir, etc.) land in the status bar
-        // rather than the screen-local error.
-        let settings = Settings::new(path.to_string_lossy().into_owned());
-        if let Err(e) = save_settings(&self.paths.settings_file, &settings) {
-            if let Screen::Settings { state } = &mut self.screen {
-                state.path_input.error = Some(format!("write settings: {e}"));
-            }
-            return Ok(());
-        }
-        // Re-point the runtime's canonical_dir at the new checkout.
-        // Failures here are surfaced through the screen-local error
-        // so the user sees them rather than seeing a stale
-        // canonical. `Paths::ensure_dirs` is intentionally NOT
-        // called here: it creates the output target trees but it
-        // does NOT create `canonical_dir` (the configured checkout
-        // is the source of truth for `agents/`, and it already
-        // existed — validation required it). Calling ensure_dirs
-        // here would also risk silently masking a real I/O error
-        // by `.ok()`-swallowing it.
-        let new_canonical = match canonical_dir_from(&self.paths.agenthd_root, &settings) {
-            Ok(p) => p,
-            Err(e) => {
+        // Hand the input to the shared workflow. The ordering
+        // (trim → empty → absolute → validate → save → revalidate
+        // → mutate) and the exact error texts / prefixes live in
+        // `crate::workflows` so a future GUI client gets the same
+        // visible contract for free.
+        match workflows::apply_checkout(&mut self.paths, &buffer) {
+            Ok(path) => {
                 if let Screen::Settings { state } = &mut self.screen {
-                    state.path_input.error = Some(format!("re-validate: {e}"));
+                    // A successful apply means the recovery
+                    // banner has been satisfied: drop it so the
+                    // screen returns to its normal non-error
+                    // look. The new "initial" is the just-saved
+                    // path; a future Esc on this Settings entry
+                    // restores to it rather than to the stale one.
+                    let path_str = path.to_string_lossy().into_owned();
+                    state.path_input.initial = path_str.clone();
+                    state.path_input.buffer = path_str;
+                    state.path_editing = false;
+                    state.path_input.error = None;
+                    state.recovery_error = None;
+                    state.status = Some(format!("saved checkout path: {}", path.display()));
                 }
-                return Ok(());
+                self.status_bar = Some(format!("saved checkout path: {}", path.display()));
             }
-        };
-        self.paths.canonical_dir = new_canonical;
-        if let Screen::Settings { state } = &mut self.screen {
-            // A successful apply means the recovery banner has
-            // been satisfied: drop it so the screen returns to
-            // its normal non-error look. The new "initial" is the
-            // just-saved path; a future Esc on this Settings
-            // entry restores to it rather than to the stale one.
-            state.path_input.initial = path.to_string_lossy().into_owned();
-            state.path_input.buffer = state.path_input.initial.clone();
-            state.path_editing = false;
-            state.path_input.error = None;
-            state.recovery_error = None;
-            state.status = Some(format!("saved checkout path: {}", path.display()));
+            Err(err) => {
+                if let Screen::Settings { state } = &mut self.screen {
+                    state.path_input.error = Some(err.message());
+                }
+            }
         }
-        self.status_bar = Some(format!("saved checkout path: {}", path.display()));
         Ok(())
     }
 }
@@ -466,7 +439,5 @@ impl App {
 /// semantics). Keeping the helper here keeps the rendering site
 /// self-contained.
 fn error_style() -> Style {
-    Style::default()
-        .fg(Color::Rgb(251, 113, 133))
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
 }

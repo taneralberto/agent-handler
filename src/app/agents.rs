@@ -15,7 +15,8 @@
 
 use super::{panel, render_popup, selected_style, truncate, App, PendingDelete, Screen};
 use crate::agent::Mode;
-use crate::store::{delete_canonical, load_canonical, Paths};
+use crate::store::{delete_canonical, Paths};
+use crate::workflows;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
@@ -81,18 +82,17 @@ impl App {
     }
 
     pub(super) fn open_agents(&mut self) {
-        match load_canonical(&self.paths) {
-            Ok(map) => {
-                let mut agents: Vec<AgentSummary> = map
-                    .into_values()
-                    .map(|(a, _)| AgentSummary {
+        match workflows::list_canonical_agents(&self.paths) {
+            Ok(agents) => {
+                let agents: Vec<AgentSummary> = agents
+                    .into_iter()
+                    .map(|a| AgentSummary {
                         name: a.name,
                         description: a.description,
                         mode: a.mode,
                         model: a.model,
                     })
                     .collect();
-                agents.sort_by(|a, b| a.name.cmp(&b.name));
                 self.pending_delete = PendingDelete::default();
                 self.status_bar = None;
                 self.screen = Screen::Agents {

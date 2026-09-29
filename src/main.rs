@@ -1,8 +1,10 @@
 mod agent;
 mod app;
+mod launcher;
 mod models;
 mod store;
 mod tools;
+mod workflows;
 
 use anyhow::{Context, Result};
 use crossterm::execute;
@@ -12,10 +14,10 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::panic;
-use std::path::PathBuf;
 
 use crate::app::App;
-use crate::store::{load_settings, save_settings, validate_checkout_path, Paths, Settings, State};
+use crate::launcher::{resolve_checkout_path, ResolveOutcome};
+use crate::store::{Paths, Settings, State};
 
 struct TerminalGuard {
     armed: bool,
@@ -40,108 +42,6 @@ impl Drop for TerminalGuard {
             let _ = execute!(out, crossterm::cursor::Show);
         }
     }
-}
-
-/// Decide which checkout path the binary should run with this
-/// invocation. Order of precedence:
-///
-/// 1. `agenthd --repo <absolute path>`. The override is validated up
-///    front so the user is told *now* if the configured checkout is
-///    unusable rather than getting a half-started TUI. The override
-///    is persisted to `settings.json` so subsequent launches agree
-///    with the user.
-/// 2. The persisted `settings.json`. Loaded fresh on every launch so
-///    the user can re-point the binary through the Settings screen
-///    or by editing the file directly.
-/// 3. None — first-run interactive flow.
-///
-/// When the persisted `settings.json` points at a checkout that has
-/// moved or otherwise fails validation, the runtime does NOT silently
-/// fall back to a cwd ancestor walk (no silent inference), nor does
-/// it delete any targets. Instead it reports `StaleCheckout` so `run`
-/// can open the Settings screen gated with the validation error
-/// visible; `--repo` may repair the configuration before the TUI
-/// starts, otherwise the user picks a new path inside the TUI.
-fn resolve_checkout_path(paths: &Paths, args: &[String]) -> Result<ResolveOutcome> {
-    if let Some(path) = parse_repo_override(args)? {
-        validate_checkout_path(&path)
-            .with_context(|| format!("--repo path `{}` is unusable", path.display()))?;
-        let settings = Settings::new(path.to_string_lossy().into_owned());
-        let existing = load_settings(&paths.settings_file).context("read settings")?;
-        if existing.as_ref() != Some(&settings) {
-            save_settings(&paths.settings_file, &settings).context("write settings")?;
-        }
-        return Ok(ResolveOutcome::Ready {
-            path,
-            override_applied: true,
-        });
-    }
-    if let Some(settings) = load_settings(&paths.settings_file).context("read settings")? {
-        let path = PathBuf::from(&settings.checkout_path);
-        match validate_checkout_path(&path) {
-            Ok(()) => {
-                return Ok(ResolveOutcome::Ready {
-                    path,
-                    override_applied: false,
-                })
-            }
-            Err(err) => {
-                // The configured checkout is unusable. Surface the
-                // failure in a gated Settings screen rather than
-                // aborting the process or silently inferring a path
-                // from the current working directory. The user sees
-                // the validation error and can either type a new
-                // path in the TUI or relaunch with `--repo` to
-                // repair it.
-                let banner = format!(
-                    "configured checkout `{}` is unusable: {err}; \
-                     type a new path or relaunch with `--repo <path>`",
-                    path.display()
-                );
-                return Ok(ResolveOutcome::StaleCheckout { banner });
-            }
-        }
-    }
-    Ok(ResolveOutcome::FirstRun)
-}
-
-/// Outcome of `resolve_checkout_path`: the runtime may either know
-/// the configured checkout (`Ready`), discover that the persisted
-/// settings point at a checkout that is no longer valid
-/// (`StaleCheckout`), or be running for the first time with no
-/// settings at all (`FirstRun`).
-enum ResolveOutcome {
-    Ready {
-        path: PathBuf,
-        override_applied: bool,
-    },
-    StaleCheckout {
-        banner: String,
-    },
-    FirstRun,
-}
-
-/// Parse the optional `agenthd --repo <absolute path>` flag.
-/// Positional args are ignored.
-fn parse_repo_override(args: &[String]) -> Result<Option<PathBuf>> {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--repo" {
-            let value = args
-                .get(i + 1)
-                .ok_or_else(|| anyhow::anyhow!("--repo requires an absolute path argument"))?;
-            let candidate = PathBuf::from(value);
-            if !candidate.is_absolute() {
-                anyhow::bail!(
-                    "--repo path `{}` must be an absolute path",
-                    candidate.display()
-                );
-            }
-            return Ok(Some(candidate));
-        }
-        i += 1;
-    }
-    Ok(None)
 }
 
 fn run() -> Result<()> {

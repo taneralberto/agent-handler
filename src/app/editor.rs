@@ -23,7 +23,7 @@
 
 use super::{
     border_style_for, centered_rect, panel, render_popup, selected_style, App, PendingDelete,
-    Screen, ACCENT, MUTED,
+    Screen, ACCENT, MUTED, SURFACE,
 };
 use crate::agent::{Agent, Mode, PermissionAction, PERMISSION_KEYS};
 use crate::models::{self, Discovery};
@@ -31,7 +31,7 @@ use crate::store::{hash_file, rename_canonical, save_canonical, Paths};
 use anyhow::{anyhow, bail, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -265,7 +265,7 @@ impl App {
         let line = Line::from(Span::styled(
             format!(" {} ", mode.label()),
             Style::default()
-                .fg(Color::Black)
+                .fg(SURFACE)
                 .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ));

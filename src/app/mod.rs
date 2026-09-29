@@ -74,14 +74,20 @@ mod settings;
 /// message.
 mod skills_list;
 
-const ACCENT: Color = Color::Rgb(94, 234, 212);
-const SURFACE: Color = Color::Rgb(24, 29, 42);
-const SURFACE_RAISED: Color = Color::Rgb(36, 44, 60);
-const TEXT: Color = Color::Rgb(226, 232, 240);
-const MUTED: Color = Color::Rgb(148, 163, 184);
-const SUCCESS: Color = Color::Rgb(74, 222, 128);
-const WARNING: Color = Color::Rgb(250, 204, 21);
-const DANGER: Color = Color::Rgb(251, 113, 133);
+// Central palette: sage accent on near-black surfaces with warm semantic
+// colors. The accent doubles as the selection highlight (foreground =
+// SURFACE so the pill stays readable on both light and dark terminals).
+const ACCENT: Color = Color::Rgb(132, 204, 169);
+const ACCENT_SOFT: Color = Color::Rgb(86, 152, 122);
+const SURFACE: Color = Color::Rgb(18, 22, 26);
+const SURFACE_RAISED: Color = Color::Rgb(28, 34, 40);
+const SURFACE_INSET: Color = Color::Rgb(24, 30, 36);
+const TEXT: Color = Color::Rgb(230, 236, 232);
+const MUTED: Color = Color::Rgb(150, 164, 160);
+const ACCENT_MUTED: Color = Color::Rgb(96, 134, 116);
+const SUCCESS: Color = Color::Rgb(132, 204, 169);
+const WARNING: Color = Color::Rgb(232, 178, 84);
+const DANGER: Color = Color::Rgb(228, 110, 110);
 
 /// Top-level menu options.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,11 +101,12 @@ enum MainItem {
 
 impl MainItem {
     fn all() -> &'static [MainItem] {
+        // Source order is the visual order on the main menu.
         &[
             MainItem::Agents,
             MainItem::InstallUpdate,
-            MainItem::Settings,
             MainItem::Tools,
+            MainItem::Settings,
             MainItem::Exit,
         ]
     }
@@ -107,22 +114,33 @@ impl MainItem {
     fn label(self) -> &'static str {
         match self {
             MainItem::Agents => "Agents",
-            MainItem::InstallUpdate => "Install/Update",
-            MainItem::Settings => "Settings",
+            MainItem::InstallUpdate => "Install / Update",
             MainItem::Tools => "Tools",
+            MainItem::Settings => "Settings",
             MainItem::Exit => "Exit",
         }
     }
 
     fn detail(self) -> &'static str {
         match self {
-            MainItem::Agents => "Create and tune OpenCode roles",
-            MainItem::InstallUpdate => "Review safe synchronization changes",
-            MainItem::Settings => {
-                "Point agenthd at the checkout whose `agents/` directory holds canonical definitions"
+            MainItem::Agents => "Create, edit, and tune your OpenCode roles",
+            MainItem::InstallUpdate => {
+                "Review and apply safe synchronization changes across your harnesses"
             }
-            MainItem::Tools => "Install bundled third-party OpenCode skills",
+            MainItem::Tools => "Install ready-to-use third-party OpenCode skills",
+            MainItem::Settings => "Choose the checkout containing your agent definitions",
             MainItem::Exit => "Close agenthd",
+        }
+    }
+
+    /// One-line group cue rendered above the menu row.
+    fn group(self) -> &'static str {
+        match self {
+            MainItem::Agents => "WORK",
+            MainItem::InstallUpdate => "SYNC",
+            MainItem::Tools => "EXTRAS",
+            MainItem::Settings => "CONFIG",
+            MainItem::Exit => "LEAVE",
         }
     }
 }
@@ -368,17 +386,30 @@ impl App {
         };
         let title = Line::from(vec![
             Span::styled(
-                "  ◆ AGENTHD  ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                "  ◆ AGENTHD ",
+                Style::default()
+                    .fg(SURFACE)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("OPEN CODE / ", Style::default().fg(MUTED)),
+            Span::styled("  ", Style::default().bg(SURFACE_RAISED)),
+            Span::styled("OpenCode", Style::default().fg(MUTED).bg(SURFACE_RAISED)),
+            Span::styled(" / ", Style::default().fg(ACCENT_MUTED).bg(SURFACE_RAISED)),
             Span::styled(
-                screen.to_uppercase(),
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                screen,
+                Style::default()
+                    .fg(TEXT)
+                    .bg(SURFACE_RAISED)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]);
-        let subtitle = Line::from("  Agent definitions and OpenCode synchronization")
-            .style(Style::default().fg(MUTED));
+        let subtitle = Line::from(vec![
+            Span::styled("  ", Style::default().bg(SURFACE_RAISED)),
+            Span::styled(
+                "Agent definitions and OpenCode synchronization",
+                Style::default().fg(MUTED).bg(SURFACE_RAISED),
+            ),
+        ]);
         frame.render_widget(
             Paragraph::new(vec![title, subtitle]).style(Style::default().bg(SURFACE_RAISED)),
             area,
@@ -386,15 +417,56 @@ impl App {
     }
 
     fn render_main(&self, frame: &mut Frame, area: Rect, selected: usize) {
-        let items: Vec<ListItem> = MainItem::all()
-            .iter()
-            .map(|item| {
-                ListItem::new(vec![
-                    Line::from(item.label()).style(Style::default().add_modifier(Modifier::BOLD)),
-                    Line::from(item.detail()).style(Style::default().fg(MUTED)),
-                ])
-            })
-            .collect();
+        // Tall layout needs `4 * N` content rows plus 2 panel border rows.
+        // Anything shorter falls back to the compact 2-line stack so every
+        // entry still fits inside the visible panel without clipping the
+        // bottom border. N = `MainItem::all().len()` = 5.
+        const TALL_ENTRY_LINES: u16 = 4;
+        let n = MainItem::all().len() as u16;
+        let tall_height_needed = TALL_ENTRY_LINES * n + 2;
+        let use_tall = area.height >= tall_height_needed;
+        let mut items: Vec<ListItem> = Vec::with_capacity(n as usize);
+        for item in MainItem::all() {
+            let lines: Vec<Line> = if use_tall {
+                vec![
+                    Line::from(Span::styled(
+                        item.group(),
+                        Style::default()
+                            .fg(ACCENT_SOFT)
+                            .add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(vec![
+                        Span::styled("●  ", Style::default().fg(ACCENT_SOFT)),
+                        Span::styled(
+                            item.label(),
+                            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(Span::styled(
+                        format!("    {}", item.detail()),
+                        Style::default().fg(MUTED),
+                    )),
+                    Line::from(""),
+                ]
+            } else {
+                vec![
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{}  ", item.group()),
+                            Style::default()
+                                .fg(ACCENT_SOFT)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            item.label(),
+                            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                        ),
+                    ]),
+                    Line::from(Span::styled(item.detail(), Style::default().fg(MUTED))),
+                ]
+            };
+            items.push(ListItem::new(lines));
+        }
         let mut state = ListState::default();
         state.select(Some(selected));
         let list = List::new(items)
@@ -429,7 +501,7 @@ impl App {
         }
         let text = self.footer_text();
         let truncated = truncate(&text, area.width as usize);
-        let style = Style::default().fg(TEXT).bg(SURFACE_RAISED);
+        let style = Style::default().fg(TEXT).bg(SURFACE_INSET);
         let para = Paragraph::new(truncated).style(style);
         frame.render_widget(para, area);
     }
@@ -604,7 +676,7 @@ fn border_style_for(active: bool) -> Style {
     if active {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(MUTED)
+        Style::default().fg(ACCENT_MUTED)
     }
 }
 
@@ -612,16 +684,18 @@ fn title_style() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
+/// Selection highlight: SURFACE text on ACCENT so the pill stays
+/// readable on both light and dark terminals.
 fn selected_style() -> Style {
     Style::default()
-        .fg(Color::Black)
+        .fg(SURFACE)
         .bg(ACCENT)
         .add_modifier(Modifier::BOLD)
 }
 
-/// Semantic color for a status-bar message. Errors go red, successes go
-/// green, the unsaved-changes warning goes yellow, everything else stays
-/// visible on the shared surface.
+/// Semantic color for a status-bar message: errors go red, successes go
+/// green, the unsaved-changes warning goes warm yellow, everything else
+/// stays visible on the shared surface.
 fn status_style_for(text: &str) -> Style {
     let color = if text.starts_with("error: ") {
         DANGER
@@ -635,7 +709,7 @@ fn status_style_for(text: &str) -> Style {
     } else {
         TEXT
     };
-    Style::default().fg(color).bg(SURFACE)
+    Style::default().fg(color).bg(SURFACE_INSET)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2099,7 +2173,7 @@ mod tests {
 
     /// The Subagent-panel (plugin) main-menu entry was removed because
     /// the bundled OpenCode sidebar plugin never worked. The main menu
-    /// must now list exactly Agents, Install/Update, Settings, Tools,
+    /// must now list exactly Agents, Install/Update, Tools, Settings,
     /// and Exit.
     #[test]
     fn main_menu_does_not_include_plugin() {
@@ -2109,8 +2183,8 @@ mod tests {
             vec![
                 MainItem::Agents,
                 MainItem::InstallUpdate,
-                MainItem::Settings,
                 MainItem::Tools,
+                MainItem::Settings,
                 MainItem::Exit,
             ],
             "main menu must not include MainItem::Plugin"
@@ -2127,6 +2201,79 @@ mod tests {
                 item.detail()
             );
         }
+    }
+
+    /// The main-menu order is a stable user-visible contract. A future
+    /// reorder must touch `MainItem::all()` AND this assertion.
+    #[test]
+    fn main_menu_order_and_labels_are_pinned() {
+        let items: Vec<MainItem> = MainItem::all().to_vec();
+        assert_eq!(
+            items,
+            vec![
+                MainItem::Agents,
+                MainItem::InstallUpdate,
+                MainItem::Tools,
+                MainItem::Settings,
+                MainItem::Exit,
+            ],
+            "main menu order is part of the user-visible UI contract"
+        );
+        let labels: Vec<&str> = items.iter().map(|i| i.label()).collect();
+        assert_eq!(
+            labels,
+            vec!["Agents", "Install / Update", "Tools", "Settings", "Exit"],
+            "labels must read exactly as the user sees them"
+        );
+        for item in items {
+            assert!(!item.group().is_empty(), "group cue must be non-empty");
+            assert!(
+                !item.detail().is_empty(),
+                "detail must be non-empty for {item:?}"
+            );
+        }
+    }
+
+    /// Pin the index→screen dispatch mapping. Reordering `MainItem::all()`
+    /// would silently rewire every index, so this test pins the mapping
+    /// the user has already memorized.
+    #[test]
+    fn main_menu_index_to_screen_mapping_is_pinned() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
+
+        app.screen = Screen::Main { selected: 0 };
+        app.handle_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            matches!(app.screen, Screen::Agents { .. }),
+            "index 0 must open the Agents screen, got {:?}",
+            app.screen
+        );
+
+        app.screen = Screen::Main { selected: 2 };
+        app.handle_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            matches!(app.screen, Screen::Tools { .. }),
+            "index 2 must open the Tools screen, got {:?}",
+            app.screen
+        );
+
+        app.screen = Screen::Main { selected: 3 };
+        app.handle_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            matches!(app.screen, Screen::Settings { .. }),
+            "index 3 must open the Settings screen, got {:?}",
+            app.screen
+        );
+
+        app.screen = Screen::Main { selected: 4 };
+        app.handle_main_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.quit, "index 4 must quit the app");
+        assert!(
+            matches!(app.screen, Screen::Main { .. }),
+            "Exit must not transition to another screen"
+        );
     }
 
     // ---------- Skills list UI tests ------------------------------------------
@@ -2233,5 +2380,156 @@ mod tests {
             }
             screen => panic!("expected InstallUpdate selector, got {screen:?}"),
         }
+    }
+
+    // ---------- Main menu rendering (TestBackend) ----------
+
+    /// Verify that the main menu renders every label in source order and
+    /// that the selected row's label sits inside a sage pill (`SURFACE`
+    /// foreground on `ACCENT` background). Asserts through the rendered
+    /// buffer so the test stays valid even if helper names drift.
+    #[test]
+    fn main_menu_renders_labels_in_order_with_sage_pill() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("render main menu");
+        let buffer = terminal.backend().buffer().clone();
+
+        // Walk the body row band (rows 3..=29; header occupies 0..=2)
+        // and assemble per-row strings so we can pin the vertical
+        // ordering of the labels.
+        let mut body_lines: Vec<String> = Vec::new();
+        for y in 3..buffer.area.height {
+            let mut line = String::new();
+            for x in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    line.push_str(cell.symbol());
+                }
+            }
+            body_lines.push(line);
+        }
+
+        fn first_row_with(lines: &[String], needle: &str) -> Option<usize> {
+            lines.iter().position(|l| l.contains(needle))
+        }
+        let expected_labels = ["Agents", "Install / Update", "Tools", "Settings", "Exit"];
+        let mut last_row: Option<usize> = None;
+        for label in &expected_labels {
+            let row = first_row_with(&body_lines, label)
+                .unwrap_or_else(|| panic!("label `{label}` not found in main menu body"));
+            if let Some(prev) = last_row {
+                assert!(
+                    row > prev,
+                    "label `{label}` must appear below the previous label in source order \
+                     (previous row {prev}, this row {row})"
+                );
+            }
+            last_row = Some(row);
+        }
+
+        let agents_row = first_row_with(&body_lines, "Agents").expect("Agents row must be present");
+        let agents_col = body_lines[agents_row].find("Agents").expect("Agents label");
+        let cell = buffer
+            .cell((agents_col as u16, 3 + agents_row as u16))
+            .expect("Agents cell must exist");
+        assert_eq!(
+            cell.fg, SURFACE,
+            "selected row label foreground must equal the new surface color"
+        );
+        assert_eq!(
+            cell.bg, ACCENT,
+            "selected row label background must equal the new sage accent"
+        );
+    }
+
+    /// Narrow terminals must keep rendering without panic and the menu
+    /// must still surface every label.
+    #[test]
+    fn main_menu_renders_safely_on_narrow_terminal() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.render(frame))
+            .expect("narrow terminal must render without panic");
+        let buffer = terminal.backend().buffer().clone();
+        let mut all_text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    all_text.push_str(cell.symbol());
+                }
+            }
+            all_text.push('\n');
+        }
+        for label in ["Agents", "Install / Update", "Tools", "Settings", "Exit"] {
+            assert!(
+                all_text.contains(label),
+                "label `{label}` must still render on a narrow terminal; got:\n{all_text}"
+            );
+        }
+    }
+
+    /// Boundary assertion for the tall-layout threshold in `render_main`.
+    /// Tall layout needs `4 * N + 2` rows (20 content + 2 panel borders
+    /// for N=5 entries). At body height = 21, a buggy threshold of
+    /// `4 * N + 1` would pick tall and clip the last entry off the
+    /// bottom of the panel; the corrected threshold of `4 * N + 2`
+    /// picks compact and keeps every entry — including the bottom
+    /// border — on screen.
+    #[test]
+    fn main_menu_bottom_border_visible_at_tall_boundary() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let app = App::new(paths, State::default());
+        let backend = TestBackend::new(60, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = Rect::new(0, 0, 60, 21);
+                app.render_main(frame, area, 0);
+            })
+            .expect("render at tall boundary");
+        let buffer = terminal.backend().buffer().clone();
+        // The last row of the rendered rect (y = 20) must contain the
+        // panel's bottom border corner / bottom edge.
+        let mut bottom_row = String::new();
+        for x in 0..buffer.area.width {
+            if let Some(cell) = buffer.cell((x, 20)) {
+                bottom_row.push_str(cell.symbol());
+            }
+        }
+        assert!(
+            bottom_row.contains('╰') || bottom_row.contains('─'),
+            "bottom border must be visible at body height 21 (the tall-layout boundary); got `{bottom_row:?}`"
+        );
+        // And every label must still be reachable from the rendered
+        // buffer so the user can navigate the last entry (Exit).
+        let mut all_text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    all_text.push_str(cell.symbol());
+                }
+            }
+            all_text.push('\n');
+        }
+        assert!(
+            all_text.contains("Exit"),
+            "the last entry (Exit) must not be clipped at the tall-layout boundary"
+        );
     }
 }
