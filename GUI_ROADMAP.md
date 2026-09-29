@@ -73,7 +73,7 @@ entra como segundo cliente.
 
 - [x] Inventario y borrador de matriz en `REUSABLE_API_COVERAGE.md`.
 - [x] `cargo test --all-targets` verde en Linux (256 + 178; 1 ignored).
-- [ ] Firmar la matriz como definitiva (ver "Próxima tarea estrecha").
+- [x] Firmar la matriz como definitiva (ver "Próxima tarea estrecha").
 
 ### Fase 2 — Separar workflows compartidos
 
@@ -109,12 +109,12 @@ entra como segundo cliente.
 
 ## Próxima tarea estrecha
 
-1. Revisar la matriz de `REUSABLE_API_COVERAGE.md` de forma
-   independiente — verificar cada entrada contra el código y los
-   tests reales (no contra el propio borrador); corregir
-   imprecisiones (nombres, archivos, líneas, conteos, estados de
-   tests); solo entonces marcarla revisada. No firmar en verde sin
-   recorrer la matriz.
+1. **Fase 1 firmada.** Recorrida read-only de la matriz con
+   reclasificaciones puntuales aplicadas en `REUSABLE_API_COVERAGE.md`
+   (Summary ampliado a listado exhaustivo). Nombres de `Cross-cutting
+   invariants` comprobados estáticamente contra el código, no fila
+   por fila. Revisión estática en Windows; conteos históricos de
+   tests Linux (256 + 178; 1 ignored) no re-ejecutados.
 2. Evaluar si el boot de `main.rs` (TerminalGuard, panic hook,
    ciclo TUI, argv) debe aislarse del guard TUI-coupling; solo si
    reduce dependencia real.
