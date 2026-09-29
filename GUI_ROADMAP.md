@@ -1,8 +1,11 @@
 # Hoja de ruta GUI — handoff (ES)
 
-Handoff autónomo para otro agente en otra PC. `PLAN.md` y
-`TOOL_INSTALLER_PLAN.md` están eliminados en el árbol de trabajo:
-no se reponen ni se apuntan como referencia canónica.
+Handoff autónomo para otro agente en otra PC.
+
+> **Nota:** `PLAN.md` y `TOOL_INSTALLER_PLAN.md` fueron retirados
+> del repositorio de forma deliberada (commit en `main`). No se
+> reponen ni se apuntan como referencia canónica. Si una tarea los
+> necesita, confirmar primero con el usuario.
 
 ## Objetivo
 
@@ -133,24 +136,14 @@ entra como segundo cliente.
 
 ## Handoff (importante)
 
-El árbol de esta PC **no está commiteado ni pusheado**:
+Este documento y `REUSABLE_API_COVERAGE.md` están commiteados en
+`origin/main`. El siguiente agente en otra PC:
 
-- Modificados (uncommitted): `src/main.rs`,
-  `src/app/{mod,agents,editor,settings}.rs`.
-- Sin tracking: `GUI_ROADMAP.md`, `REUSABLE_API_COVERAGE.md`,
-  `src/launcher.rs`, `src/workflows.rs`. No estarán presentes en otra
-  PC hasta sincronizar (commit + push aquí, pull allá, o parche).
-- Eliminados (en working tree, sin commit): `PLAN.md`,
-  `TOOL_INSTALLER_PLAN.md`.
-
-No significa que estén en `origin/main`. El siguiente agente en
-otra PC: `git status` + `git diff` antes de commit; no asumir
-untracked en su copia; no restaurar ni commitear los eliminados
-sin confirmar intención del usuario (desconocida); transferir este
-doc y los untracked por parche o commit + push explícito.
-
-> **Nota:** este snapshot del árbol proviene de esta máquina. El
-> siguiente agente debe re-verificar el estado real en su propio
-> árbol antes de actuar. `PLAN.md` y `TOOL_INSTALLER_PLAN.md` no
-> están disponibles aquí; su eliminación exige decisión del
-> usuario y no debe darse por sentada como canónica.
+1. Sincronizar: `git pull origin main`.
+2. Verificar estado: `git status` debe estar limpio salvo por
+   cambios intencionales propios; `git rev-parse HEAD` debe
+   coincidir con `origin/main`.
+3. Proceder usando este documento y `REUSABLE_API_COVERAGE.md`
+   como referencia canónica. No restaurar ni re-crear
+   `PLAN.md` ni `TOOL_INSTALLER_PLAN.md` — su retirada es
+   deliberada.
