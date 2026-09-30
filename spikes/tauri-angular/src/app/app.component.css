@@ -1,0 +1,5 @@
+/* Component-local styles intentionally empty — the spike
+   uses the global stylesheet for everything. Keeping the
+   file present so Angular CLI does not warn about the
+   missing styleUrl when the @Component decorator points
+   at it. */

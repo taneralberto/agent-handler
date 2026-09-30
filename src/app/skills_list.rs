@@ -1,10 +1,11 @@
 //! Skills list UI: render / open / refresh / handle key / apply safe.
 //!
-//! Driven by `crate::store::plan_skills` / `apply_skills`. The UI is
-//! intentionally shape-agnostic: the store produces a per-skill
-//! `SkillPlanItem` row carrying the action label and reason, and the
-//! handler dispatches `Esc` / arrows / `i` / `o` / `r` into the
-//! appropriate plan / apply call.
+//! Driven by `crate::store::plan_skills` (rendering) and
+//! `crate::workflows::plan_then_apply_skills` (install orchestration).
+//! The UI is intentionally shape-agnostic: the store produces a
+//! per-skill `SkillPlanItem` row carrying the action label and
+//! reason, and the handler dispatches `Esc` / arrows / `i` / `o` /
+//! `r` into the appropriate plan / apply call.
 //!
 //! Conflict policy: there is no force-overwrite path. The `o` key is
 //! surfaced as a status-bar decline so the user knows the omission
@@ -12,7 +13,8 @@
 //! in `Paths.skills_dir`) is never touched by this screen.
 
 use super::{panel, render_popup, selected_style, truncate, App, Screen, DANGER, SUCCESS};
-use crate::store::{apply_skills, plan_skills, SkillAction, SkillOutcome, SkillPlanItem};
+use crate::store::{plan_skills, SkillAction, SkillOutcome, SkillPlanItem};
+use crate::workflows::plan_then_apply_skills;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Stylize};
@@ -209,7 +211,13 @@ impl App {
 
     fn apply_skills_install(&mut self) {
         // Re-read state and re-plan immediately before any writes so
-        // we never act on stale items.
+        // we never act on stale items. The orchestration (replan →
+        // no-op if empty → apply if non-empty, with no force-
+        // overwrite on conflicts) lives in
+        // `workflows::plan_then_apply_skills` so it can be unit-
+        // tested without the TUI; this handler keeps the state
+        // update, status-bar text, last-outcomes update, and the
+        // post-apply refresh.
         let state = match crate::store::State::load(&self.paths.state_file) {
             Ok(s) => s,
             Err(e) => {
@@ -218,19 +226,11 @@ impl App {
             }
         };
         self.state = state;
-        let plan = match plan_skills(&self.paths, &self.state) {
-            Ok(p) => p,
-            Err(e) => {
-                self.status_bar = Some(format!("error: {}", e));
-                return;
+        match plan_then_apply_skills(&self.paths, self.state.clone()) {
+            Ok(None) => {
+                self.status_bar = Some("nothing to install for Skills".to_string());
             }
-        };
-        if plan.is_empty() {
-            self.status_bar = Some("nothing to install for Skills".to_string());
-            return;
-        }
-        match apply_skills(&self.paths, self.state.clone(), plan) {
-            Ok((state, outcomes)) => {
+            Ok(Some((state, outcomes))) => {
                 self.state = state;
                 let succeeded = outcomes.iter().filter(|o| o.ok).count();
                 let failed = outcomes.iter().filter(|o| !o.ok).count();

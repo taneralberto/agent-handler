@@ -2,10 +2,11 @@
 //!
 //! Each entry point here orchestrates the data-store primitives in
 //! `crate::store` and `crate::agent` and returns typed outcomes
-//! (`CheckoutStatus`, `ApplyError`, `Vec<Agent>`). Callers
+//! (`CheckoutStatus`, `ApplyError`, `Vec<Agent>`, the Skills
+//! orchestration's `Option<(State, Vec<SkillOutcome>)>`). Callers
 //! decide how to render or transition around them.
 //!
-//! Three flows:
+//! Flows:
 //!
 //! 1. [`read_checkout`] classifies the persisted `settings.json`:
 //!    a missing file is `Empty`, a valid path is `Ready`, a moved
@@ -32,13 +33,55 @@
 //!    front, so a missing or moved checkout is an explicit error
 //!    rather than an empty list. A valid empty directory returns
 //!    an empty vec; the caller decides what to render around it.
+//!
+//! 4. [`plan_then_apply_skills`] is the Skills-install
+//!    orchestration the TUI's `apply_skills_install` handler used
+//!    to inline: take a freshly-loaded `State`, replan from disk,
+//!    and only call `apply_skills` if the plan is non-empty. Empty
+//!    plan is `Ok(None)` and writes nothing; non-empty plan returns
+//!    the post-apply `(State, Vec<SkillOutcome>)`. No force-
+//!    overwrite is performed on conflicts — the store layer's
+//!    `Conflict` row surfaces a `skipped` outcome with `ok = true`.
+//!
+//! 5. [`plan_then_apply_agents_safe`] is the per-target agent
+//!    safe-install orchestration the TUI's `apply_safe_install`
+//!    handler used to inline: take a freshly-loaded `State` and
+//!    the bound `SyncTarget`, fail-closed via `load_canonical`
+//!    before any target-side read, replan via `plan_for` from
+//!    disk, and only call `apply_safe` if the plan is non-empty.
+//!    Empty plan is `Ok(None)` and writes nothing; non-empty plan
+//!    returns the post-apply `(State, Vec<ApplyOutcome>)`. The
+//!    `force_install` path stays on the TUI side — this workflow
+//!    is the safe-install mirror of [`plan_then_apply_skills`]
+//!    and never force-overwrites. Signature mirrors
+//!    [`plan_then_apply_skills`]: a concrete `SyncTarget`, no UI
+//!    preconditions in the contract.
+//!
+//! 6. [`save_agent`] is the rename-then-save helper the TUI's
+//!    `EditorOp::Save` arm used to inline. When the agent name
+//!    changed (`original_name != material.name`), the source
+//!    hash is re-checked against `prior_hash` BEFORE the rename
+//!    and the destination name is rejected if the canonical
+//!    source has drifted; only then does `rename_canonical`
+//!    run. After the rename (or when no rename is needed),
+//!    `save_canonical` writes the rendered material with the
+//!    **original** `prior_hash` so an external edit that
+//!    slipped in between open and save is rejected. The
+//!    composite path is **not** atomic across the rename + save
+//!    boundary — a successful rename followed by a failed save
+//!    leaves the source renamed with the pre-edit bytes; the
+//!    TUI surfaces the error so the user can re-open and
+//!    retry. Errors from `rename_canonical` are prefixed with
+//!    `"rename: "`; errors from `save_canonical` are prefixed
+//!    with `"save: "`, matching the inline TUI text exactly.
 
 use crate::agent::Agent;
 use crate::store::{
-    canonical_dir_from, load_canonical, load_settings, save_settings, validate_checkout_path,
-    Paths, Settings,
+    apply_safe, apply_skills, canonical_dir_from, hash_file, load_canonical, load_settings,
+    plan_for, plan_skills, rename_canonical, save_canonical, save_settings, validate_checkout_path,
+    ApplyOutcome, Paths, Settings, SkillOutcome, State, SyncTarget,
 };
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 
 /// What the persisted `settings.json` contains, classified for
@@ -179,6 +222,189 @@ pub fn list_canonical_agents(paths: &Paths) -> Result<Vec<Agent>> {
     let mut agents: Vec<Agent> = map.into_values().map(|(agent, _)| agent).collect();
     agents.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(agents)
+}
+
+/// Skills-install orchestration, UI-agnostic.
+///
+/// The caller has already reloaded `State` from disk (matching the
+/// reload the Skills screen performs at the top of its install
+/// handler); the workflow takes that fresh `State`, replans from
+/// disk, and only invokes `apply_skills` when the plan is
+/// non-empty. An empty plan is a no-op: `apply_skills` is not
+/// called, no skill files are written, and `state.json` is not
+/// rewritten.
+///
+/// Returns:
+///
+/// - `Ok(None)` — the replan produced no actionable rows. The
+///   caller's `State` is the freshly-loaded value and is
+///   authoritative; no disk write happens on this path.
+/// - `Ok(Some((state, outcomes)))` — `apply_skills` ran; outcomes
+///   describe what happened per skill, and the returned `state`
+///   is the post-apply manifest (which `apply_skills` persists
+///   only if it actually changed). Conflict rows in `outcomes`
+///   carry `ok = true` because the refusal to overwrite is the
+///   contract — the installer never force-overwrites a target
+///   with different bytes.
+/// - `Err(_)` — the replan or the apply failed. The caller's
+///   in-memory `State` (the freshly-loaded value) remains valid;
+///   this function does not return partial state on error.
+///
+/// The function does not render, mutate UI status, or call into
+/// the TUI. The Skills screen keeps its state/status/key handling
+/// and only delegates the orchestration here.
+pub fn plan_then_apply_skills(
+    paths: &Paths,
+    state: State,
+) -> Result<Option<(State, Vec<SkillOutcome>)>> {
+    // Replan from disk before deciding whether to apply. The
+    // store's `plan` walks the source tree fresh, so the caller's
+    // `state` only seeds the manifest lookups; the per-row
+    // decisions come from what is actually on disk now. This is
+    // the "no invocar apply si plan vacío" guard: an empty plan
+    // short-circuits before any filesystem write.
+    let plan = plan_skills(paths, &state)?;
+    if plan.is_empty() {
+        return Ok(None);
+    }
+    let (new_state, outcomes) = apply_skills(paths, state, plan)?;
+    Ok(Some((new_state, outcomes)))
+}
+
+/// Per-target safe-install orchestration, UI-agnostic.
+///
+/// The caller has already reloaded `State` from disk (matching the
+/// reload the Install/Update screen performs at the top of its
+/// safe-install handler) and resolved the bound `SyncTarget`
+/// from its UI state. The workflow fail-closed-loads the
+/// canonical source, replans from disk via `plan_for`, and only
+/// invokes `apply_safe` when the plan is non-empty. An empty
+/// plan is a no-op: `apply_safe` is not called, no agent files
+/// are written, and `state.json` is not rewritten. The
+/// `force_install` path stays on the TUI side — this workflow
+/// is the safe-install mirror of [`plan_then_apply_skills`] and
+/// never force-overwrites a conflict target.
+///
+/// Signature mirrors [`plan_then_apply_skills`]: a concrete
+/// `SyncTarget` (not `Option<SyncTarget>`) so the workflow
+/// stays free of UI preconditions like "no harness is bound".
+/// The TUI owns that guard; on the no-target path the TUI
+/// runs `load_canonical` once on its own to preserve the
+/// original inline ordering (`load_canonical` runs before the
+/// target guard surfaces `pick a harness first`), then maps
+/// the success into `"pick a harness first"`. On the normal
+/// path (target bound) the workflow is the single owner of
+/// `load_canonical` — no duplication.
+///
+/// Returns:
+///
+/// - `Ok(None)` — the replan produced no actionable rows. The
+///   caller's `State` is the freshly-loaded value and is
+///   authoritative; no disk write happens on this path.
+/// - `Ok(Some((state, outcomes)))` — `apply_safe` ran; outcomes
+///   describe what happened per agent file, and the returned
+///   `state` is the post-apply manifest (which `apply_safe`
+///   persists only if it actually changed). Conflict rows in
+///   `outcomes` carry `ok = true` because the refusal to
+///   overwrite is the contract — the installer never force-
+///   overwrites a target with different bytes.
+/// - `Err(_)` — the source load, the replan, or the apply
+///   failed. The caller's in-memory `State` (the freshly-loaded
+///   value) remains valid; this function does not return partial
+///   state on error.
+///
+/// The function does not render, mutate UI status, or call into
+/// the TUI. The Install/Update screen keeps its state/status/
+/// key handling and only delegates the orchestration here. The
+/// caller is responsible for the post-apply refresh that
+/// rebuilds the visible item list.
+pub fn plan_then_apply_agents_safe(
+    paths: &Paths,
+    state: State,
+    target: SyncTarget,
+) -> Result<Option<(State, Vec<ApplyOutcome>)>> {
+    // Fail closed on the canonical source BEFORE any target-side
+    // read. The configured checkout has to be a real directory
+    // with parseable agent files; without that guard the
+    // planner could otherwise produce a `Remove` row that
+    // `apply_safe` would later honor (silently deleting an
+    // installed target) even though the source has vanished.
+    load_canonical(paths)?;
+    // Replan from disk before deciding whether to apply. The
+    // store's `plan_for` walks both the source and target fresh,
+    // so the caller's `state` only seeds the manifest lookups;
+    // the per-row decisions come from what is actually on disk
+    // now. This is the "no invocar apply si plan vacío" guard:
+    // an empty plan short-circuits before any filesystem write.
+    let plan = plan_for(paths, &state, target)?;
+    if plan.is_empty() {
+        return Ok(None);
+    }
+    let (new_state, outcomes) = apply_safe(paths, state, plan)?;
+    Ok(Some((new_state, outcomes)))
+}
+
+/// Save an agent, performing a rename first if the name changed.
+///
+/// `prior_hash` is the SHA-256 captured when the editor opened
+/// the canonical file (or `None` for a new agent). It is passed
+/// straight through to `save_canonical` so an external edit
+/// made between open and save is rejected. Recomputing it here
+/// would defeat the check.
+///
+/// This workflow is a verbatim lift of the previous inline
+/// `save_agent` helper in `src/app/editor.rs`. Body and order
+/// are preserved bit-for-bit:
+///
+/// 1. Compute `target_name` from the material; decide whether a
+///    rename is needed by comparing against `original_name`.
+/// 2. If renaming: hash the **source** path (the original
+///    filename), bail if the hash drifted from `prior_hash`,
+///    then `rename_canonical(old, target_name)`.
+/// 3. `save_canonical(material, prior_hash)` — with the
+///    original `prior_hash`, so a post-rename external edit
+///    also surfaces as the standard "changed on disk" error.
+/// 4. Return the final `target_name` so the caller can use it
+///    for status messages without re-reading the material.
+///
+/// Composite non-atomic behavior (preserved, not improved): a
+/// successful rename followed by a failed `save_canonical`
+/// leaves the source renamed with the pre-edit bytes on disk
+/// (the rendered `material` was never landed). The workflow
+/// surfaces the `save_canonical` error verbatim so the caller
+/// can re-open and retry; no compensating rename-back is
+/// attempted. The store layer's atomicity guarantees apply
+/// per `write_target` only.
+///
+/// Errors from `rename_canonical` are prefixed with `"rename: "`;
+/// errors from `save_canonical` are prefixed with `"save: "`,
+/// matching the inline TUI text exactly so the user-visible
+/// error field is unchanged.
+pub fn save_agent(
+    paths: &Paths,
+    original_name: Option<String>,
+    prior_hash: Option<String>,
+    material: Agent,
+) -> Result<String> {
+    let target_name = material.name.clone();
+    let needs_rename = original_name
+        .as_ref()
+        .map(|o| o != &target_name)
+        .unwrap_or(false);
+    if needs_rename {
+        let old = original_name.clone().unwrap();
+        let source_path = paths.canonical_dir.join(format!("{}.md", old));
+        let current_hash = hash_file(&source_path)?;
+        if current_hash.as_deref() != prior_hash.as_deref() {
+            bail!(
+                "`{}` changed on disk since this edit started; reload to pick up the latest version",
+                source_path.display()
+            );
+        }
+        rename_canonical(paths, &old, &target_name).map_err(|e| anyhow!("rename: {}", e))?;
+    }
+    save_canonical(paths, &material, prior_hash.as_deref()).map_err(|e| anyhow!("save: {}", e))?;
+    Ok(target_name)
 }
 
 #[cfg(test)]
@@ -477,5 +703,644 @@ mod tests {
             err.contains("does not exist"),
             "expected missing-source error from listing, got: {err}"
         );
+    }
+
+    // ---------- plan_then_apply_skills ----------
+
+    /// The empty-plan branch is a no-op: `apply_skills` is not
+    /// invoked, no skill files appear under `paths.skills_dir`,
+    /// and `state.json` is not rewritten. The workflow returns
+    /// `Ok(None)` and the caller's `State` is unchanged.
+    #[test]
+    fn plan_then_apply_skills_empty_plan_is_no_op_and_does_not_write() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        paths.canonical_dir = dir.path().join("checkout").join("agents");
+        // Configured checkout with `skills/` but no actual skill
+        // subdirectories — every plan row is UpToDate/Absent.
+        let checkout = paths.canonical_dir.parent().unwrap();
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        fs::create_dir_all(checkout.join("skills")).unwrap();
+        // Seed a non-empty state.json so a rewrite would land
+        // something on disk; we then assert it stays byte-stable.
+        let state = State::default();
+        let before_bytes = {
+            if let Some(parent) = paths.state_file.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            // Seed directly via `serde_json` so the test does not
+            // need to call `store::write_state` (which is
+            // `pub(in crate::store)`).
+            let bytes = serde_json::to_vec_pretty(&state).unwrap();
+            fs::write(&paths.state_file, &bytes).unwrap();
+            fs::read(&paths.state_file).unwrap()
+        };
+        assert!(
+            !paths.skills_dir.join("anything").exists(),
+            "skills_dir must be empty before the no-op call"
+        );
+
+        let result = plan_then_apply_skills(&paths, state).unwrap();
+        assert!(result.is_none(), "empty plan must return Ok(None)");
+
+        // No skill file landed under the configured skills dir. The
+        // skills dir may not exist at all in this test (we never
+        // called `Paths::ensure_dirs`); that is also a valid
+        // "no writes" outcome. If it does exist, it must be empty.
+        match fs::read_dir(&paths.skills_dir) {
+            Ok(rd) => assert_eq!(
+                rd.count(),
+                0,
+                "skills_dir must remain empty after the no-op call"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("unexpected skills_dir error: {e}"),
+        }
+
+        // state.json was NOT rewritten — bytes identical to seed.
+        let after_bytes = fs::read(&paths.state_file).unwrap();
+        assert_eq!(
+            before_bytes, after_bytes,
+            "state.json must not be rewritten on the no-op path"
+        );
+    }
+
+    /// `plan_then_apply_skills` must replan from disk, not trust
+    /// the caller's `State` alone. Seed an old `State` whose
+    /// manifest records a no-op outcome, then mutate the source
+    /// tree on disk after the seed; the workflow replans and
+    /// installs because disk says so, even though the old
+    /// `State` did not. This pins the "no invocar apply si plan
+    /// vacío" + "no confiar en plan stale" contract.
+    #[test]
+    fn plan_then_apply_skills_replans_from_disk_even_when_caller_state_is_stale() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        let checkout = dir.path().join("checkout");
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        fs::create_dir_all(checkout.join("skills")).unwrap();
+        paths.canonical_dir = checkout.join("agents");
+
+        // Seed: caller hands us a `State` with no `installed_skills`
+        // entries — the old `State` says "nothing owned", so a naive
+        // caller could conclude there's no work. But the disk tells
+        // a different story after we add a skill directory below.
+        let stale_state = State::default();
+        assert!(
+            stale_state.installed_skills.is_empty(),
+            "stale seed: empty manifest"
+        );
+
+        // Land a brand-new skill on disk AFTER the seed. The
+        // workflow must replan from disk and install it.
+        let skill = checkout.join("skills").join("foo");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: foo\ndescription: test\n---\nbody\n",
+        )
+        .unwrap();
+
+        let result =
+            plan_then_apply_skills(&paths, stale_state).expect("replan + apply must succeed");
+        let (new_state, outcomes) =
+            result.expect("non-empty plan must produce Some((state, outcomes))");
+
+        // At least one outcome for `foo`, marked installed / adopted.
+        assert_eq!(outcomes.len(), 1, "expected one outcome");
+        assert_eq!(outcomes[0].name, "foo");
+        assert!(
+            outcomes[0].ok,
+            "install outcome must be ok: {}",
+            outcomes[0].detail
+        );
+
+        // The manifest now records ownership of `foo` even though
+        // the caller's stale State did not. This is the
+        // "replan from disk" half of the contract.
+        assert!(
+            new_state.installed_skills.contains_key("foo"),
+            "post-apply state must record `foo`"
+        );
+
+        // The skill landed on the destination side.
+        assert!(
+            paths.skills_dir.join("foo").join("SKILL.md").is_file(),
+            "skill must have been published under skills_dir"
+        );
+    }
+
+    /// Conflict rows: a target that already exists with different
+    /// bytes produces a `Conflict` plan item and the apply pass
+    /// leaves the target untouched (`apply_skills` only ever
+    /// writes through `rename_no_replace` for owned targets, and
+    /// unowned-with-different-bytes targets are refused). The
+    /// outcome carries `ok = true` because the refusal is the
+    /// contract — `plan_then_apply_skills` must NOT force-overwrite.
+    #[test]
+    fn plan_then_apply_skills_conflict_does_not_overwrite_target() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        let checkout = dir.path().join("checkout");
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        fs::create_dir_all(checkout.join("skills")).unwrap();
+        paths.canonical_dir = checkout.join("agents");
+
+        // Source: a clean `foo` skill directory.
+        let skill = checkout.join("skills").join("foo");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: foo\ndescription: test\n---\nsource body\n",
+        )
+        .unwrap();
+
+        // Destination: an UNOWNED `foo` directory with different
+        // bytes — the planner must classify this as `Conflict`,
+        // and the apply must refuse to touch it.
+        let target = paths.skills_dir.join("foo");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(
+            target.join("SKILL.md"),
+            "---\nname: foo\ndescription: test\n---\nforeign body\n",
+        )
+        .unwrap();
+        let foreign_bytes_before = fs::read(target.join("SKILL.md")).unwrap();
+
+        let result =
+            plan_then_apply_skills(&paths, State::default()).expect("replan + apply must succeed");
+        let (new_state, outcomes) =
+            result.expect("non-empty plan must produce Some((state, outcomes))");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].name, "foo");
+        assert!(
+            outcomes[0].ok,
+            "conflict outcome must be ok=true (refusal is the contract): {}",
+            outcomes[0].detail
+        );
+        assert!(
+            outcomes[0].detail.contains("refusing")
+                || outcomes[0].detail.contains("different bytes"),
+            "conflict detail must mention refusal / different bytes, got: {}",
+            outcomes[0].detail
+        );
+
+        // Target bytes unchanged on disk.
+        let foreign_bytes_after = fs::read(target.join("SKILL.md")).unwrap();
+        assert_eq!(
+            foreign_bytes_before, foreign_bytes_after,
+            "conflict target must NOT be force-overwritten"
+        );
+
+        // Manifest does NOT gain ownership of the conflicting
+        // target — it remains an unowned foreign install.
+        assert!(
+            !new_state.installed_skills.contains_key("foo"),
+            "manifest must not record ownership of a conflicting target"
+        );
+    }
+
+    // ---------- plan_then_apply_agents_safe ----------
+
+    /// Helper that writes an agent file into the canonical agents
+    /// directory so the per-target safe-install planner has a real
+    /// `NotInstalled` row to act on. Mirrors how the Skills test
+    /// helpers seed a fresh source tree. The agent's `name` is
+    /// derived from the filename (the canonical schema's contract,
+    /// not from the frontmatter), so we keep the frontmatter
+    /// minimal and parseable.
+    fn write_canonical_agent(canonical_dir: &Path, name: &str, body: &str) {
+        std::fs::create_dir_all(canonical_dir).unwrap();
+        std::fs::write(
+            canonical_dir.join(format!("{name}.md")),
+            format!("---\ndescription: test\nmode: subagent\n---\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    /// Empty-plan branch is a no-op: `apply_safe` is not invoked,
+    /// no agent files appear under `paths.target_dir`, and
+    /// `state.json` is not rewritten. The workflow returns
+    /// `Ok(None)` and the caller's `State` is unchanged.
+    #[test]
+    fn plan_then_apply_agents_safe_empty_plan_is_no_op_and_does_not_write() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        // Configured checkout with `agents/` but no actual agent
+        // files — every plan row is `Unowned`/`Absent` and there
+        // is nothing the safe path would act on.
+        let checkout = dir.path().join("checkout");
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        paths.canonical_dir = checkout.join("agents");
+
+        // Seed a non-empty `state.json` so a rewrite would land
+        // something on disk; we then assert it stays byte-stable.
+        let state = State::default();
+        let before_bytes = {
+            if let Some(parent) = paths.state_file.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let bytes = serde_json::to_vec_pretty(&state).unwrap();
+            fs::write(&paths.state_file, &bytes).unwrap();
+            fs::read(&paths.state_file).unwrap()
+        };
+
+        let result = plan_then_apply_agents_safe(&paths, state, SyncTarget::OpenCode).unwrap();
+        assert!(result.is_none(), "empty plan must return Ok(None)");
+
+        // No agent file landed under the OpenCode target dir. The
+        // target dir may not exist at all in this test (we never
+        // called `Paths::ensure_dirs`); that is also a valid
+        // "no writes" outcome. If it does exist, it must be empty.
+        match fs::read_dir(&paths.target_dir) {
+            Ok(rd) => assert_eq!(
+                rd.count(),
+                0,
+                "target_dir must remain empty after the no-op call"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("unexpected target_dir error: {e}"),
+        }
+
+        // state.json was NOT rewritten — bytes identical to seed.
+        let after_bytes = fs::read(&paths.state_file).unwrap();
+        assert_eq!(
+            before_bytes, after_bytes,
+            "state.json must not be rewritten on the no-op path"
+        );
+    }
+
+    /// `plan_then_apply_agents_safe` must replan from disk, not
+    /// trust the caller's `State` alone. Seed an empty `State`,
+    /// then mutate the source tree on disk after the seed; the
+    /// workflow replans and installs because disk says so, even
+    /// though the old `State` did not. This pins the
+    /// "no confiar en plan stale" half of the contract.
+    #[test]
+    fn plan_then_apply_agents_safe_replans_from_disk_even_when_caller_state_is_stale() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        let checkout = dir.path().join("checkout");
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        paths.canonical_dir = checkout.join("agents");
+
+        // Seed: caller hands us a `State` with no ownership
+        // entries — the old `State` says "nothing owned", so a
+        // naive caller could conclude there's no work. But the
+        // disk tells a different story after we add an agent
+        // file below.
+        let stale_state = State::default();
+        assert!(
+            stale_state.installed.is_empty(),
+            "stale seed: empty opencode manifest"
+        );
+
+        // Land a brand-new agent on disk AFTER the seed. The
+        // workflow must replan from disk and install it.
+        write_canonical_agent(&paths.canonical_dir, "foo", "source body");
+
+        let result = plan_then_apply_agents_safe(&paths, stale_state, SyncTarget::OpenCode)
+            .expect("replan + apply must succeed");
+        let (new_state, outcomes) =
+            result.expect("non-empty plan must produce Some((state, outcomes))");
+
+        assert_eq!(outcomes.len(), 1, "expected one outcome");
+        assert_eq!(outcomes[0].filename, "foo.md");
+        assert!(
+            outcomes[0].ok,
+            "install outcome must be ok: {}",
+            outcomes[0].detail
+        );
+
+        // The manifest now records ownership of `foo.md` even though
+        // the caller's stale State did not. This is the
+        // "replan from disk" half of the contract. The store
+        // keys the ownership map by the full filename (with
+        // `.md` extension), not the bare agent name.
+        assert!(
+            new_state.installed.contains_key("foo.md"),
+            "post-apply state must record `foo.md` for OpenCode"
+        );
+
+        // The agent landed on the destination side.
+        assert!(
+            paths.target_dir.join("foo.md").is_file(),
+            "agent must have been published under target_dir"
+        );
+    }
+
+    /// Per-target scope: a plan computed for `SyncTarget::OpenCode`
+    /// must NOT touch the Pi target directory or the Pi
+    /// ownership map, even when the Pi target is empty. The
+    /// mirror property holds in reverse. This pins the
+    /// per-harness isolation the Install/Update session relies
+    /// on.
+    #[test]
+    fn plan_then_apply_agents_safe_plan_is_scoped_to_the_bound_target_only() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        let checkout = dir.path().join("checkout");
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        paths.canonical_dir = checkout.join("agents");
+
+        // Source: one agent under canonical.
+        write_canonical_agent(&paths.canonical_dir, "foo", "source body");
+
+        // Both target dirs are missing — the planner must still
+        // produce a `NotInstalled` row for the bound target only.
+        let result = plan_then_apply_agents_safe(&paths, State::default(), SyncTarget::OpenCode)
+            .expect("replan + apply must succeed");
+        let (new_state, outcomes) =
+            result.expect("non-empty plan must produce Some((state, outcomes))");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].filename, "foo.md");
+
+        // OpenCode target received the agent.
+        assert!(
+            paths.target_dir.join("foo.md").is_file(),
+            "bound (OpenCode) target must receive the agent"
+        );
+        // Pi target directory must NOT have been touched.
+        assert!(
+            !paths.pi_target_dir.exists() || !paths.pi_target_dir.join("foo.md").exists(),
+            "other (Pi) target dir must not be touched"
+        );
+        // OpenCode manifest gains ownership, Pi manifest stays empty.
+        assert!(
+            new_state.installed.contains_key("foo.md"),
+            "bound target manifest must record ownership"
+        );
+        assert!(
+            !new_state.pi_installed.contains_key("foo.md"),
+            "other target manifest must not be touched"
+        );
+    }
+
+    /// Missing source fail-closed: when the configured canonical
+    /// source has been removed out-of-band, the workflow must
+    /// surface an explicit error from `load_canonical` BEFORE
+    /// reaching `plan_for` — a missing checkout must never
+    /// produce a phantom plan that `apply_safe` could otherwise
+    /// honor (e.g., a precomputed `Remove` row).
+    #[test]
+    fn plan_then_apply_agents_safe_fails_closed_when_canonical_source_missing() {
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        // A `Paths` whose canonical_dir parent is missing must
+        // surface an error before the planner runs.
+        paths.canonical_dir = dir.path().join("nope").join("agents");
+        let err = plan_then_apply_agents_safe(&paths, State::default(), SyncTarget::OpenCode)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not exist"),
+            "expected missing-source error from safe-install workflow, got: {err}"
+        );
+    }
+
+    // ---------- save_agent ----------
+
+    /// Build a fresh agent with valid body content for the
+    /// save-agent tests. Centralizes the description + prompt
+    /// seeding so each test only has to vary the rename /
+    /// prior-hash inputs.
+    fn material(name: &str) -> Agent {
+        let mut agent = Agent::new_default(name.to_string()).unwrap();
+        agent.description = "test description".to_string();
+        agent.prompt = "test prompt body".to_string();
+        agent
+    }
+
+    /// New agent (no `original_name`, no `prior_hash`): the
+    /// workflow must land the rendered material at
+    /// `<canonical_dir>/<name>.md` and return `target_name`.
+    /// No rename, no hash check; this is the "alta" path.
+    #[test]
+    fn save_agent_creates_new_canonical_when_no_original_name() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let target = material("helper");
+        let returned = save_agent(&paths, None, None, target).expect("new save must succeed");
+        assert_eq!(returned, "helper");
+        let path = paths.canonical_dir.join("helper.md");
+        assert!(path.is_file(), "new agent file must be created");
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            bytes.contains("test prompt body"),
+            "rendered body must be on disk"
+        );
+    }
+
+    /// Same name as the original (no rename), with a
+    /// `prior_hash` matching disk: the workflow must overwrite
+    /// the existing file with the new rendered material and
+    /// not touch any other file. This pins the "update"
+    /// branch of the workflow.
+    #[test]
+    fn save_agent_updates_existing_canonical_when_name_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        // Seed an existing agent on disk so the "update" path
+        // is meaningful (overwriting an existing file rather
+        // than creating a fresh one).
+        let existing = material("helper");
+        let path = paths.canonical_dir.join("helper.md");
+        std::fs::write(&path, existing.render()).unwrap();
+        let prior_hash = crate::store::hash_file(&path).unwrap();
+
+        // Update the prompt and save with the matching prior
+        // hash.
+        let mut updated = material("helper");
+        updated.prompt = "updated prompt body".to_string();
+        let returned = save_agent(
+            &paths,
+            Some("helper".to_string()),
+            prior_hash,
+            updated.clone(),
+        )
+        .expect("update must succeed");
+        assert_eq!(returned, "helper");
+        let bytes = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            bytes.contains("updated prompt body"),
+            "updated body must land on disk"
+        );
+        // No rename: source path == destination path; no
+        // sibling file.
+        assert!(
+            !paths.canonical_dir.join("helper.md").exists()
+                || paths.canonical_dir.join("helper.md") == path,
+            "no rename means no extra files"
+        );
+    }
+
+    /// Rename path: `original_name != target_name` with a
+    /// `prior_hash` matching disk. The workflow must rename
+    /// the source to the new name, write the rendered
+    /// material at the new path, and remove the old file.
+    /// The return value is the new name.
+    #[test]
+    fn save_agent_renames_when_name_changes_and_prior_hash_matches() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let existing = material("helper");
+        let old_path = paths.canonical_dir.join("helper.md");
+        std::fs::write(&old_path, existing.render()).unwrap();
+        let prior_hash = crate::store::hash_file(&old_path).unwrap();
+
+        // Save as `assistant` (different name).
+        let mut renamed = material("assistant");
+        renamed.prompt = "renamed body".to_string();
+        let returned = save_agent(
+            &paths,
+            Some("helper".to_string()),
+            prior_hash,
+            renamed.clone(),
+        )
+        .expect("rename + save must succeed");
+        assert_eq!(returned, "assistant");
+
+        // Old path gone, new path present with the new body.
+        assert!(
+            !old_path.exists(),
+            "old canonical file must be removed after rename"
+        );
+        let new_path = paths.canonical_dir.join("assistant.md");
+        assert!(new_path.is_file(), "new canonical file must exist");
+        let bytes = std::fs::read_to_string(&new_path).unwrap();
+        assert!(
+            bytes.contains("renamed body"),
+            "renamed body must land on disk"
+        );
+    }
+
+    /// Stale source without moving: the source file was
+    /// edited externally between open and save. The workflow
+    /// must surface the inline-style error
+    /// "`X` changed on disk since this edit started..." from
+    /// the rename branch. Crucially, the file must NOT be
+    /// renamed (the hash check happens before `rename_canonical`
+    /// is called). For a non-rename save, `save_canonical`
+    /// performs its own hash check and surfaces the same
+    /// error shape; this test exercises the rename branch.
+    #[test]
+    fn save_agent_rename_branch_rejects_when_source_hash_drifts() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        // Seed the source.
+        let existing = material("helper");
+        let old_path = paths.canonical_dir.join("helper.md");
+        std::fs::write(&old_path, existing.render()).unwrap();
+        // Capture the hash as it stood when the editor opened
+        // the file.
+        let prior_hash = crate::store::hash_file(&old_path).unwrap();
+
+        // External edit between open and save: rewrite the
+        // source with different bytes.
+        let mut external = material("helper");
+        external.prompt = "external body slipped in".to_string();
+        std::fs::write(&old_path, external.render()).unwrap();
+
+        // Attempt a rename — the workflow must bail before
+        // moving the file.
+        let renamed = material("assistant");
+        let err = save_agent(&paths, Some("helper".to_string()), prior_hash, renamed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("changed on disk"),
+            "expected stale-source error, got: {err}"
+        );
+        // Source file must NOT have been moved.
+        assert!(
+            old_path.exists(),
+            "stale-source bail must not rename the file"
+        );
+        assert!(
+            !paths.canonical_dir.join("assistant.md").exists(),
+            "destination must not be created when source drifts"
+        );
+    }
+
+    /// Destination occupied: renaming into a name whose
+    /// canonical file already exists must surface the
+    /// `"rename: "` prefixed error from `rename_canonical`
+    /// (verbatim: "cannot rename to `X`: file already exists").
+    /// The source file must remain in place.
+    #[test]
+    fn save_agent_rename_branch_rejects_when_destination_occupied() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        // Seed source: `helper.md`.
+        let source = material("helper");
+        let source_path = paths.canonical_dir.join("helper.md");
+        std::fs::write(&source_path, source.render()).unwrap();
+        let prior_hash = crate::store::hash_file(&source_path).unwrap();
+        // Seed destination: `assistant.md` already on disk.
+        let occupant = material("assistant");
+        let dest_path = paths.canonical_dir.join("assistant.md");
+        std::fs::write(&dest_path, occupant.render()).unwrap();
+        let dest_bytes_before = std::fs::read(&dest_path).unwrap();
+
+        // Attempt a rename into the occupied destination.
+        let renamed = material("assistant");
+        let err = save_agent(&paths, Some("helper".to_string()), prior_hash, renamed)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("rename: "),
+            "expected `rename: ` prefix, got: {err}"
+        );
+        assert!(
+            err.contains("file already exists"),
+            "expected destination-occupied error from rename_canonical, got: {err}"
+        );
+        // Source must still be in place (the rename never
+        // landed). Destination bytes unchanged (rename did
+        // not touch it).
+        assert!(
+            source_path.exists(),
+            "source must not be moved on a failed rename"
+        );
+        let dest_bytes_after = std::fs::read(&dest_path).unwrap();
+        assert_eq!(
+            dest_bytes_before, dest_bytes_after,
+            "destination bytes must not be touched on a failed rename"
+        );
+    }
+
+    // ---------- save_agent helpers ----------
+
+    /// `setup_paths_with_checkout` lives in the app-level test
+    /// module; we replicate a minimal version here so the
+    /// `save_agent` tests can land canonical files against a
+    /// real `<checkout>/agents/` directory (the same shape the
+    /// inline editor used). The two test modules are
+    /// independent — `workflows` does not pull from `app`'s
+    /// private tests.
+    fn setup_paths_with_checkout(dir: &TempDir) -> (Paths, std::path::PathBuf) {
+        let paths = Paths {
+            agenthd_root: dir.path().join(".agenthd"),
+            canonical_dir: dir.path().join(".agenthd").join("agents"),
+            state_file: dir.path().join(".agenthd").join("state.json"),
+            target_dir: dir.path().join(".config").join("opencode").join("agents"),
+            pi_target_dir: dir.path().join(".pi").join("agent").join("agents"),
+            skills_dir: dir.path().join(".config").join("opencode").join("skills"),
+            settings_file: dir.path().join(".agenthd").join("settings.json"),
+        };
+        let checkout = dir.path().join("checkout");
+        let agents = checkout.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let paths = Paths {
+            canonical_dir: agents.clone(),
+            ..paths
+        };
+        (paths, checkout)
     }
 }

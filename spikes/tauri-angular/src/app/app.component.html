@@ -1,0 +1,78 @@
+<main>
+  <h1>agenthd spike · D1 / Tauri + Angular</h1>
+  <p>
+    Read-only prototype. The frontend invokes two commands
+    (<code>settings_status</code>, <code>list_agents</code>)
+    against the agenthd library — no other surface. Carga al
+    abrir y refresco manual; sin auto-poll.
+  </p>
+
+  <section>
+    <header>
+      <h2>Settings</h2>
+      <button
+        type="button"
+        (click)="refreshSettings()"
+        [disabled]="settingsLoading()"
+      >
+        Refresh settings
+      </button>
+    </header>
+
+    @if (settingsError(); as err) {
+      <p class="error">{{ err }}</p>
+    } @else if (settings(); as s) {
+      <p><strong>{{ settingsLabel() }}</strong></p>
+      <dl class="kv">
+        @for (row of settingsDetails(); track row[0]) {
+          <dt>{{ row[0] }}</dt>
+          <dd>{{ row[1] }}</dd>
+        }
+      </dl>
+    } @else {
+      <p class="empty">No settings loaded yet.</p>
+    }
+  </section>
+
+  <section>
+    <header>
+      <h2>Agents</h2>
+      <button
+        type="button"
+        (click)="refreshAgents()"
+        [disabled]="agentsLoading()"
+      >
+        Refresh agents
+      </button>
+    </header>
+
+    @if (agentsError(); as err) {
+      <p class="error">{{ err }}</p>
+    } @else if (agents().length > 0) {
+      <ul class="agents">
+        @for (a of agents(); track a.name) {
+          <li>
+            <div>
+              <span class="name">{{ a.name }}</span>
+              <span class="meta">{{ a.mode }}</span>
+              @if (a.model) {
+                <span class="meta"> · {{ a.model }}</span>
+              }
+            </div>
+            @if (a.description) {
+              <div>{{ a.description }}</div>
+            }
+          </li>
+        }
+      </ul>
+    } @else {
+      <p class="empty">No agents loaded yet.</p>
+    }
+  </section>
+
+  <section>
+    <button type="button" (click)="refreshAll()" [disabled]="settingsLoading() || agentsLoading()">
+      Refresh both
+    </button>
+  </section>
+</main>

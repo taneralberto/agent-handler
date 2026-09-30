@@ -1,0 +1,35 @@
+# See https://docs.github.com/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
+
+# Angular compiled output
+/dist
+/tmp
+/out-tsc
+/bazel-out
+
+# Node
+/node_modules
+npm-debug.log
+yarn-error.log
+
+# Angular CLI caches
+/.angular/cache
+/connect.lock
+
+# Tauri-generated Tauri schemas (regenerated on build)
+/src-tauri/gen/schemas
+
+# Tauri Cargo target (compiled output)
+/src-tauri/target
+
+# Editor / IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.history/
+.DS_Store
+Thumbs.db
+
+# Cargo.lock for THIS spike está generado y versionado con
+# el spike (lockfile reproducible). El crate padre `agenthd`
+# es workspace member con su propia política de lockfile en
+# la raíz del repositorio.

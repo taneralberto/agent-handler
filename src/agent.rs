@@ -42,6 +42,14 @@ impl Mode {
             Mode::all => Mode::subagent,
         }
     }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Mode::subagent => Mode::all,
+            Mode::primary => Mode::subagent,
+            Mode::all => Mode::primary,
+        }
+    }
 }
 
 /// Permission action vocabulary. Matches the OpenCode SDK `PermissionAction`

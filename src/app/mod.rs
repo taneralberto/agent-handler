@@ -753,13 +753,20 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::starter_agent;
-    use crate::agent::STARTERS;
+    // The lib's `starter_fixture` is `#[cfg(test)]` and therefore
+    // absent from the bin's test build (cfg(test) does not propagate
+    // across crates). `src/main.rs` re-includes it as
+    // `crate::starter_fixture` under the same `#[cfg(test)]` gate, so
+    // these symbols come from there. The fixture itself imports
+    // `crate::agent::Agent` which resolves to the lib's `Agent` via
+    // the `pub use agenthd::agent` in `src/main.rs`.
+    use crate::starter_fixture::{starter_agent, STARTERS};
     // Editor-only helpers and the `EditorOp` enum live in the `editor`
     // child module; pull them in here so the existing editor / model
     // picker tests keep their direct call shapes.
     use crate::agent::{Mode, PermissionAction};
     use crate::store::{hash_file, save_canonical, Settings};
+    use crate::tools::{ToolItem, ToolStatus, DEFAULT_CATALOG};
     use editor::{edit_text_field, next_field, prev_field, EditorOp};
     use serde_json;
     use std::collections::BTreeMap;
@@ -2379,6 +2386,480 @@ mod tests {
                 assert!(items.is_empty());
             }
             screen => panic!("expected InstallUpdate selector, got {screen:?}"),
+        }
+    }
+
+    // ---------- Install/Update safe-install ordering (direct) ----------
+
+    /// Direct TUI test pinning the observable ordering of
+    /// `App::apply_safe_install`: when no harness is bound
+    /// (`target = None`) AND the canonical source has been
+    /// removed out-of-band, the status bar must carry the
+    /// canonical-load error (the "load_canonical runs before
+    /// the target guard" invariant) — not the "pick a harness
+    /// first" notice. The bound-target guard stays in the TUI;
+    /// on the no-target branch the TUI calls `load_canonical`
+    /// itself so the source-load error surfaces before the
+    /// guard's "pick a harness first" message.
+    #[test]
+    fn apply_safe_install_no_target_with_missing_source_reports_canonical_error() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Repoint `canonical_dir` at a directory that does not
+        // exist so `load_canonical` (called by the TUI's
+        // no-target `else` arm before the bound-target guard)
+        // fails closed with a "does not exist" error.
+        let mut paths = paths;
+        paths.canonical_dir = dir.path().join("does-not-exist").join("agents");
+        let mut app = App::new(paths, State::default());
+        // Open Install/Update and stay on the selector (no
+        // harness picked → `target = None`).
+        app.open_install_update();
+        match &app.screen {
+            Screen::InstallUpdate { target: None, .. } => {}
+            screen => panic!("expected InstallUpdate selector, got {screen:?}"),
+        }
+
+        app.apply_safe_install();
+
+        // The status bar must surface the canonical-load
+        // error, NOT "pick a harness first". This is the
+        // ordering invariant: on the no-target branch the
+        // TUI runs `load_canonical` before the bound-target
+        // guard so a missing source still surfaces its own
+        // error.
+        let status = app
+            .status_bar
+            .as_deref()
+            .expect("status_bar must be set on the fail-closed path");
+        assert!(
+            status.starts_with("error: "),
+            "expected canonical-load error in status_bar, got: {status}"
+        );
+        assert!(
+            status.contains("does not exist"),
+            "expected missing-source error from load_canonical, got: {status}"
+        );
+        assert!(
+            !status.contains("pick a harness first"),
+            "bound-target guard must NOT fire when load_canonical fails first, got: {status}"
+        );
+
+        // The screen must still be the Install/Update selector
+        // — the call must not have promoted to a list view.
+        match &app.screen {
+            Screen::InstallUpdate { target: None, .. } => {}
+            screen => panic!("expected selector to stay on screen, got {screen:?}"),
+        }
+        // No agent file landed under the OpenCode target dir.
+        assert!(
+            !fs::read_dir(&app.paths.target_dir)
+                .map(|rd| rd.count())
+                .unwrap_or(0)
+                > 0,
+            "no target_dir writes on the fail-closed path"
+        );
+    }
+
+    /// Direct TUI test pinning the bound-target guard on a
+    /// valid source: when the canonical checkout is fine but
+    /// no harness is bound (`target = None`), the status bar
+    /// must say `"pick a harness first"` (matching the
+    /// previous inline message bit-for-bit). This is the
+    /// mirror of the previous test: source valid + no
+    /// target → NoTarget path.
+    #[test]
+    fn apply_safe_install_no_target_with_valid_source_reports_pick_a_harness_first() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_install_update();
+        match &app.screen {
+            Screen::InstallUpdate { target: None, .. } => {}
+            screen => panic!("expected InstallUpdate selector, got {screen:?}"),
+        }
+
+        app.apply_safe_install();
+
+        let status = app
+            .status_bar
+            .as_deref()
+            .expect("status_bar must be set on the no-target path");
+        assert_eq!(
+            status, "pick a harness first",
+            "bound-target guard message must match the previous inline text"
+        );
+    }
+
+    // ---------- Tools screen (TUI focal tests) ----------
+
+    /// `App::open_tools` → `App::refresh_tools` reads
+    /// `crate::tools::DEFAULT_CATALOG` and asks
+    /// `crate::tools::tool_status` for each entry, populating
+    /// `Screen::Tools { entries, .. }`. With nothing pre-staged
+    /// on disk, every entry must read `NotInstalled` (the
+    /// pre-flight checks git/node/npm are NOT run here — they
+    /// only fire when the user actually presses `i`). This
+    /// pins the catalog → screen contract without invoking
+    /// the installer.
+    #[test]
+    fn tools_refresh_populates_entries_from_default_catalog_status_not_installed() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        // Ensure `skills_dir` exists; `tool_status` only does a
+        // `symlink_metadata` so a missing destination simply
+        // reports `NotInstalled`. No preflight / no spawn.
+        app.open_tools();
+        match &app.screen {
+            Screen::Tools {
+                entries, status, ..
+            } => {
+                assert_eq!(
+                    entries.len(),
+                    DEFAULT_CATALOG.len(),
+                    "screen must list every catalog entry"
+                );
+                for item in entries.iter() {
+                    assert_eq!(
+                        item.status,
+                        ToolStatus::NotInstalled,
+                        "no destination on disk → NotInstalled, got {:?} for {}",
+                        item.status,
+                        item.entry.skill_name
+                    );
+                }
+                assert!(
+                    status.is_none(),
+                    "no preflight error path on a clean skills_dir, got {status:?}"
+                );
+            }
+            screen => panic!("expected Tools screen, got {screen:?}"),
+        }
+        assert!(
+            app.status_bar.is_none(),
+            "no status_bar message on a clean refresh, got {:?}",
+            app.status_bar
+        );
+    }
+
+    /// `tool_status` is the only store-side touch `refresh_tools`
+    /// performs. Stage a directory at the catalog entry's
+    /// destination (`<skills_dir>/<destination_subpath>`) and
+    /// re-open the screen: the row must report `Installed` for
+    /// that entry, every other entry still reports
+    /// `NotInstalled`. This proves the screen reads status off
+    /// the filesystem without spawning anything.
+    #[test]
+    fn tools_refresh_status_reflects_filesystem_state_per_entry() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Stage one catalog entry on disk so its row flips to
+        // `Installed` after refresh.
+        let staged = paths
+            .skills_dir
+            .join(DEFAULT_CATALOG[0].destination_subpath);
+        std::fs::create_dir_all(&staged).unwrap();
+        let mut app = App::new(paths, State::default());
+        app.open_tools();
+        match &app.screen {
+            Screen::Tools { entries, .. } => {
+                assert_eq!(entries[0].status, ToolStatus::Installed);
+                assert_eq!(
+                    entries[0].destination, staged,
+                    "destination path must mirror the on-disk layout"
+                );
+                if entries.len() > 1 {
+                    for item in &entries[1..] {
+                        assert_eq!(
+                            item.status,
+                            ToolStatus::NotInstalled,
+                            "other catalog entries must remain NotInstalled"
+                        );
+                    }
+                }
+            }
+            screen => panic!("expected Tools screen, got {screen:?}"),
+        }
+    }
+
+    /// Conflict shape: a non-directory file at the destination
+    /// must read as `ToolStatus::Conflict` after refresh. This
+    /// pins the screen's filesystem-driven classification
+    /// without exercising `install_tool`.
+    #[test]
+    fn tools_refresh_status_reads_conflict_when_destination_is_a_file() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        // Plant a regular file at the destination.
+        let dest = paths
+            .skills_dir
+            .join(DEFAULT_CATALOG[0].destination_subpath);
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"not-a-directory").unwrap();
+        let mut app = App::new(paths, State::default());
+        app.open_tools();
+        match &app.screen {
+            Screen::Tools { entries, .. } => {
+                assert_eq!(entries[0].status, ToolStatus::Conflict);
+            }
+            screen => panic!("expected Tools screen, got {screen:?}"),
+        }
+    }
+
+    /// `tools_screen_install_target` is the pure dispatch
+    /// helper that decides whether the `i` key should fire the
+    /// installer. With `selected` pointing at a real entry it
+    /// returns `Some(selected)`; with `selected` out of range
+    /// it returns `None` so `handle_tools_key` can early-return
+    /// without invoking `install_tool`. Pin both arms directly
+    /// — no installer is invoked.
+    #[test]
+    fn tools_screen_install_target_returns_selected_when_in_range() {
+        let items: Vec<ToolItem> = (0..3)
+            .map(|_| ToolItem {
+                entry: &DEFAULT_CATALOG[0],
+                status: ToolStatus::NotInstalled,
+                detail: String::new(),
+                destination: std::path::PathBuf::new(),
+            })
+            .collect();
+        assert_eq!(
+            App::tools_screen_install_target(&items, 0),
+            Some(0),
+            "in-range selected must dispatch"
+        );
+        assert_eq!(
+            App::tools_screen_install_target(&items, 2),
+            Some(2),
+            "last in-range selected must dispatch"
+        );
+        assert_eq!(
+            App::tools_screen_install_target(&items, 3),
+            None,
+            "selected past the end must NOT dispatch"
+        );
+        assert_eq!(
+            App::tools_screen_install_target(&[], 0),
+            None,
+            "empty items must NOT dispatch"
+        );
+    }
+
+    /// Pressing `i` with `selected` past the end of `entries`
+    /// must early-return without touching the screen state or
+    /// invoking the installer. The dispatcher sets
+    /// `installing = true` only inside `install_selected_tool`;
+    /// an out-of-range selection never reaches that path, so
+    /// `installing` stays false and the screen stays on
+    /// `Screen::Tools`. `open_tools` populates one entry per
+    /// `DEFAULT_CATALOG` row; with the current catalog that is
+    /// a single row, so `selected = 99` is past the end and
+    /// the dispatch helper returns `None`.
+    #[test]
+    fn tools_i_key_with_out_of_range_selected_is_a_no_op() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_tools();
+        let entries_len = match &app.screen {
+            Screen::Tools { entries, .. } => entries.len(),
+            _ => panic!("expected Tools screen"),
+        };
+        assert!(
+            entries_len >= 1,
+            "test setup: catalog must populate at least one entry, got {entries_len}"
+        );
+        match &mut app.screen {
+            Screen::Tools { selected, .. } => {
+                *selected = entries_len + 100;
+            }
+            _ => panic!("expected Tools screen"),
+        }
+        app.handle_tools_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()));
+        match &app.screen {
+            Screen::Tools { installing, .. } => {
+                assert!(
+                    !*installing,
+                    "out-of-range `i` must not set installing=true"
+                );
+            }
+            screen => panic!("expected Tools screen to stay put, got {screen:?}"),
+        }
+    }
+
+    /// While `installing = true`, every key in the Tools
+    /// dispatch table (`Esc`, arrows, `i`, `r`) must be a no-op
+    /// — the dispatcher returns early before any arm runs, so
+    /// `installing` stays true and the screen state stays put.
+    /// This pins the "block dispatch while an install is
+    /// running so the user cannot queue more work or race the
+    /// spawn loop" invariant without running a real install.
+    #[test]
+    fn tools_keys_are_blocked_while_installing_flag_is_set() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_tools();
+        // Force `installing = true` as if a real
+        // `install_selected_tool` were mid-flight.
+        match &mut app.screen {
+            Screen::Tools {
+                entries,
+                selected,
+                installing,
+                ..
+            } => {
+                // Snapshot current state for assertions.
+                let entries_len = entries.len();
+                let before = (*selected, entries_len);
+                *installing = true;
+                for code in [
+                    KeyCode::Esc,
+                    KeyCode::Up,
+                    KeyCode::Down,
+                    KeyCode::Char('r'),
+                    KeyCode::Char('i'),
+                ] {
+                    app.handle_tools_key(KeyEvent::new(code, KeyModifiers::empty()));
+                    match &app.screen {
+                        Screen::Tools {
+                            selected: s,
+                            entries: es,
+                            installing: ins,
+                            ..
+                        } => {
+                            assert!(
+                                *ins,
+                                "installing must stay true while blocked, key={code:?}"
+                            );
+                            assert_eq!(
+                                (*s, es.len()),
+                                before,
+                                "selected/entries must not change while blocked, key={code:?}"
+                            );
+                        }
+                        screen => panic!(
+                            "screen must stay on Tools while blocked, got {screen:?} (key={code:?})"
+                        ),
+                    }
+                }
+            }
+            screen => panic!("expected Tools screen, got {screen:?}"),
+        }
+    }
+
+    /// `handle_event` filters out non-Press key kinds before
+    /// dispatching. A Release event for the same key that
+    /// would otherwise pop the Tools screen must be a no-op:
+    /// the screen stays on Tools, `status_bar` is untouched,
+    /// and no error is propagated. This pins the
+    /// Press-only-dispatch contract from `handle_event`.
+    #[test]
+    fn tools_release_event_is_filtered_before_dispatch() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_tools();
+        // Snapshot the screen so we can assert nothing
+        // changed after the Release event.
+        let before_screen = match &app.screen {
+            Screen::Tools {
+                entries, selected, ..
+            } => (entries.len(), *selected),
+            screen => panic!("expected Tools screen, got {screen:?}"),
+        };
+        let status_before = app.status_bar.clone();
+        // Build a Release event for `Esc` (would otherwise pop
+        // to the main menu).
+        let release = KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Release,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        // `handle_event` is private to `App`; the `app::tests`
+        // submodule has direct access.
+        app.handle_event(Event::Key(release))
+            .expect("Release event must not error");
+        match &app.screen {
+            Screen::Tools {
+                entries, selected, ..
+            } => {
+                assert_eq!(
+                    (entries.len(), *selected),
+                    before_screen,
+                    "Release event must not mutate the Tools screen"
+                );
+            }
+            screen => panic!("Release event must not pop Tools screen, got {screen:?}"),
+        }
+        assert_eq!(
+            app.status_bar, status_before,
+            "Release event must not touch status_bar"
+        );
+    }
+
+    /// Press event for the same key DOES dispatch: the
+    /// companion to the Release test. Pressing `Esc` from the
+    /// Tools screen pops back to the main menu. This makes the
+    /// Press-vs-Release distinction observable in the test
+    /// surface.
+    #[test]
+    fn tools_press_event_for_esc_pops_to_main_menu() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_tools();
+        let press = KeyEvent {
+            code: KeyCode::Esc,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        };
+        app.handle_event(Event::Key(press))
+            .expect("Press event must not error");
+        assert!(
+            matches!(app.screen, Screen::Main { .. }),
+            "Press Esc must pop to Main, got {:?}",
+            app.screen
+        );
+    }
+
+    /// Ctrl-C inside any screen (Tools included) must set
+    /// `quit = true` without changing the screen and without
+    /// erroring. The dispatch layer checks Ctrl-C before
+    /// routing by screen, so the screen the user was on at
+    /// the moment of Ctrl-C stays put. `quit` is a private
+    /// field on `App`; this test lives in the same module so
+    /// it can read it directly (no accessor).
+    #[test]
+    fn ctrl_c_from_tools_screen_returns_ok_and_leaves_screen_in_place() {
+        let dir = TempDir::new().unwrap();
+        let paths = setup_paths(&dir);
+        let mut app = App::new(paths, State::default());
+        app.open_tools();
+        match &app.screen {
+            Screen::Tools { .. } => {}
+            screen => panic!("expected Tools screen, got {screen:?}"),
+        }
+        assert!(!app.quit, "quit must be false before the dispatch runs");
+        // Ctrl-C dispatch is in `handle_key` (not
+        // `handle_event`), so build the key as the dispatcher
+        // sees it.
+        let result = app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            result.is_ok(),
+            "Ctrl-C dispatch must not error, got {result:?}"
+        );
+        assert!(
+            app.quit,
+            "Ctrl-C must set quit = true so the main loop exits"
+        );
+        match &app.screen {
+            Screen::Tools { .. } => {}
+            screen => panic!("Ctrl-C must not change the screen, got {screen:?}"),
         }
     }
 

@@ -25,10 +25,11 @@ use super::{
     border_style_for, centered_rect, panel, render_popup, selected_style, App, PendingDelete,
     Screen, ACCENT, MUTED, SURFACE,
 };
-use crate::agent::{Agent, Mode, PermissionAction, PERMISSION_KEYS};
+use crate::agent::{Agent, PermissionAction, PERMISSION_KEYS};
 use crate::models::{self, Discovery};
-use crate::store::{hash_file, rename_canonical, save_canonical, Paths};
-use anyhow::{anyhow, bail, Result};
+use crate::store::{hash_file, Paths};
+use crate::workflows::save_agent;
+use anyhow::{anyhow, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -952,39 +953,6 @@ impl App {
     }
 }
 
-/// Save an agent, performing a rename first if the name changed.
-///
-/// `prior_hash` is the SHA-256 captured when the editor opened the canonical
-/// file (or `None` for a new agent). It is passed straight through to
-/// `save_canonical` so an external edit made between open and save is
-/// rejected. Recomputing it here would defeat the check.
-fn save_agent(
-    paths: &Paths,
-    original_name: Option<String>,
-    prior_hash: Option<String>,
-    material: Agent,
-) -> Result<String> {
-    let target_name = material.name.clone();
-    let needs_rename = original_name
-        .as_ref()
-        .map(|o| o != &target_name)
-        .unwrap_or(false);
-    if needs_rename {
-        let old = original_name.clone().unwrap();
-        let source_path = paths.canonical_dir.join(format!("{}.md", old));
-        let current_hash = hash_file(&source_path)?;
-        if current_hash.as_deref() != prior_hash.as_deref() {
-            bail!(
-                "`{}` changed on disk since this edit started; reload to pick up the latest version",
-                source_path.display()
-            );
-        }
-        rename_canonical(paths, &old, &target_name).map_err(|e| anyhow!("rename: {}", e))?;
-    }
-    save_canonical(paths, &material, prior_hash.as_deref()).map_err(|e| anyhow!("save: {}", e))?;
-    Ok(target_name)
-}
-
 fn edit_prompt_externally(prompt: &str) -> Result<String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1072,14 +1040,4 @@ pub(super) fn prev_field(field: &mut EditorField, perm_len: usize) {
         EditorField::Permissions(0) => EditorField::Prompt,
         EditorField::Permissions(idx) => EditorField::Permissions(idx - 1),
     };
-}
-
-impl Mode {
-    pub(super) fn prev(self) -> Self {
-        match self {
-            Mode::subagent => Mode::all,
-            Mode::primary => Mode::subagent,
-            Mode::all => Mode::primary,
-        }
-    }
 }

@@ -44,13 +44,36 @@ the Settings screen or with `--repo <absolute>` on the next launch.
 ### `--repo` CLI override
 
 ```sh
-agenthd --repo <abs-path>   # point at a checkout (validated up front)
+agenthd --repo <abs-path>            # point at a checkout (validated up front)
+agenthd tui --repo <abs-path>        # explicit TUI mode (default)
+agenthd --repo <abs-path> tui        # --repo and mode keyword in either order
 ```
 
 `--repo` requires an absolute path. The path is validated up front so
 the user sees a clear error if the checkout is unusable. When the path
 is valid it is persisted to `settings.json` so subsequent launches
-agree with the user.
+agree with the user. The `--repo` value is rejected when it equals
+`tui` or `gui` so the parser never confuses the value with the mode
+keyword — matters when the user types `agenthd --repo tui` by
+accident.
+
+### Modes (TUI today, GUI planned)
+
+The binary accepts a single positional mode keyword:
+
+```sh
+agenthd                # default: TUI
+agenthd tui            # explicit TUI (same as default)
+agenthd gui            # GUI — not implemented yet (rejected before any side effects)
+```
+
+`gui` is reserved for the future GUI client (phase 5, behind D1).
+Until then, `agenthd gui` exits with code `2` and a clear stderr
+message; `settings.json`, `state.json`, and the OpenCode target tree
+are never touched. The parser is shared by every mode that lands, so
+`--repo` applies to both TUI and GUI in the same way — once the GUI
+client is implemented, `--repo` will persist through the same
+`settings.json` path the TUI uses today.
 
 ### Empty checkout
 

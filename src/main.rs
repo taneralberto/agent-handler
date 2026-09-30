@@ -1,10 +1,40 @@
-mod agent;
+// The shared library crate (`src/lib.rs`) is the single source of
+// truth for the UI-independent modules (`agent`, `launcher`,
+// `models`, `store`, `tools`, `workflows`). The binary crate does
+// NOT redeclare them with `mod` (that would double-compile every
+// test). Instead, the bin re-exports them at its own crate root
+// via `pub use agenthd::...`, so the `crate::store::*` /
+// `crate::workflows::*` / `crate::agent::*` paths inside `app/`
+// resolve to the lib's types — same path-based references, single
+// source of truth, no test duplication.
+//
+// The `app` module is TUI-only (ratatui / crossterm wiring,
+// `TerminalGuard`, panic hook, the `App::run` loop) and stays
+// declared locally with `mod app;` so it is not part of the
+// shared surface. It depends on `ratatui` / `crossterm`, which
+// the GUI candidate will replace.
+pub use agenthd::{agent, launcher, models, store, tools, workflows};
+
 mod app;
-mod launcher;
-mod models;
-mod store;
-mod tools;
-mod workflows;
+
+// Test-only fixture re-include. The binary's `app::tests` references
+// `STARTERS` / `starter_agent` (defined in the lib's
+// `src/agent/starter_fixture/mod.rs`). `cfg(test)` does not
+// propagate across crates: when `cargo test --bin agenthd` runs,
+// the bin is in `cfg(test)` but the lib is NOT, so the lib's
+// `#[cfg(test)]` items are absent from the bin's test build.
+// Re-include the fixture here, gated to `#[cfg(test)]` so the
+// production binary carries zero markdown bytes. The fixture
+// re-uses the same source as the lib's (single source of truth
+// for the markdown bytes), and the include_str paths to
+// `agents/*.md` resolve correctly because the fixture's depth
+// (one level under `src/agent/`) is preserved relative to this
+// `#[path]` declaration. Inside the fixture, `crate::agent::Agent`
+// resolves to the lib's `Agent` via the `pub use agenthd::agent`
+// at the top of this file.
+#[cfg(test)]
+#[path = "agent/starter_fixture/mod.rs"]
+mod starter_fixture;
 
 use anyhow::{Context, Result};
 use crossterm::execute;
@@ -16,7 +46,7 @@ use std::io;
 use std::panic;
 
 use crate::app::App;
-use crate::launcher::{resolve_checkout_path, ResolveOutcome};
+use crate::launcher::{parse_launch, resolve_checkout_path, Mode, ResolveOutcome};
 use crate::store::{Paths, Settings, State};
 
 struct TerminalGuard {
@@ -46,6 +76,32 @@ impl Drop for TerminalGuard {
 
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Parse argv into a launch plan before touching the filesystem
+    // or the persisted `settings.json`. The GUI mode is rejected
+    // here — implementation lives behind D1 / phase 5 — so a user
+    // typo or a `--repo` that collides with the mode keyword never
+    // produces side effects.
+    //
+    // `parse_launch` is the CLI-surface parser: it owns the mode
+    // keyword and the `--repo` value-shape validation that the
+    // boot path cares about (mode-keyword collision, absolute-path
+    // shape). The legacy override resolution path — the one that
+    // actually loads `settings.json` and persists the override —
+    // still re-parses argv through `parse_repo_override` inside
+    // `resolve_checkout_path` below. The two parsers are aligned
+    // for any input that passes `parse_launch`; the split is
+    // deliberate so the legacy persistence contract (the `--repo`
+    // wins / save-if-changed / first-wins-on-duplicates behaviour
+    // pinned by the launcher tests) is unchanged for the
+    // implemented TUI mode.
+    let plan = parse_launch(&args)?;
+    if plan.mode == Mode::Gui {
+        eprintln!(
+            "agenthd: GUI mode is not implemented yet; \
+             use `agenthd` or `agenthd tui` for now"
+        );
+        std::process::exit(2);
+    }
     let paths = Paths::from_env().context("resolve config paths")?;
     // `ensure_dirs` only creates the agenthd root (settings + state
     // parents) and the output target trees. It deliberately does NOT

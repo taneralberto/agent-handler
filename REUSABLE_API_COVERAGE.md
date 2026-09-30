@@ -151,6 +151,9 @@ another unit's test, or not at all.
 | `ApplyError::message` | `fn(&self) -> String` | partial | `apply_checkout_empty_input_is_rejected` *(workflows.rs)* asserts the `Empty` message string and `apply_checkout_relative_input_is_rejected_with_exact_prefix` *(workflows.rs)* asserts the `NotAbsolute` message string — only 2 of 5 variants are asserted via `err.message()`; the `Invalid`, `Save`, and `Revalidate` variants reach `err.message()` only in production code (`src/app/settings.rs:428`), with no Settings-screen test asserting the displayed string |
 | `apply_checkout` | `fn(&mut Paths, &str) -> Result<PathBuf, ApplyError>` | covered | `apply_checkout_empty_input_is_rejected`, `apply_checkout_relative_input_is_rejected_with_exact_prefix`, `apply_checkout_missing_path_is_rejected_without_persisting_or_mutating`, `apply_checkout_valid_path_persists_repoints_canonical_dir_and_does_not_create_dirs`, `apply_checkout_preserves_paths_on_failure` *(workflows.rs)* |
 | `list_canonical_agents` | `fn(&Paths) -> Result<Vec<Agent>>` | covered | `list_canonical_agents_sorts_by_name_regardless_of_on_disk_order`, `list_canonical_agents_empty_checkout_returns_empty_vec`, `list_canonical_agents_fails_closed_when_checkout_missing` *(workflows.rs)* |
+| `plan_then_apply_skills` | `fn(&Paths, State) -> Result<Option<(State, Vec<SkillOutcome>)>>` | covered | `plan_then_apply_skills_empty_plan_is_no_op_and_does_not_write`, `plan_then_apply_skills_replans_from_disk_even_when_caller_state_is_stale`, `plan_then_apply_skills_conflict_does_not_overwrite_target` *(workflows.rs)* |
+| `plan_then_apply_agents_safe` | `fn(&Paths, State, SyncTarget) -> Result<Option<(State, Vec<ApplyOutcome>)>>` | covered | `plan_then_apply_agents_safe_empty_plan_is_no_op_and_does_not_write`, `plan_then_apply_agents_safe_replans_from_disk_even_when_caller_state_is_stale`, `plan_then_apply_agents_safe_plan_is_scoped_to_the_bound_target_only`, `plan_then_apply_agents_safe_fails_closed_when_canonical_source_missing` *(workflows.rs)*; TUI regression in `app::tests::apply_safe_install_no_target_with_missing_source_reports_canonical_error`, `app::tests::apply_safe_install_no_target_with_valid_source_reports_pick_a_harness_first` *(app/mod.rs)* pins the `load_canonical → target guard` ordering through `App::apply_safe_install` |
+| `save_agent` | `fn(&Paths, Option<String>, Option<String>, Agent) -> Result<String>` (rename-then-save helper) | covered | `save_agent_creates_new_canonical_when_no_original_name`, `save_agent_updates_existing_canonical_when_name_unchanged`, `save_agent_renames_when_name_changes_and_prior_hash_matches`, `save_agent_rename_branch_rejects_when_source_hash_drifts`, `save_agent_rename_branch_rejects_when_destination_occupied` *(workflows.rs)* |
 
 ## `launcher` — `src/launcher.rs` (UI-independent boot path)
 
@@ -159,12 +162,22 @@ another unit's test, or not at all.
 | `resolve_checkout_path` | `fn(&Paths, &[String]) -> Result<ResolveOutcome>` | covered | `resolve_persisted_valid_returns_ready_without_override_flag`, `resolve_persisted_stale_returns_banner_with_exact_prior_suffix`, `resolve_persisted_absent_returns_first_run`, `resolve_persisted_malformed_settings_propagates_error`, `resolve_repo_override_takes_precedence_over_persisted_settings`, `resolve_repo_override_relative_path_errors_without_writing`, `resolve_repo_override_does_not_rewrite_settings_when_unchanged` *(launcher.rs)* |
 | `ResolveOutcome` | enum (Ready/StaleCheckout/FirstRun) | covered | same tests as above |
 | `parse_repo_override` | `fn(&[String]) -> Result<Option<PathBuf>>` | covered | `parse_repo_override_missing_value_is_an_error`, `parse_repo_override_ignores_positional_arguments`, plus the `resolve_repo_override_*` tests above |
+| `parse_launch` | `fn(&[String]) -> Result<LaunchPlan>` | covered | `parse_launch_no_args_defaults_to_tui_without_repo`, `parse_launch_explicit_tui_keyword`, `parse_launch_explicit_gui_keyword`, `parse_launch_repo_then_tui_preserves_path`, `parse_launch_tui_then_repo_preserves_path`, `parse_launch_repo_value_colliding_with_gui_keyword_is_an_error`, `parse_launch_repo_value_colliding_with_tui_keyword_is_an_error`, `parse_launch_repo_missing_value_is_an_error`, `parse_launch_repo_relative_path_is_an_error`, `parse_launch_conflicting_mode_keywords_is_an_error`, `parse_launch_ignores_unknown_positional_args`, `parse_launch_repo_path_and_tui_in_either_order`, `parse_launch_duplicate_repo_first_wins_and_still_validates_later` *(launcher.rs)*; integration end-to-end no-side-effect tests `agenthd_gui_rejects_with_clear_error_and_no_side_effects`, `agenthd_gui_with_repo_rejects_without_writing_settings` *(tests/cli_launch.rs)* |
+| `Mode` | enum (Tui/Gui) | covered | `parse_launch_*` tests above |
+| `LaunchPlan` | struct `{mode, repo}` | covered | `parse_launch_*` tests above |
 
 ## Network smoke (ignored)
 
 | Test | File | Notes |
 |---|---|---|
 | `real_install_pi_psql_against_remote` | `tests/tools_install_smoke.rs` | Runs `git ls-remote` / `git fetch` / `npm ci` against `https://github.com/taneralberto/pi-psql.git`. Gated `#[cfg(target_os = "linux")]` (the test binary does not even compile on Windows builds) and `#[ignore]` — does NOT run in `cargo test` on Linux. Network-dependent, so the smoke is opt-in: `cargo test --test tools_install_smoke -- --ignored --nocapture`. It is the only test that covers the live `install_tool` path end-to-end. |
+
+## CLI launch integration (D2 seam)
+
+| Test | File | Notes |
+|---|---|---|
+| `agenthd_gui_rejects_with_clear_error_and_no_side_effects` | `tests/cli_launch.rs` | Spawns the `agenthd` binary with isolated `HOME` / `XDG_CONFIG_HOME` and asserts `agenthd gui` exits with code `2`, prints a stderr line naming the GUI seam, and writes no `settings.json` / `state.json` / OpenCode target dir. Pins the "GUI rejects before any side effects" contract from `GUI_ROADMAP.md` D2. Runs by default (no `--ignored`). |
+| `agenthd_gui_with_repo_rejects_without_writing_settings` | `tests/cli_launch.rs` | Same harness with `agenthd gui --repo <abs-path>`. Asserts the rejection happens on `mode`, not on the path; the override cannot turn a future-mode rejection into a write. The pre-existing checkout on disk is left untouched (no agents/ contents added). Runs by default. |
 
 ## Summary of partial / untested rows
 

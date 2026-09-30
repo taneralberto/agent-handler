@@ -24,9 +24,9 @@
 
 use super::{panel, render_popup, selected_style, truncate, App, Screen, DANGER, SUCCESS};
 use crate::store::{
-    apply_safe, force_install, load_canonical, plan_for, ApplyOutcome, State, SyncItem, SyncStatus,
-    SyncTarget,
+    force_install, load_canonical, plan_for, ApplyOutcome, State, SyncItem, SyncStatus, SyncTarget,
 };
+use crate::workflows::plan_then_apply_agents_safe;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Style, Stylize};
@@ -436,12 +436,24 @@ impl App {
     }
 
     /// Apply all safe actions for the bound target only. The plan is
-    /// computed via `plan_for`, so the other harness's files and
-    /// ownership entries are guaranteed not to appear in `items`.
-    /// `apply_safe`'s cleanup pass is scoped to the targets present in
-    /// `items`, which is exactly the bound target here — the other
-    /// harness's ownership map is left untouched even if it contains
-    /// stale entries.
+    /// computed via `workflows::plan_then_apply_agents_safe`, which
+    /// owns `load_canonical → plan_for → empty-plan no-op →
+    /// apply_safe` end-to-end on the bound path. The TUI keeps its
+    /// `State::load` + `self.state` assignment, the bound-target
+    /// guard, and the post-apply `last_outcomes` / `status` /
+    /// refresh wiring; the bound-target guard runs first in the
+    /// TUI and, only if a target is bound, the workflow then runs
+    /// its `load_canonical → plan_for → …` sequence. The other
+    /// harness's files and ownership entries are guaranteed not to
+    /// appear in the plan; `apply_safe`'s cleanup pass is scoped to
+    /// the targets present in the items, which is exactly the bound
+    /// target here — the other harness's ownership map is left
+    /// untouched even if it contains stale entries.
+    ///
+    /// On the no-target path the TUI runs `load_canonical` once
+    /// on its own to preserve the original inline ordering
+    /// (source-load fail-closed surfaces before "pick a harness
+    /// first"), then reports the bound-target message.
     pub(super) fn apply_safe_install(&mut self) {
         let state = match State::load(&self.paths.state_file) {
             Ok(s) => s,
@@ -451,39 +463,43 @@ impl App {
             }
         };
         self.state = state;
-        // Fail closed: every canonical must parse cleanly.
-        if let Err(e) = load_canonical(&self.paths) {
-            self.status_bar = Some(format!("error: {}", e));
-            return;
-        }
-        let target = match &self.screen {
-            Screen::InstallUpdate {
-                target: Some(t), ..
-            } => *t,
-            _ => {
-                self.status_bar = Some("pick a harness first".to_string());
-                return;
-            }
-        };
-        // Recompute the plan from disk before any writes so we never
-        // act on stale items held in memory, and so the scope of the
-        // plan is unambiguous.
-        let plan = match plan_for(&self.paths, &self.state, target) {
-            Ok(p) => p,
-            Err(e) => {
+        // Resolve the bound target. The dispatcher routes
+        // `Op::Install` here only from `Screen::InstallUpdate`
+        // with `target.is_some()`, so the `else` arm is
+        // unreachable from the live UI; we fall back to
+        // `pick a harness first` rather than panicking so a
+        // future caller that forgets the screen guard still
+        // degrades to the same status the inline version
+        // produced.
+        let target = if let Screen::InstallUpdate {
+            target: Some(t), ..
+        } = &self.screen
+        {
+            *t
+        } else {
+            // No harness bound: run `load_canonical` once to
+            // preserve the original ordering (source-load
+            // fail-closed surfaces before the target guard),
+            // then map to the bound-target message. This is
+            // the only branch where the TUI calls
+            // `load_canonical` directly — the workflow is the
+            // single owner on the normal path.
+            if let Err(e) = load_canonical(&self.paths) {
                 self.status_bar = Some(format!("error: {}", e));
                 return;
             }
-        };
-        if plan.is_empty() {
-            // Empty plan is the safe no-op path: do not call apply_safe
-            // (which would still walk cleanup, even though no targets
-            // would qualify), and surface a clear message to the user.
-            self.status_bar = Some(format!("nothing to install for {}", target.label()));
+            self.status_bar = Some("pick a harness first".to_string());
             return;
-        }
-        match apply_safe(&self.paths, self.state.clone(), plan) {
-            Ok((state, outcomes)) => {
+        };
+        match plan_then_apply_agents_safe(&self.paths, self.state.clone(), target) {
+            Ok(None) => {
+                // Empty plan is the safe no-op path: the workflow
+                // did not call `apply_safe` (which would still walk
+                // cleanup, even though no targets would qualify),
+                // and the TUI surfaces a clear message to the user.
+                self.status_bar = Some(format!("nothing to install for {}", target.label()));
+            }
+            Ok(Some((state, outcomes))) => {
                 self.state = state;
                 let succeeded: usize = outcomes.iter().filter(|o| o.ok).count();
                 let failed: usize = outcomes.iter().filter(|o| !o.ok).count();

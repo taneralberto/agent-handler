@@ -1,0 +1,62 @@
+[package]
+name = "agenthd-tauri-angular-spike"
+version = "0.1.0"
+description = "D1 spike: Tauri v2 + Angular prototype that depends on the agenthd library by path."
+authors = ["agenthd spike"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "agenthd_tauri_angular_spike_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Single source of truth: this crate depends on the agenthd
+# library by path, so the lib crate (src/lib.rs in the parent
+# workspace) is the only place store/workflows/agent/launcher
+# definitions live. The Tauri prototype reuses them through
+# `agenthd::...` paths. No duplication of types or logic.
+#
+# Path is relative to THIS Cargo.toml. From
+# `spikes/tauri-angular/src-tauri/` we need to climb three
+# levels to reach the agenthd package root (which owns
+# `src/lib.rs`).
+agenthd = { path = "../../.." }
+
+# Tauri v2 itself — only the core runtime. No plugins enabled
+# by default; the prototype declares just enough capabilities
+# for the read-only commands below (no fs / no shell / no
+# dialog / no opener). Anything that would mutate the host
+# filesystem or spawn processes is intentionally absent.
+tauri = { version = "2", features = [] }
+
+# We re-export a few agenthd types to the frontend via serde.
+# The lib already pulls `serde` and `serde_json`; this crate
+# declares them explicitly because we also `#[derive(Serialize)]`
+# on the small projection structs we expose to the frontend.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Focals for the two read-only commands build `Paths`
+# inside a `tempfile::TempDir` (the same pattern the lib
+# `agenthd` tests use). We do not mutate `HOME` /
+# `XDG_CONFIG_HOME`; we explicitly pass both into
+# `Paths::resolve`. The spike stays env-pure.
+tempfile = "3"
+
+# Read more about the optimization guideline for more details:
+# https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

@@ -1,0 +1,109 @@
+/* Minimal CSS for the D1 spike. No external dependencies,
+   no font loads, no remote assets — the spike is meant to
+   show two read-only screens with the least ceremony. */
+
+:root {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    sans-serif;
+  color-scheme: light dark;
+}
+
+body {
+  margin: 0;
+  padding: 1rem;
+  background: Canvas;
+  color: CanvasText;
+}
+
+main {
+  max-width: 60rem;
+  margin: 0 auto;
+}
+
+section {
+  margin-bottom: 1.5rem;
+  padding: 1rem;
+  border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+  border-radius: 0.5rem;
+}
+
+section header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+section header h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.25rem 0.75rem;
+  border: 1px solid color-mix(in srgb, CanvasText 30%, transparent);
+  border-radius: 0.375rem;
+  background: ButtonFace;
+  color: ButtonText;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.kv {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875rem;
+}
+
+.kv dt {
+  color: color-mix(in srgb, CanvasText 70%, transparent);
+}
+
+.kv dd {
+  margin: 0;
+  word-break: break-all;
+}
+
+ul.agents {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+ul.agents li {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+  border-radius: 0.375rem;
+}
+
+ul.agents .name {
+  font-weight: 600;
+  margin-right: 0.5rem;
+}
+
+ul.agents .meta {
+  font-size: 0.8rem;
+  color: color-mix(in srgb, CanvasText 65%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.error {
+  color: #b00020;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}
+
+.empty {
+  color: color-mix(in srgb, CanvasText 65%, transparent);
+  font-style: italic;
+}

@@ -2,10 +2,29 @@
 //!
 //! Owns the boot-path pieces of `agenthd` that are UI-independent:
 //!
-//! - [`parse_repo_override`]: the optional `agenthd --repo <absolute
-//!   path>` flag. Positional args are ignored.
+//! - [`parse_launch`]: CLI-surface parser. Parses `argv` into a
+//!   [`LaunchPlan`] (`Mode` + optional `--repo` override) and is
+//!   the parser the boot path uses to reject the GUI mode before
+//!   any side effect. Unknown positional args are ignored (pre-D2
+//!   tolerance). `--repo` value is rejected when it collides with
+//!   a mode keyword; the value must be an absolute path; the first
+//!   `--repo` wins on duplicates.
+//! - [`parse_repo_override`]: legacy override reader used by
+//!   [`resolve_checkout_path`] for the override / persistence
+//!   branch. It re-parses argv for the *resolution* step (where
+//!   the path is validated against the checkout workflow and,
+//!   when it differs from `settings.json`, persisted). This is the
+//!   second parser that sees argv on the boot path; the split is
+//!   intentional — `parse_launch` owns the CLI surface, while
+//!   `parse_repo_override` is the reader the legacy persistence
+//!   contract (save-if-changed, first-wins-on-duplicates) was
+//!   pinned against. The two parsers are aligned for any argv
+//!   that passes `parse_launch` (mode-keyword collision in
+//!   particular is rejected before `resolve_checkout_path` ever
+//!   runs, so `parse_repo_override` never sees `--repo tui`/
+//!   `--repo gui` in normal flow).
 //! - [`ResolveOutcome`] / [`resolve_checkout_path`]: classify the
-//!   configured checkout for the binary. The function reads through
+//!   configured checkout. Reads through
 //!   [`crate::workflows::read_checkout`] so the boot path and the
 //!   in-app Settings screen agree on what "valid / stale / missing"
 //!   means. `--repo` overrides the persisted value and (when it
@@ -100,6 +119,111 @@ pub enum ResolveOutcome {
     FirstRun,
 }
 
+/// UI mode keyword selected by the user via `argv`. `Tui` is the
+/// only implemented mode today; `Gui` exists so [`parse_launch`]
+/// has a single parser for the CLI surface and is rejected by the
+/// boot path before any side effects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Tui,
+    Gui,
+}
+
+/// Output of [`parse_launch`]: the parsed mode and the optional
+/// `--repo` override. Persistence is owned by
+/// [`resolve_checkout_path`] and unchanged for `Tui`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPlan {
+    pub mode: Mode,
+    pub repo: Option<PathBuf>,
+}
+
+/// Parse `argv` into a [`LaunchPlan`].
+///
+/// Recognized tokens:
+///
+/// - `tui` / `gui` — mode keyword. The first occurrence wins; a
+///   later conflicting keyword is an error so a typo (e.g. `gii`)
+///   cannot silently flip the mode. Unknown positional args are
+///   ignored to preserve the pre-D2 tolerance.
+/// - `--repo <value>` — overrides the configured checkout. The
+///   next token is consumed as the value. The value is rejected
+///   when it equals `tui` or `gui` (mode-keyword collision, checked
+///   before the absolute-path check so the user sees the most
+///   specific reason). The value must be an absolute path. The
+///   **first** `--repo` wins on duplicates — matches the legacy
+///   [`parse_repo_override`] / [`resolve_checkout_path`] contract,
+///   so `parse_launch` is the single source of truth for argv.
+///
+/// `parse_launch` does NOT touch the filesystem and does NOT
+/// persist anything; persistence is the caller's job, gated on
+/// the parsed mode.
+pub fn parse_launch(args: &[String]) -> Result<LaunchPlan> {
+    let mut mode: Option<Mode> = None;
+    let mut repo: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--repo" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--repo requires an absolute path argument"))?;
+                match value.as_str() {
+                    "tui" | "gui" => {
+                        anyhow::bail!(
+                            "--repo value `{value}` is a mode keyword; \
+                             pass the absolute path before or after the mode"
+                        );
+                    }
+                    _ => {}
+                }
+                let candidate = PathBuf::from(value);
+                if !candidate.is_absolute() {
+                    anyhow::bail!(
+                        "--repo path `{}` must be an absolute path",
+                        candidate.display()
+                    );
+                }
+                // First `--repo` wins: matches `parse_repo_override`
+                // and keeps the legacy persistence contract intact.
+                if repo.is_none() {
+                    repo = Some(candidate);
+                }
+                i += 2;
+            }
+            "tui" => {
+                set_mode(&mut mode, Mode::Tui, args[i].as_str())?;
+                i += 1;
+            }
+            "gui" => {
+                set_mode(&mut mode, Mode::Gui, args[i].as_str())?;
+                i += 1;
+            }
+            _ => {
+                // Unknown positional: ignored (pre-D2 tolerance).
+                i += 1;
+            }
+        }
+    }
+    Ok(LaunchPlan {
+        mode: mode.unwrap_or(Mode::Tui),
+        repo,
+    })
+}
+
+fn set_mode(slot: &mut Option<Mode>, next: Mode, token: &str) -> Result<()> {
+    match *slot {
+        None => {
+            *slot = Some(next);
+            Ok(())
+        }
+        Some(prev) if prev == next => Ok(()),
+        Some(_) => Err(anyhow::anyhow!(
+            "conflicting mode keyword `{token}` in argv"
+        )),
+    }
+}
+
 /// Parse the optional `agenthd --repo <absolute path>` flag.
 /// Positional args are ignored.
 pub fn parse_repo_override(args: &[String]) -> Result<Option<PathBuf>> {
@@ -133,6 +257,15 @@ mod tests {
     //! boot path relies on. Tests construct a `Paths` through
     //! `Paths::resolve` (no global env mutation) and write
     //! `settings.json` inside a `TempDir`.
+    //!
+    //! `parse_launch` tests pin the CLI parser contract that closes
+    //! D2: mode default (Tui), explicit `tui` / `gui`, both
+    //! `--repo path mode` and `mode --repo path` orderings,
+    //! `--repo` missing value, `--repo` colliding with a mode
+    //! keyword, conflicting mode keywords, unknown positional
+    //! tolerance, and a non-absolute `--repo` value rejection.
+    //! These are pure unit tests — `parse_launch` does not touch
+    //! the filesystem.
 
     use super::*;
     use crate::store::{save_settings, Settings};
@@ -433,6 +566,237 @@ mod tests {
         assert_eq!(
             on_disk,
             Settings::new(checkout.to_string_lossy().into_owned())
+        );
+    }
+
+    // ---------- parse_launch (D2 seam) ----------
+
+    /// No argv: the CLI surface defaults to TUI with no override.
+    /// Pre-D2 callers relied on this exact shape.
+    #[test]
+    fn parse_launch_no_args_defaults_to_tui_without_repo() {
+        let plan = parse_launch(&empty_args()).unwrap();
+        assert_eq!(
+            plan,
+            LaunchPlan {
+                mode: Mode::Tui,
+                repo: None,
+            }
+        );
+    }
+
+    /// Explicit `tui` keyword: same default as no args, but the
+    /// parser still has to acknowledge the keyword.
+    #[test]
+    fn parse_launch_explicit_tui_keyword() {
+        let plan = parse_launch(&["tui".to_string()]).unwrap();
+        assert_eq!(
+            plan,
+            LaunchPlan {
+                mode: Mode::Tui,
+                repo: None,
+            }
+        );
+    }
+
+    /// Explicit `gui` keyword: the parser accepts it (caller
+    /// rejects before side effects); the plan must carry the
+    /// future-mode value.
+    #[test]
+    fn parse_launch_explicit_gui_keyword() {
+        let plan = parse_launch(&["gui".to_string()]).unwrap();
+        assert_eq!(
+            plan,
+            LaunchPlan {
+                mode: Mode::Gui,
+                repo: None,
+            }
+        );
+    }
+
+    /// `--repo path` first, then `tui`: both orderings must parse
+    /// identically and the path must NOT be confused with the mode.
+    #[test]
+    fn parse_launch_repo_then_tui_preserves_path() {
+        let dir = TempDir::new().unwrap();
+        let checkout = dir.path().join("checkout");
+        let args = vec![
+            "--repo".to_string(),
+            checkout.to_string_lossy().into_owned(),
+            "tui".to_string(),
+        ];
+        let plan = parse_launch(&args).unwrap();
+        assert_eq!(plan.mode, Mode::Tui);
+        assert_eq!(plan.repo, Some(checkout));
+    }
+
+    /// `tui` first, then `--repo path`: mirror of the prior test;
+    /// the mode keyword must not consume the path.
+    #[test]
+    fn parse_launch_tui_then_repo_preserves_path() {
+        let dir = TempDir::new().unwrap();
+        let checkout = dir.path().join("checkout");
+        let args = vec![
+            "tui".to_string(),
+            "--repo".to_string(),
+            checkout.to_string_lossy().into_owned(),
+        ];
+        let plan = parse_launch(&args).unwrap();
+        assert_eq!(plan.mode, Mode::Tui);
+        assert_eq!(plan.repo, Some(checkout));
+    }
+
+    /// `--repo gui`: the value slot accidentally contains a mode
+    /// keyword. The parser must reject this so the value is never
+    /// confused with the mode. Pre-D2 callers could not trip this
+    /// because there was no mode keyword; post-D2 the guard pins
+    /// the contract.
+    #[test]
+    fn parse_launch_repo_value_colliding_with_gui_keyword_is_an_error() {
+        let args = vec!["--repo".to_string(), "gui".to_string()];
+        let err = parse_launch(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("mode keyword"),
+            "mode-keyword collision error must surface, got: {err}"
+        );
+    }
+
+    /// `--repo tui`: mirror of the prior test for the TUI keyword.
+    #[test]
+    fn parse_launch_repo_value_colliding_with_tui_keyword_is_an_error() {
+        let args = vec!["--repo".to_string(), "tui".to_string()];
+        let err = parse_launch(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("mode keyword"),
+            "mode-keyword collision error must surface, got: {err}"
+        );
+    }
+
+    /// `--repo` at the end of argv without a value: same error
+    /// pre-D2 callers relied on.
+    #[test]
+    fn parse_launch_repo_missing_value_is_an_error() {
+        let args = vec!["--repo".to_string()];
+        let err = parse_launch(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("--repo requires an absolute path argument"),
+            "missing-value error must match the pre-D2 contract, got: {err}"
+        );
+    }
+
+    /// `--repo <relative>`: still rejected; pre-D2 contract holds.
+    #[test]
+    fn parse_launch_repo_relative_path_is_an_error() {
+        let args = vec!["--repo".to_string(), "relative/path".to_string()];
+        let err = parse_launch(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("must be an absolute path"),
+            "absolute-path error must surface, got: {err}"
+        );
+    }
+
+    /// `tui gui`: the parser refuses to silently pick one. The
+    /// contract pins a user-facing error.
+    #[test]
+    fn parse_launch_conflicting_mode_keywords_is_an_error() {
+        let args = vec!["tui".to_string(), "gui".to_string()];
+        let err = parse_launch(&args).unwrap_err().to_string();
+        assert!(
+            err.contains("conflicting mode keyword"),
+            "conflicting-mode error must surface, got: {err}"
+        );
+    }
+
+    /// Unknown positional args are ignored, matching pre-D2
+    /// tolerance. A lone positional must not flip the mode.
+    #[test]
+    fn parse_launch_ignores_unknown_positional_args() {
+        let args = vec![
+            "some-positional".to_string(),
+            "/another".to_string(),
+            "tui".to_string(),
+        ];
+        let plan = parse_launch(&args).unwrap();
+        assert_eq!(plan.mode, Mode::Tui);
+        assert_eq!(plan.repo, None);
+    }
+
+    /// The `--repo` value must not be confused with the mode
+    /// keyword across both orderings when both happen to be on the
+    /// command line. This is the integration-level guard against
+    /// the value/mode confusion the parser promises.
+    #[test]
+    fn parse_launch_repo_path_and_tui_in_either_order() {
+        let dir = TempDir::new().unwrap();
+        let checkout = dir.path().join("checkout");
+
+        // Order A: mode first.
+        let a = vec![
+            "tui".to_string(),
+            "--repo".to_string(),
+            checkout.to_string_lossy().into_owned(),
+        ];
+        let plan_a = parse_launch(&a).unwrap();
+        assert_eq!(
+            plan_a,
+            LaunchPlan {
+                mode: Mode::Tui,
+                repo: Some(checkout.clone()),
+            }
+        );
+
+        // Order B: --repo first.
+        let b = vec![
+            "--repo".to_string(),
+            checkout.to_string_lossy().into_owned(),
+            "tui".to_string(),
+        ];
+        let plan_b = parse_launch(&b).unwrap();
+        assert_eq!(
+            plan_b,
+            LaunchPlan {
+                mode: Mode::Tui,
+                repo: Some(checkout),
+            }
+        );
+    }
+
+    /// Duplicate `--repo`: the FIRST wins. This matches the legacy
+    /// `parse_repo_override` contract used by `resolve_checkout_path`,
+    /// so `parse_launch` is the single source of truth — the plan's
+    /// `repo` is always the path the persistence layer will use.
+    /// Validates on every occurrence (no shortcut on later ones) so
+    /// a bad second value still surfaces its own error.
+    #[test]
+    fn parse_launch_duplicate_repo_first_wins_and_still_validates_later() {
+        let dir = TempDir::new().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+
+        // Two absolute paths: first wins, second is ignored.
+        let plan = parse_launch(&[
+            "--repo".to_string(),
+            first.to_string_lossy().into_owned(),
+            "--repo".to_string(),
+            second.to_string_lossy().into_owned(),
+        ])
+        .unwrap();
+        assert_eq!(plan.repo, Some(first));
+
+        // First absolute, second relative: first still wins; the
+        // second's relative-path error still surfaces because we
+        // validate on every occurrence.
+        let err = parse_launch(&[
+            "--repo".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+            "--repo".to_string(),
+            "relative/path".to_string(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("must be an absolute path"),
+            "later duplicate still validates, got: {err}"
         );
     }
 }
