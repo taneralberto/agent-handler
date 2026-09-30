@@ -1,10 +1,17 @@
 # Spike D1 / Tauri v2 + Angular — Evidencia observada
 
-Recopilado durante la etapa 2 del spike D1, en este host
-(Linux genérico, no Arch específica). **Esta es la verdad
-ejecutada, no una proyección de lo que debería pasar.** Las
-verificaciones que terminan con `OK` se corrieron de verdad;
-las que terminan con `N/A` no se aplicaron a este host.
+Recopilado durante la etapa 2 del spike D1. Las
+verificaciones del cuerpo de este documento se ejecutaron
+en host **Linux genérico** (no Arch específica) y son la
+**verdad ejecutada**, no una proyección de lo que debería
+pasar: las verificaciones que terminan con `OK` se corrieron
+de verdad; las que terminan con `N/A` no se aplicaron a ese
+host. Tras la elección del usuario sobre D1, se añadió una
+corrida posterior en host **Windows 11 con MSYS** cuyo
+registro (smoke parcial) vive en "Observaciones Windows 11
+MSYS" más abajo — **no** sustituye ni contradice las
+observaciones Linux; agrega lo que ese nuevo host permite
+atestiguar sin afirmar lo que no atestigua.
 
 ## Plantilla oficial inspeccionada (sin instalar sistema)
 
@@ -94,7 +101,7 @@ Ejecutadas en `spikes/tauri-angular/src-tauri/`:
 | Check | Comando | Resultado REAL |
 |---|---|---|
 | Compilación lib | `cargo check` | **OK** |
-| Compilación binario | `cargo build` | **OK** (2.64s; binario 193 MB debug en `target/debug/agenthd-tauri-angular-spike`) |
+| Compilación binario | `cargo build` | **OK** (2.64s; binario 193 MB debug en `target/debug/agenthd-tauri-angular-spike` — nombre histórico del binario en ese pase de Linux; el binario pasó después a llamarse `agenthd-gui` vía `[[bin]]` en `src-tauri/Cargo.toml`, pero la observación aquí registrada es la del momento del pase y no se reescribe) |
 | Tests focales | `cargo test --lib` | **OK**: 8/8 tests pasan (ver detalle abajo) |
 | Clippy | `cargo clippy --lib --tests` | **Sin warnings nuevos del spike** (solo los 3 warnings pre-existentes del lib `agenthd`) |
 
@@ -147,9 +154,14 @@ verificación queda para Fase 6 de empaquetado.
   Windows 10). El bin necesita MSVC toolchain. El spike
   ya genera `main.rs` con
   `#![cfg_attr(not(debug_assertions), windows_subsystem =
-  "windows")]`.
+  "windows")]`. WebView2 runtime **observado instalado** en
+  el host Windows 11 MSYS de la corrida posterior — ver
+  "Observaciones Windows 11 MSYS" más abajo. Esa corrida
+  **no** verifica IPC end-to-end ni visualización real:
+  enumera handles de ventana del proceso vía
+  `Get-Process` y nada más.
 
-## Pros y contras observables (D1 sigue abierto)
+## Pros y contras observables (D1 cerrado por elección del usuario)
 
 **Pros** (evidencia directa de este spike):
 
@@ -182,10 +194,257 @@ verificación queda para Fase 6 de empaquetado.
   independiente).
 - Compatibilidad cross-platform no validada en Arch /
   Windows en este host (queda para Fase 6 de empaquetado;
-  **NO es gate de D1** — D1 se cierra con la comparación
-  de evidencia + limitaciones honestas registradas + la
-  aceptación del usuario; Arch/Windows reales entran al
+  **NO es gate de D1** — el cierre de D1 observado fue
+  por elección explícita del usuario apoyada en este
+  spike (scaffold reproducible, 8/8 tests focales del
+  backend, lockfiles generados y versionados con el
+  spike, lockfile doble, dependencia cruzada por path,
+  pros/contras observables) más las limitaciones
+  honestas registradas, sin comparación factual con el
+  resto de candidatos; Arch/Windows reales entran al
   gate de Fase 6, no al gate D1).
+
+## Observaciones Windows 11 MSYS
+
+Smoke parcial registrado tras la elección del usuario sobre
+D1, en host **Windows 11 con MSYS** y toolchain Rust
+`x86_64-pc-windows-msvc`. **No** es una verificación
+end-to-end del runtime gráfico ni del IPC JS↔Rust — ver
+"Limitaciones honestas" para el conjunto completo de lo que
+**no** se demuestra. Esta sección registra lo atestiguado
+en esa corrida sin reinterpretar lo del host Linux.
+
+### Entorno verificado en este host
+
+- **Host:** Windows 11 con MSYS.
+- **Toolchain Rust:** `x86_64-pc-windows-msvc`.
+- `node` **v24.16.0**, `npm` **12.0.1**, `cargo` **1.98.1**.
+- **WebView2 runtime:** observado instalado en este host
+  (Windows 11 incluye WebView2 Evergreen Runtime por
+  defecto; en Windows 10 sería instalable por separado).
+
+### Verificaciones frontend / backend (smoke parcial)
+
+| Check | Comando | Resultado REAL |
+|---|---|---|
+| Lockfile reproducible | `npm ci --no-audit --no-fund` | **OK**: 218 paquetes instalados desde lockfile, con warnings de `install-scripts` blocked (observación documental, no afecta al smoke del frontend) |
+| Build Angular | `npm run build` | **OK**: bundle **116.20 kB initial / 34.81 kB transfer** en `dist/agenthd-tauri-angular-spike/browser/`. Distinto del tamaño observado en Linux (209 KB initial / 57 KB gzipped) — la causa de la diferencia **no se establece** en este spike |
+| Tests focales backend | `cargo test --lib` | **OK**: 8/8 tests pasan en Windows (target `x86_64-pc-windows-msvc`), mismos nombres y misma semántica que en Linux |
+
+### Smoke de `npm run tauri dev`
+
+- `npm run tauri dev` arrancó el dev server en
+  `127.0.0.1:14720`, compiló el binario y lo lanzó.
+- `PowerShell Get-Process` a los **12 s** del arranque
+  observó para el proceso:
+  - `MainWindowHandle = 656192`
+  - título `agenthd spike (D1 / Tauri + Angular)` (título
+    observado en esa corrida; el branding posterior
+    renombró la ventana a `agenthd GUI`, pero la
+    observación aquí registrada es la del momento del
+    smoke y no se reescribe)
+  - `PID 11624`
+- La ejecución timed fue **interrumpida a los 55 s** (exit
+  143 / SIGTERM). Durante esa ventana **no se observó
+  contenido Angular ni respuesta IPC**: no se invocó
+  `settings_status` ni `list_agents` desde el WebView2 con
+  respuesta observable, no se inspeccionó el DOM, no se
+  tomó screenshot.
+- Un retry anterior **falló con `HRESULT 0x800700AA`
+   (`ERROR_BUSY`, "resource in use")** tras un run timed
+   previo; el run posterior creó el window handle documentado
+   arriba. La causa del `ERROR_BUSY` en el retry inicial
+   **no se establece** en este spike; queda como observación
+   sin atribuir.
+
+### Lo que este smoke **NO** demuestra
+
+- **No** demuestra que Arch o Windows estén empaquetados
+  (queda para Fase 6; el spike es un scaffold reproducible,
+  no un artefacto firmado por plataforma).
+- **No** demuestra IPC end-to-end: ningún `invoke(
+  'settings_status')` ni `invoke('list_agents')` desde
+  Angular con respuesta observable del backend fue
+  registrado durante la ventana de 55 s.
+- **No** demuestra visualización real **desde la
+  perspectiva del agente**: `Get-Process` solo enumera
+  el handle de ventana del proceso; el contenido del
+  WebView2, los eventos de IPC, o que Angular cargara
+  y mostrara Settings / Agents siguen **sin observación
+  directa** por parte del agente (sin screenshot, sin
+  inspección del DOM, sin captura de payloads IPC, sin
+  apertura de devtools, sin inspección de red). El
+  usuario, **por separado**, reportó manualmente que
+  Settings y Agents aparecen y que Refresh both
+  actualiza — esa confirmación está documentada en
+  "Verificación manual user-reported" más abajo y
+  **no** es instrumentación del agente.
+- **No** declara la GUI lista para producción.
+
+### Verificación manual user-reported (no instrumentada por el agente)
+
+Tras el smoke registrado arriba, el **usuario** abrió
+`npm run tauri dev` en un escritorio Windows 11
+interactivo y reportó manualmente, en respuesta a la
+solicitud del agente ("confirma visualmente Settings /
+Agents y Refresh both"), lo siguiente sobre esa sesión:
+
+- **Settings aparece** en la GUI.
+- **Agents aparece** en la GUI.
+- **Refresh both** (etiqueta del botón en el
+  `AppComponent` del spike) **actualiza** ambos
+  paneles.
+
+Esta verificación es **user-reported, manual, no
+independientemente instrumentada ni capturada por el
+agente** durante esa corrida. El agente no operó la
+ventana, no tomó screenshots, no inspeccionó el DOM,
+no capturó payloads de IPC, no abrió devtools, no
+observó tráfico de red, ni verificó el contenido
+específico mostrado en cada panel. El reporte del
+usuario es la única evidencia observable de esta
+sesión interactiva para esos tres puntos.
+
+**Lo que la confirmación user-reported NO establece:**
+
+- **No** inspecciona payloads de IPC: los argumentos
+  y resultados de `invoke('settings_status')` /
+  `invoke('list_agents')` no fueron capturados ni
+  observados.
+- **No** inspecciona CSP: las directivas `csp` /
+  `devCsp` configuradas en `tauri.conf.json` no fueron
+  ejercitadas por el agente en runtime; su corrección
+  sigue basada en documentación oficial, no en
+  verificación end-to-end instrumentada.
+- **No** inspecciona devtools, ni tráfico de red, ni
+  consola del WebView2.
+- **No** afirma contenido específico: el reporte
+  del usuario cubre **aparición** de los paneles y la
+  **actualización** ante "Refresh both", pero **no**
+  describe los datos concretos mostrados (paths,
+  estados de checkout, listas de agentes, etc.).
+- **No** ejecuta el runtime empaquetado en otras
+  plataformas (Arch / otros Linux): la confirmación
+  es del host Windows 11 interactivo del usuario; los
+  gates de Fase 6 (D4 pendiente) **siguen abiertos**.
+- **No** declara la GUI lista para producción por sí
+  sola: la entrada `agenthd gui` sigue rechazándose
+  con exit `2` antes de cualquier efecto (D2
+  cerrado) hasta que un agente con permisos de
+  implementación integre la rama de arranque de la
+  GUI en `src/main.rs`. La integración del comando
+  `agenthd gui` en producción **puede proceder** una
+  vez tomada la **decisión de arquitectura de
+  launch/install** (cómo se arranca y distribuye la
+  GUI) que este spike no prescribe; el slice de
+  producción read-only de Fase 5 requerirá su propia
+  validación al integrarse (tests runtime, contratos
+  de IPC ejercitados, comportamiento de la TUI
+  conservado, etc.) — esa validación es parte del
+  trabajo del slice, **no** un bloqueo pendiente
+  sobre el gate visual aquí satisfecho. El gate
+  visual del primer slice de Fase 5 (Settings y
+  Agents aparecen; Refresh both actualiza) queda
+  **satisfecho** por la confirmación manual
+  user-reported; un eventual probe automatizado
+  end-to-end, si se ejecuta, sería validación
+  adicional para profundizar confianza, no cierre
+  formal obligatorio.
+
+### Próximo paso explícito
+
+La confirmación visual manual del usuario (Settings y
+Agents aparecen; Refresh both actualiza — ver
+"Verificación manual user-reported") **queda
+registrada y satisface** el gate visual del primer
+slice read-only de Fase 5: aparición de los paneles
+Settings y Agents y refresco manual ante "Refresh
+both" quedan atestiguados por el reporte manual del
+usuario en una sesión `npm run tauri dev` interactiva
+en Windows 11. La atribución es honesta — la sesión
+no fue instrumentada por el agente (sin screenshots,
+sin captura de payloads IPC, sin inspección del DOM
+/ CSP / devtools / red, sin afirmación de contenido
+específico mostrado) — pero **sí** establece lo que
+el usuario atestiguó sobre esos tres puntos, y con
+eso el gate visual del primer slice de Fase 5 queda
+**satisfecho**.
+
+Eso habilita el siguiente paso concreto: la
+descripción e implementación del slice read-only de
+Fase 5 (`compose_settings_status` +
+`compose_agents_list` reusando el lib, sin
+side-effects) por un agente con permisos de
+implementación (ver `GUI_ROADMAP.md` → "Próxima
+tarea estrecha → 5"). **Slice "binario acompañante"
+ejecutado:** la rama `agenthd gui` en `src/main.rs`
+ahora localiza el binario `agenthd-gui` adyacente al
+ejecutable actual y, cuando está presente, lo lanza
+con el mismo argv reenviando su código de salida;
+cuando falta, sale con exit `2` y un stderr claro
+**antes** de cualquier escritura de `settings.json`.
+El binario del spike pasa a llamarse `agenthd-gui`
+(vía `[[bin]]` en `src-tauri/Cargo.toml`), y el
+branding "spike" se baja en `productName` /
+`identifier` / título de ventana / `<h1>` Angular;
+los comandos, capabilities, CSP y comportamiento
+read-only se quedan como están. La integración de
+`agenthd gui` en producción **puede proceder** una
+vez tomada la **decisión de arquitectura de
+launch/install** (cómo se arranca y distribuye la
+GUI) que este spike no prescribe; el slice de
+producción read-only **requerirá su propia
+validación** al integrarse (tests runtime, contratos
+de IPC ejercitados, comportamiento de la TUI
+conservado, etc.) — esa validación es parte del
+trabajo del slice, **no** un bloqueo pendiente sobre
+este gate visual.
+
+**Mientras tanto**, la rama actual de `src/main.rs`
+rechaza `agenthd gui` con exit `2` cuando el
+acompañante falta; cuando el acompañante está
+presente, lo lanza y reenvía su código de salida (no
+rechaza con exit `2` por "no implementado" como
+antes — la rama GUI ya no es un placeholder). Esto
+se mantiene intacto hasta que un agente con permisos de
+implementación integre la rama de arranque de la
+GUI. Los gates de Fase 6 (D4 pendiente — empaquetado
+Arch / otros Linux / Windows) **siguen abiertos** y
+son **separados** del gate visual del primer slice
+de Fase 5 satisfecho aquí; un eventual probe
+automatizado end-to-end, si se ejecuta en el futuro,
+sería validación adicional para profundizar
+confianza, **no** cierre formal obligatorio de este
+gate.
+
+### Relación con el resto del spike
+
+- Las observaciones frontend / backend de Linux histórico
+  (tablas anteriores de este documento) **siguen siendo
+  válidas** para ese host; el smoke de Windows 11 MSYS no
+  las reemplaza ni las contradice.
+- El smoke automatizado del agente **no es** la
+  verificación visual del primer slice de Fase 5:
+  reduce incertidumbre sobre el arranque del binario
+  y la presencia de WebView2, pero no sobre el
+  contenido del WebView ni sobre el IPC end-to-end.
+  **Sí** queda registrada la confirmación manual
+  user-reported del usuario (Settings y Agents
+  aparecen; Refresh both actualiza — ver
+  "Verificación manual user-reported"): cubre
+  **aparición de los paneles y actualización**, con
+  atribución honesta — no es instrumentación
+  automatizada del agente (no captura payloads IPC,
+  no inspecciona CSP / devtools / red, no afirma
+  contenido específico). El gate visual del primer
+  slice de Fase 5 queda **satisfecho** por esta
+  confirmación user-reported. Un eventual probe
+  automatizado end-to-end, si se ejecuta, sería
+  validación adicional para profundizar confianza,
+  pero **no** es cierre formal obligatorio de este
+  gate. El gate de empaquetado por plataforma (Fase
+  6, D4 pendiente) **sigue abierto** y es
+  **independiente** del gate visual satisfecho aquí.
 
 ## Limitaciones honestas
 
@@ -223,6 +482,53 @@ verificación queda para Fase 6 de empaquetado.
   nativa ejecutándose, que este host no soporta. La
   corrección se basa en evidencia documental, no en
   evidencia de ejecución end-to-end.
+- **Smoke Windows 11 MSYS registrado, no ejecución
+  validada.** Una corrida posterior en Windows 11 con
+  MSYS (ver "Observaciones Windows 11 MSYS") atestigua
+  que `npm run tauri dev` arrancó el dev server, compiló,
+  lanzó el binario y que `Get-Process` observó un
+  `MainWindowHandle` con título `agenthd spike (D1 /
+  Tauri + Angular)` a los 12 s; un run timed fue
+  interrumpido a los 55 s (exit 143) sin que se
+  observara contenido Angular ni respuesta IPC. **Esto
+  reduce incertidumbre** sobre arranque del binario,
+  WebView2 presente y creación de ventana nativa, **pero
+  no demuestra** visualización real del WebView2, IPC
+  end-to-end, ni que la GUI esté lista para producción.
+  El retry inicial con `HRESULT 0x800700AA` (`ERROR_BUSY`)
+  queda como observación sin causa establecida en este
+  spike.
+- **Confirmación manual user-reported (no
+  instrumentada por el agente).** En una sesión
+  interactiva posterior en el mismo host, el usuario
+  reportó manualmente (sin screenshots, sin captura
+  de payloads IPC, sin inspección del DOM / CSP /
+  devtools / red) que Settings y Agents aparecen y
+  que Refresh both actualiza. Esa confirmación está
+  documentada en "Observaciones Windows 11 MSYS →
+  Verificación manual user-reported" y **no**
+  equivale a instrumentación del agente: **no**
+  inspecciona payloads, **no** inspecciona CSP,
+  **no** inspecciona devtools, **no** inspecciona
+  red, **no** afirma contenido específico mostrado,
+  y **no** equivale a Windows empaquetado validado
+  (gate de Fase 6, D4 pendiente, **sigue abierto**
+  y es **separado** del gate visual de Fase 5). Sí
+  **satisface** el gate visual del primer slice
+  read-only de Fase 5 (aparición de Settings y
+  Agents, refresco manual ante "Refresh both"), con
+  la atribución honesta ya registrada. No habilita
+  por sí sola la integración de `agenthd gui` en
+  producción: esa integración requiere además la
+  **decisión de arquitectura de launch/install**
+  (cómo se arranca y distribuye la GUI, fuera del
+  scope de este spike) y la validación propia del
+  slice de producción read-only al integrarse
+  (tests runtime, contratos de IPC ejercitados,
+  comportamiento de la TUI conservado) — esa
+  validación es parte del trabajo del slice y **no**
+  un bloqueo pendiente sobre el gate visual
+  satisfecho aquí.
 
 ## Diagnóstico: colisión IPv4/IPv6 en 1420 y migración a 14720
 
@@ -286,12 +592,50 @@ cargo build        # genera binario
 Para abrir la ventana nativa (requiere display usable:
 en este host, `DISPLAY=:0` + `timeout 12s` produjo exit
 124 con stderr vacío, lo cual **no** prueba que el
-runtime gráfico funcione — ver "Limitaciones honestas"):
+runtime gráfico funcione — ver "Limitaciones honestas".
+En el host Windows 11 MSYS posterior, `npm run tauri dev`
+sí arrancó el dev server, compiló y lanzó el binario, y
+`Get-Process` a los 12 s observó un `MainWindowHandle`
+con título `agenthd spike (D1 / Tauri + Angular)` — esto
+**sigue sin ser** prueba de visualización ni de IPC, solo
+atestigua que el proceso y la ventana existen; ver
+"Observaciones Windows 11 MSYS"):
 
 ```bash
 cd spikes/tauri-angular
 npm run tauri dev
 ```
+
+**Gate visual del primer slice de Fase 5.** El
+usuario **ya reportó manualmente** que Settings y
+Agents aparecen y que Refresh both actualiza (ver
+"Verificación manual user-reported" en
+"Observaciones Windows 11 MSYS"): esa confirmación
+**es user-reported**, **no** es instrumentación
+automatizada end-to-end (no captura payloads IPC,
+no inspecciona CSP / devtools / red, no afirma
+contenido específico), y **sí satisface** el gate
+visual del primer slice de Fase 5 (aparición de los
+paneles Settings y Agents; refresco manual ante
+"Refresh both"). Un eventual probe automatizado
+end-to-end, si se ejecuta en el futuro, sería
+validación adicional para profundizar confianza,
+pero **no** es cierre formal obligatorio de este
+gate, que queda satisfecho por la confirmación
+user-reported. La rama actual de `src/main.rs`
+rechaza `agenthd gui` con exit `2` antes de
+cualquier efecto (D2 cerrado) y eso se mantiene
+intacto hasta que un agente con permisos de
+implementación integre la rama de arranque de la
+GUI. La integración de `agenthd gui` en producción
+**puede proceder** una vez tomada la **decisión de
+arquitectura de launch/install** (cómo se arranca
+y distribuye la GUI) que este spike no prescribe;
+el slice de producción read-only requerirá su
+propia validación al integrarse. El gate de
+empaquetado por plataforma (Fase 6, D4 pendiente)
+**sigue abierto** y es **separado** del gate visual
+de Fase 5 satisfecho aquí.
 
 Estado de los lockfiles en git: ambos
 (`spikes/tauri-angular/src-tauri/Cargo.lock` y

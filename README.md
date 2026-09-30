@@ -64,16 +64,96 @@ The binary accepts a single positional mode keyword:
 ```sh
 agenthd                # default: TUI
 agenthd tui            # explicit TUI (same as default)
-agenthd gui            # GUI — not implemented yet (rejected before any side effects)
+agenthd gui            # GUI — requires the companion binary `agenthd-gui(.exe)` next to `agenthd`
 ```
 
-`gui` is reserved for the future GUI client (phase 5, behind D1).
-Until then, `agenthd gui` exits with code `2` and a clear stderr
-message; `settings.json`, `state.json`, and the OpenCode target tree
-are never touched. The parser is shared by every mode that lands, so
-`--repo` applies to both TUI and GUI in the same way — once the GUI
-client is implemented, `--repo` will persist through the same
-`settings.json` path the TUI uses today.
+The GUI branch locates the companion binary `agenthd-gui` (or
+`agenthd-gui.exe` on Windows) **adjacent to the current executable**
+and spawns it with the same argv; `agenthd` then waits and forwards
+the companion's exit code. If the companion is missing,
+`agenthd gui` exits with code `2` and a clear stderr message that
+names the missing file; `settings.json`, `state.json`, and the
+OpenCode target tree are never touched. The companion check runs
+before `resolve_checkout_path`, so even a valid `--repo` cannot turn
+a missing-companion rejection into a `settings.json` write. PATH is
+**not** consulted: spawning arbitrary PATH executables would let a
+hostile `PATH` masquerade as the companion. The parser is shared by
+every mode, so `--repo` applies to both TUI and GUI in the same way
+— the GUI branch runs the same `resolve_checkout_path` override
+precedence / save-if-changed logic as the TUI branch, then hands
+control to the companion.
+
+### Paired install contract (CLI + companion GUI)
+
+The root CLI (`agenthd`) and the companion GUI (`agenthd-gui`) are
+two **separate** crates with separate build steps. `cargo install
+--path .` of the root repository only installs the CLI — the
+companion is not produced and `agenthd gui` will refuse to start
+until both binaries are present next to each other. The companion
+lives at `spikes/tauri-angular/` and depends on the root library by
+path, so installing it requires running the Angular frontend build
+**first** to populate `spikes/tauri-angular/dist/`, then installing
+the Tauri binary via `cargo install` (same cargo root as the CLI,
+so `agenthd` finds it adjacent to itself with no PATH juggling):
+
+```sh
+# 1. Install the CLI (one crate, no frontend).
+cargo install --path . --locked
+
+# 2. Build the Angular bundle the Tauri companion embeds. The
+#    `dist/` directory is what `tauri build` reads at install time,
+#    so this MUST run before step 3.
+cd spikes/tauri-angular
+npm ci            # reproducible install from the versioned lockfile
+npm run build     # Angular bundle into dist/
+
+# 3. Install the companion binary into the SAME cargo root as
+#    the CLI. `cargo install` defaults to `~/.cargo/bin` on Linux
+#    and `C:\Users\<user>\.cargo\bin` on Windows, the same root
+#    `cargo install --path .` of step 1 wrote `agenthd(.exe)` to,
+#    so the root CLI's adjacent-companion lookup finds
+#    `agenthd-gui(.exe)` without any copy step. If you customized
+#    `CARGO_HOME` or passed `--root <dir>` to step 1, pass the
+#    same value to step 3 (e.g. `CARGO_HOME=<dir> cargo install
+#    --path src-tauri --locked --bin agenthd-gui --root <dir>`)
+#    so both binaries land next to each other — otherwise the
+#    CLI's adjacent-companion lookup will not find the
+#    companion. The package name
+#    is still `agenthd-tauri-angular-spike` (historical / internal);
+#    `--bin agenthd-gui` pins the production-style binary name the
+#    root CLI actually looks for. **Note:** this command does
+#    **not** overwrite a preexisting `agenthd-gui(.exe)` at the
+#    destination. `cargo install` refuses to replace an existing
+#    binary at the target path unless `--force` is passed, so any
+#    companion you already installed (from a previous install or
+#    from your own `cargo build`) stays in place and is not
+#    silently overwritten by this step. Updating an existing
+#    companion requires a deliberate user action: re-run this
+#    command with `--force` only when you intend to replace your
+#    currently installed `agenthd-gui(.exe)`.
+cargo install --path src-tauri --locked --bin agenthd-gui
+```
+
+The companion crate is the existing `spikes/tauri-angular/src-tauri/`
+crate with its binary renamed to `agenthd-gui` — there is **no**
+second copy. The crate directory stays under `spikes/` for now
+(it still serves as a spike / slice boundary), but the binary name
+and the displayed branding are production-style (`agenthd-gui`,
+`agenthd GUI`). Commands, capabilities, CSP, and read-only
+behaviour are unchanged from the spike's D1 contract. Step 3
+above is the **install** path; the underlying `cargo build`
+artifact is still `target/release/agenthd-gui(.exe)` under
+`spikes/tauri-angular/src-tauri/`, but `cargo install` is what
+copies it into the cargo root the CLI ships from — no manual
+"drop the binary next to the CLI" step is needed (or implied).
+The single-step `cargo install` of the root **does not** bundle
+the companion; both crates must be installed separately.
+
+**No platform packaging claim.** This slice installs both binaries
+into the same cargo root and stops there; Arch packages, `.deb` /
+`.rpm` / AppImage, winget / Scoop / MSI installers, and any
+per-platform packaging are explicitly **out of scope** for this
+slice and remain gate-of-Fase-6 (D4 pendiente) work.
 
 ### Empty checkout
 
@@ -132,6 +212,11 @@ Update with `cargo install --path . --locked --force`, remove with
 `cargo uninstall agenthd`. The binary installs to `~/.cargo/bin`, which
 is typically on `PATH` already via `~/.cargo/env`; add it to your
 shell's `PATH` if it is not.
+
+Installing the CLI alone is not enough to run `agenthd gui`: the GUI
+branch requires the companion binary `agenthd-gui(.exe)` next to the
+CLI's binary. See "Paired install contract (CLI + companion GUI)"
+above for the build steps.
 
 ## Paths
 

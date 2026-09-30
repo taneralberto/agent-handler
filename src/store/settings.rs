@@ -235,10 +235,14 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("agents")).unwrap();
-        let settings = Settings::new("/this/path/does/not/exist/agenthd-test");
-        let err = canonical_dir_from(&PathBuf::from("/tmp/agenthd-test"), &settings)
-            .unwrap_err()
-            .to_string();
+        // Non-existent subpath of an existing tempdir so the path
+        // is absolute on the host platform (the Unix-style
+        // literal `/this/path/...` is NOT absolute on Windows and
+        // would trip the absolute-path gate instead of the
+        // missing-checkout gate this test is asserting).
+        let missing = dir.path().join("does-not-exist");
+        let settings = Settings::new(missing.to_string_lossy());
+        let err = canonical_dir_from(root, &settings).unwrap_err().to_string();
         assert!(err.contains("does not exist"), "got: {}", err);
     }
 
@@ -253,9 +257,14 @@ mod tests {
 
     #[test]
     fn validate_rejects_missing_path() {
-        let err = validate_checkout_path(Path::new("/this/path/does/not/exist/agenthd-test"))
-            .unwrap_err()
-            .to_string();
+        // Non-existent subpath of an existing tempdir so the path
+        // is absolute on the host platform (the Unix-style
+        // literal `/this/path/...` is NOT absolute on Windows and
+        // would trip the absolute-path gate instead of the
+        // missing-checkout gate this test is asserting).
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = validate_checkout_path(&missing).unwrap_err().to_string();
         assert!(err.contains("does not exist"), "got: {}", err);
     }
 
@@ -336,8 +345,13 @@ mod tests {
         let target = dir.path().join("target");
         fs::create_dir_all(&target).unwrap();
         let link = dir.path().join("link");
-        // On Windows symlink_dir may fail silently in tests; skip if so.
+        // On Windows symlink_dir can fail without
+        // SeCreateSymbolicLinkPrivilege; skip in that case so the
+        // rest of the suite still runs.
+        #[cfg(unix)]
         let made_link = std::os::unix::fs::symlink(&target, &link).is_ok();
+        #[cfg(windows)]
+        let made_link = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
         if !made_link {
             // Skip the test in environments that can't create symlinks.
             return;

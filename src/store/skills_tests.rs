@@ -10,8 +10,56 @@ use crate::store::{
 };
 use std::collections::BTreeMap;
 use std::fs;
-use std::os::unix::fs::symlink as unix_symlink;
+use std::path::Path;
 use tempfile::TempDir;
+
+// Cross-platform test-only symlink helpers. On Unix both wrappers
+// collapse onto `std::os::unix::fs::symlink`. On Windows they
+// dispatch to the explicit `symlink_dir` / `symlink_file` APIs
+// because the unified `std::os::unix::fs::symlink` has no Windows
+// equivalent and the platform primitives refuse to create the
+// wrong kind of link (a directory symlink via `symlink_file`
+// fails with ERROR_NOT_A_REPARSE_POINT / ERROR_ACCESS_DENIED, so
+// each call site must pick the right one). On either platform,
+// creating the link can still fail when the process lacks the
+// privilege (e.g. Windows: SeCreateSymbolicLinkPrivilege, or a
+// sandboxed CI); callers already treat `is_err()` as "skip the
+// scenario" and continue with the rest of the test.
+#[cfg(unix)]
+fn symlink_dir<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(unix)]
+fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(original, link)
+}
+
+#[cfg(windows)]
+fn symlink_dir<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(original, link)
+}
+
+#[cfg(windows)]
+fn symlink_file<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(original, link)
+}
+
+/// Build the suffix the `rename_seam` matches against a rename
+/// dst path. The seam compares `dst.to_string_lossy().ends_with(suffix)`,
+/// so the suffix must use the same separator as the host's
+/// native path representation: `/` on Unix, `\` on Windows.
+/// Building the suffix via `Path::join` instead of `format!("/...")`
+/// keeps it OS-native without changing the seam itself (the seam
+/// lives in `src/store/skills.rs` as a `#[cfg(test)]` helper
+/// module, but the test files in scope here must not touch
+/// production source).
+fn rename_seam_suffix(skills_dir: &Path, skill_name: &str) -> String {
+    Path::new(skills_dir.file_name().expect("skills_dir has a basename"))
+        .join(skill_name)
+        .to_string_lossy()
+        .into_owned()
+}
 
 fn setup_paths(dir: &TempDir) -> Paths {
     let paths = Paths {
@@ -392,7 +440,7 @@ fn plan_rejects_symlinked_skills_root() {
     fs::create_dir_all(checkout.join("agents")).unwrap();
     let real = dir.path().join("real-skills");
     fs::create_dir_all(&real).unwrap();
-    if unix_symlink(&real, checkout.join("skills")).is_err() {
+    if symlink_dir(&real, checkout.join("skills")).is_err() {
         return; // sandbox without symlink perms
     }
     let paths = Paths {
@@ -423,7 +471,7 @@ fn plan_rejects_symlinked_skill_directory() {
         "---\nname: foo\ndescription: t\n---\nbody\n",
     )
     .unwrap();
-    if unix_symlink(&real, skills_src.join("foo")).is_err() {
+    if symlink_dir(&real, skills_src.join("foo")).is_err() {
         return;
     }
     let err = plan_skills(&paths, &State::default())
@@ -450,7 +498,7 @@ fn plan_rejects_symlinked_file_in_skill_tree() {
     .unwrap();
     let real = dir.path().join("real-file");
     fs::write(&real, b"x").unwrap();
-    if unix_symlink(&real, skill.join("linked.md")).is_err() {
+    if symlink_file(&real, skill.join("linked.md")).is_err() {
         return;
     }
     let err = plan_skills(&paths, &State::default())
@@ -556,7 +604,7 @@ fn plan_reports_conflict_for_symlinked_destination() {
     let (paths, checkout) = setup_paths_with_skills(&dir);
     let skills_src = checkout.join("skills");
     write_skill(&skills_src, "clarify-before-coding", "body");
-    if unix_symlink(
+    if symlink_dir(
         dir.path().join("nowhere"),
         paths.skills_dir.join("clarify-before-coding"),
     )
@@ -1211,10 +1259,7 @@ fn update_restores_from_backup_when_publish_fails() {
     // target->backup rename has already succeeded. The expected
     // recovery is to rename backup -> target and clean up.
     crate::store::skills::rename_seam::arm_next(
-        &format!(
-            "{}/clarify-before-coding",
-            paths.skills_dir.file_name().unwrap().to_string_lossy()
-        ),
+        &rename_seam_suffix(&paths.skills_dir, "clarify-before-coding"),
         1,
     );
 
@@ -1292,10 +1337,7 @@ fn update_retains_backup_when_publish_and_restore_both_fail() {
     // retained backup path so the user can recover the v1 bytes
     // by hand.
     crate::store::skills::rename_seam::arm_persistent(
-        &format!(
-            "{}/clarify-before-coding",
-            paths.skills_dir.file_name().unwrap().to_string_lossy()
-        ),
+        &rename_seam_suffix(&paths.skills_dir, "clarify-before-coding"),
         1,
     );
 
@@ -1767,10 +1809,7 @@ fn update_publish_and_restore_failure_reports_backup_path_outside_skills_dir() {
     // skills_dir, so arming the dst suffix persistently matches
     // both calls.
     crate::store::skills::rename_seam::arm_persistent(
-        &format!(
-            "{}/clarify-before-coding",
-            paths.skills_dir.file_name().unwrap().to_string_lossy()
-        ),
+        &rename_seam_suffix(&paths.skills_dir, "clarify-before-coding"),
         1,
     );
     let (_, outcomes) = apply_skills(&paths, state, plan).unwrap();

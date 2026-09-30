@@ -8,7 +8,15 @@ a la forma GUI del proyecto `agenthd` (decisión D1 de
 opt-in que vive en `spikes/tauri-angular/` y depende del lib
 `agenthd` por path. El binario `agenthd` sigue rechazando
 `agenthd gui` con exit code 2 — este prototipo no toca esa
-ruta, no se acopla a la CLI, y no marca D1 como cerrado.
+ruta, no se acopla a la CLI. **El spike en sí no cierra D1**:
+no compara candidatos entre sí, no ejecuta el runtime
+gráfico end-to-end, no decide empaquetado. D1 lo cerró el
+usuario por elección explícita sobre la base del spike Tauri
+existente y su familiaridad con Angular, **sin** comparación
+factual entre frameworks (Tauri, GTK4-rs, egui, iced,
+servidor web local). Ver
+"Estado del spike" abajo y `GUI_ROADMAP.md` → "Decisiones
+pendientes → D1".
 
 ## Qué demuestra
 
@@ -72,7 +80,11 @@ spikes/tauri-angular/
 
 ## Prerrequisitos verificados en este host
 
-Comprobado durante la inspección previa al spike:
+Comprobado durante la inspección previa al spike y, en una
+corrida posterior, en un segundo host. Cada bloque corresponde
+a un host distinto; no mezclar.
+
+**Linux (host histórico del spike):**
 
 - `node` 22.22.3
 - `npm` 12.0.2
@@ -82,9 +94,20 @@ Comprobado durante la inspección previa al spike:
   que Tauri necesita en Linux están disponibles sin instalar
   paquetes de sistema)
 
-Si tu host no tiene las nativas GTK/WebKitGTK, el comando
-`cargo build` de `src-tauri/` fallará con un error de
-`pkg-config` o de cabecera. **No instales paquetes de
+**Windows 11 MSYS (smoke posterior — ver
+`spikes/tauri-angular/EVIDENCE.md` → "Observaciones Windows
+11 MSYS"):**
+
+- Host: Windows 11 con MSYS.
+- `node` v24.16.0
+- `npm` 12.0.1
+- `cargo` 1.98.1
+- Toolchain Rust: `x86_64-pc-windows-msvc`.
+- WebView2 runtime: observado instalado en este host.
+
+Si tu host Linux no tiene las nativas GTK/WebKitGTK, el
+comando `cargo build` de `src-tauri/` fallará con un error
+de `pkg-config` o de cabecera. **No instales paquetes de
 sistema sin permiso del usuario**; el spike debe reportar
 el bloqueo exacto.
 
@@ -97,7 +120,10 @@ Desde el directorio `spikes/tauri-angular/`:
 #    `package-lock.json` (195 KB, generado y versionado
 #    con el spike).
 #    `npm ci` (218 paquetes, 2s) confirma reproducibilidad.
-#    `npm run build` generó `dist/agenthd-tauri-angular-spike/`.
+#    `npm run build` generó `dist/agenthd-tauri-angular-spike/`
+#    (el directorio `dist/` sigue llamándose por el nombre
+#    del proyecto Angular, **no** por el nombre del binario
+#    de Tauri; el binario se llama `agenthd-gui`).
 
 # 1) Re-verifica el frontend (idempotente, usa el lockfile):
 npm ci
@@ -108,10 +134,27 @@ npm run build
 #    Requiere un display usable con WebKitGTK inicializado.
 #    Nota: en este host, `DISPLAY=:0` +
 #    `timeout 12s ./target/debug/agenthd-tauri-angular-spike`
+#    (nombre histórico del binario en ese pase de Linux; el
+#    binario pasó después a llamarse `agenthd-gui` vía
+#    `[[bin]]` en `src-tauri/Cargo.toml` — la observación
+#    aquí registrada es la del momento del pase y no se
+#    reescribe)
 #    produjo exit 124 con stderr vacío, lo cual NO
 #    demuestra que el runtime gráfico funcione. Ver
 #    `spikes/tauri-angular/EVIDENCE.md` → "Limitaciones
 #    honestas".
+#    En el host Windows 11 MSYS posterior, `npm run tauri
+#    dev` sí arrancó el dev server, compiló y lanzó el
+#    binario, y `Get-Process` observó un
+#    `MainWindowHandle` con título `agenthd spike (D1 / Tauri + Angular)`
+#    a los 12 s (título **histórico** del momento del smoke; el
+#    branding posterior renombró la ventana a `agenthd GUI`, pero
+#    la observación aquí registrada es la original, no la
+#    renombrada); un run timed fue interrumpido a los 55 s
+#    (exit 143) sin observarse contenido Angular ni respuesta IPC
+#    — **sigue sin ser** prueba de visualización ni de IPC
+#    end-to-end. Ver `spikes/tauri-angular/EVIDENCE.md` →
+#    "Observaciones Windows 11 MSYS".
 npm run tauri dev
 
 # 3) Build de producción (Angular a dist/, Tauri a bundle).
@@ -169,28 +212,41 @@ tras `Paths::from_env()`.
 
 ## Estado del spike
 
-**D1 sigue sin cerrarse.** Este spike es una pieza de
-evidencia técnica: ejercita el seam del lib y deja los
-lockfiles generados y versionados con el spike
-para que el siguiente agente pueda reproducir el
+> **Nota posterior:** D1 (forma GUI) se cerró por
+> elección explícita del usuario (Tauri + Angular), sin
+> comparación factual con el resto de candidatos; ver
+> `GUI_ROADMAP.md` → "Decisiones pendientes → D1". Este
+> spike sigue siendo la pieza de evidencia del candidato
+> elegido. La IPC visual queda como gate del primer
+> slice de Fase 5 (no como gate de D1); la
+> verificación por plataforma Arch / Windows queda
+> como gate de Fase 6 (D4 pendiente).
+
+**Registro al cierre del spike (antes de la elección
+del usuario):** D1 aún no estaba cerrado. Este spike es
+una pieza de evidencia técnica: ejercita el seam del
+lib y deja los lockfiles generados y versionados con el
+spike para que el siguiente agente pueda reproducir el
 build sin surprises. **No** valida el runtime gráfico
 (ver `EVIDENCE.md` → "Limitaciones honestas": en este
 host `DISPLAY=:0` + `timeout 12s` produjo exit 124 con
 stderr vacío, lo cual NO demuestra visualización ni IPC/
 ventana funcional — esta limitación se **registra**, no
 convierte la ejecución gráfica en gate de D1) y **no**
-se ejecutó en Arch ni en Windows (queda para Fase 6 de
-empaquetado; **NO es gate de D1**). La decisión final
-Tauri vs GTK4-rs vs egui vs iced vs web local se cierra
-tras (a) comparar pros/contras factuales contra los
-otros candidatos tomando como entrada lo que el spike
+se había ejecutado en Arch ni en Windows (queda para
+Fase 6 de empaquetado; **NO es gate de D1**). La propuesta de
+cierre de D1 en ese momento era (a) comparar
+pros/contras factuales Tauri vs GTK4-rs vs egui vs iced
+vs web local tomando como entrada lo que el spike
 produce de verdad (scaffold reproducible, 8/8 tests
 focales del backend, lockfiles generados y versionados
-con el spike, lockfile doble, dependencia
-cruzada por path, pros/contras observables), más las
-limitaciones honestas registradas (runtime gráfico no
-demostrado en este host, tests del backend no invocan
-el dispatch Tauri), y (b) la aceptación explícita del
-usuario. El próximo paso es esa comparación de
-pros/contras, no invertir en el slice vertical de Fase
-5 (Fase 5 viene después de cerrar D1).
+con el spike, lockfile doble, dependencia cruzada por
+path, pros/contras observables), más las limitaciones
+honestas registradas (runtime gráfico no demostrado en
+este host, tests del backend no invocan el dispatch
+Tauri), y (b) la aceptación explícita del usuario. El
+siguiente paso propuesto entonces era esa comparación
+de pros/contras, no invertir en el slice vertical de
+Fase 5 (Fase 5 venía después de cerrar D1); esa
+propuesta fue superada por la elección explícita del
+usuario documentada arriba.

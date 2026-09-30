@@ -9,11 +9,12 @@ Handoff autónomo para otro agente en otra PC.
 
 ## Objetivo
 
-Añadir GUI a `agenthd` sin reescribir la base ni duplicar lógica. Sin
-framework GUI hasta cerrar D1; D2 está cerrado (seam CLI), D3–D5
-se cierran en sus fases respectivas (ver gates). TUI y `--repo`
-siguen siendo el comportamiento observable hasta que llegue la GUI
-(fase 5).
+Añadir GUI a `agenthd` sin reescribir la base ni duplicar lógica. D1
+cerrado por elección explícita del usuario: Tauri + Angular
+(familiaridad Angular + spike ya ejecutado); D2 está cerrado (seam
+CLI), D3–D5 se cierran en sus fases respectivas (ver gates). TUI y
+`--repo` siguen siendo el comportamiento observable hasta que llegue
+la GUI (fase 5).
 
 ## Antes de empezar y estado observable hoy
 
@@ -43,7 +44,16 @@ siguen siendo el comportamiento observable hasta que llegue la GUI
   `TerminalGuard` y `AgentDraft` / `EditorField` / `EditorMode` /
   `EditorOp` / `edit_prompt_externally` son TUI-coupled
   (`main.rs`, `app/editor.rs`); reusarlos exige evaluar caso por
-  caso tras D1. Windows sin validar en ejecución.
+  caso tras D1. **Windows 11 MSYS:** hay un **smoke parcial**
+  registrado (arranque de `npm run tauri dev`, dev server en
+  `127.0.0.1:14720`, compilación, lanzamiento del binario y
+  `MainWindowHandle` observado vía `Get-Process` con título
+  `agenthd spike (D1 / Tauri + Angular)`) — **no** equivale a
+  ejecución validada del runtime gráfico ni del IPC end-to-end.
+  Ver `spikes/tauri-angular/EVIDENCE.md` → "Observaciones
+  Windows 11 MSYS" y "Limitaciones honestas". Empaquetado
+  cross-platform (Arch / otros Linux / Windows) sigue siendo
+  gate de Fase 6, D4 pendiente.
 
 ## Invariantes (la GUI los respeta tal cual)
 
@@ -55,8 +65,25 @@ confirmación explícita; skills sin force-overwrite.
 
 ## Decisiones pendientes
 
-- **D1 — Forma GUI.** Escritorio nativo (Tauri, GTK4-rs, egui, iced)
-  o servidor web local. Cierra antes de fase 4.
+- **D1 — Forma GUI.**
+
+  > **D1 cerrado por elección explícita del usuario.** Se mantiene
+  > **Tauri + Angular** por familiaridad del usuario con Angular y
+  > por la existencia del spike ya ejecutado
+  > (`spikes/tauri-angular/`, etapas 1 y 2 — ver "Fase 4" y
+  > "Próxima tarea estrecha"). **No** se afirma una comparación
+  > factual entre Tauri, GTK4-rs, egui, iced y servidor web local.
+  > Quedan dos frentes de validación gráfica, **distintos** entre
+  > sí: (i) IPC visual (ventana nativa + JS↔Rust con CSP y
+  > `127.0.0.1:14720`), que es **gate del primer slice read-only
+  > de Fase 5** (ver punto 5); (ii) empaquetado cross-platform en
+  > Arch / otros Linux / Windows, que es **gate de Fase 6** (D4
+  > pendiente). D1 no validaba ninguno de los dos; era solo la
+  > elección del framework. **Nota:** el smoke parcial de
+  > Windows 11 MSYS registrado en el spike (window handle
+  > observado vía `Get-Process`, sin contenido Angular ni IPC
+  > observables) **no** cambia este estado — sigue siendo
+  > smoke, no validación end-to-end del runtime gráfico.
 - **D2 — `g` / `i` y `--repo`.** Cuál abre GUI/TUI/defecto; si
   `--repo` aplica a ambos; persistencia en `settings.json` o solo
   por argumento. Sin campo persistido ni subcomando `agenthd tui`
@@ -90,10 +117,11 @@ confirmación explícita; skills sin force-overwrite.
 
 ## Gates de fase
 
-Fases 1–3 no dependen de D1–D5. Fase 4 requiere D1. Fase 5 requiere
-D1 + D2 (subfases largas además D3). Fase 6 requiere D4 y validación
-previa por plataforma. Cada fase deja la TUI funcionando; la GUI
-entra como segundo cliente.
+Fases 1–3 no dependen de D1–D5. Fase 4 cerrada por elección
+explícita del usuario (Tauri + Angular); ver "Decisiones
+pendientes → D1". Fase 5 requiere D2 (subfases largas además D3).
+Fase 6 requiere D4 y validación previa por plataforma. Cada fase
+deja la TUI funcionando; la GUI entra como segundo cliente.
 
 ## Checkboxes — entregado vs. pendiente
 
@@ -222,9 +250,9 @@ entra como segundo cliente.
 **Fase 2 cerrada:** la lógica compartible pendiente está
 toda extraída (`plan_then_apply_skills`,
 `plan_then_apply_agents_safe`, `save_agent`) o evaluada
-explícitamente como UI-only (`tools`, dispatch). La
-próxima decisión bloqueante es D1 (forma GUI), no más
-extracciones de Fase 2.
+explícitamente como UI-only (`tools`, dispatch). D1
+(forma GUI) se cerró después por elección explícita del
+usuario — ver "Decisiones pendientes → D1" y "Fase 4".
 
 ### Fase 3 — Aislar el launcher
 
@@ -271,24 +299,128 @@ extracciones de Fase 2.
       de IPC end-to-end** (intento de ejecución con
       `DISPLAY=:0` + `timeout 12s` → exit 124 sin stderr;
       los tests del backend invocan los composition helpers,
-      no el dispatch Tauri en runtime). Detalle completo en
-      "Próxima tarea estrecha → Spike etapa 2 ejecutado".
-- [ ] Comparación y firma de D1 pendientes. D1 **no se
-      marca cerrada** ni habilita Fase 5 hasta comparar
-      pros/contras factuales de Tauri vs GTK4-rs vs egui vs
-      iced vs servidor web local tomando como entrada la
-      evidencia de este spike, las validaciones pendientes
-      (ejecución real con display del binario Tauri en Arch
-      vía `pacman`, otros Linux, Windows vía WebView2 +
-      MSVC; pruebas del runtime gráfico y del dispatch
-      Tauri end-to-end), y la aceptación explícita del
-      usuario. La **ejecución real en Arch y en Windows NO
-      es gate de D1**: queda en Fase 6 (verificación de
-      empaquetado por plataforma).
+      no el dispatch Tauri en runtime). **Smoke Windows
+      11 MSYS posterior:** `cargo test --lib` 8/8 ok,
+      `npm run build` ok (116.20 kB initial / 34.81 kB
+      transfer), `npm run tauri dev` arrancó y
+      `Get-Process` observó un `MainWindowHandle` con
+      título `agenthd spike (D1 / Tauri + Angular)` a
+      los 12 s (PID 11624), run timed interrumpido a
+      55 s (exit 143) sin contenido Angular ni IPC
+      observables — **sigue sin ser** visualización ni
+      IPC end-to-end. Ver
+      `spikes/tauri-angular/EVIDENCE.md` → "Observaciones
+      Windows 11 MSYS". Detalle completo en "Próxima
+      tarea estrecha → Spike etapa 2 ejecutado".
+- [x] **D1 cerrado por elección explícita del usuario:**
+      Tauri + Angular. La decisión se basa en (a) la
+      familiaridad del usuario con Angular y (b) el spike
+      ya ejecutado (`spikes/tauri-angular/`, etapas 1 y 2).
+      **No** se afirma comparación factual con GTK4-rs /
+      egui / iced / servidor web local. Quedan dos frentes
+      de validación gráfica, **distintos** entre sí: (i)
+      IPC visual (ventana nativa + JS↔Rust con CSP y
+      `127.0.0.1:14720`), gate del primer slice read-only
+      de Fase 5 (ver punto 5); (ii) empaquetado
+      cross-platform Arch / otros Linux / Windows, gate
+      de Fase 6 (D4 pendiente). D1 no validaba ninguno de
+      los dos; era solo la elección del framework. La
+      **base del primer slice read-only Settings + Agents
+      (Fase 5)** ya está ejecutada: el slice "binario
+      acompañante" (Fase 5 [x]) localiza el companion
+      `agenthd-gui(.exe)` adyacente al CLI, aborta con
+      exit `2` sin escrituras cuando falta, y cuando está
+      presente reenvía argv + exit code al acompañante
+      preservando la rama TUI. El contrato de
+      instalación "emparejada" (CLI + GUI como dos
+      crates separados) está documentado en `README.md`
+      → "Paired install contract (CLI + companion GUI)".
+      Lo que queda pendiente del primer slice read-only
+      **no** es la integración: es la **validación por
+      el usuario** del binario acompañante **contra la
+      configuración real compartida con la TUI** (mismo
+      `HOME`, sin `--repo`, sin aislamiento de `HOME`),
+      para confirmar que los paneles Settings y Agents
+      reflejan el mismo estado que la TUI observa hoy.
+      Esa validación es la próxima tarea estrecha (ver
+      punto 5); **no** se afirma contenido Angular ni
+      IPC end-to-end del binario de producción — lo
+      único observado a nivel de paired build es el
+      handle / título del proceso acompañante tras
+      `cargo install` en raíz temporal preaprobada (ver
+      "Validación y plataforma"). La confirmación
+      manual user-reported del spike en `tauri dev`
+      (Settings + Agents + Refresh both) **sigue
+      siendo evidencia aparte y separada**: es del
+      spike en modo dev, no del binario de
+      producción. Gates de Fase 5: el primer slice
+      read-only depende solo de D2 (D3 no le aplica —
+      D3 bloquea las subfases largas que lo extiendan);
+      D1 ya está cerrado. D3 / D4 / D5 siguen
+      pendientes; el empaquetado cross-platform (Arch
+      / otros Linux / Windows) sigue siendo gate
+      separado de Fase 6 (D4 pendiente).
 
 ### Fase 5 — Slice Settings + Agents y expandir
 
-- [ ] Slice vertical; requiere D1 + D2 (subfases largas además D3).
+- [x] **Binario acompañante (slice read-only, fase 5 — primer
+      paso).** El CLI `agenthd` localiza el binario
+      `agenthd-gui` (o `agenthd-gui.exe` en Windows) adyacente
+      al ejecutable actual; si falta, aborta con exit `2` y un
+      mensaje de stderr que nombra el archivo faltante **antes**
+      de que `resolve_checkout_path` corra (y por tanto antes
+      de cualquier escritura de `settings.json`). Cuando está
+      presente, `resolve_checkout_path` se ejecuta igual que en
+      la TUI (precedencia de `--repo`, save-if-changed,
+      `save_settings` ya crea el padre), y luego el CLI hace
+      `Command::new(companion).args(args).status()` con el env
+      heredado naturalmente — el código de salida del
+      acompañante se reenvía al llamador. La rama GUI no llama
+      `ensure_dirs` ni instala `TerminalGuard` / panic hook:
+      el acompañante posee su propia superficie de ventana. PATH
+      **no** se consulta: solo el nombre exacto adyacente al
+      ejecutable actual. El contrato de instalación
+      "emparejada" (CLI + GUI como dos crates separados, sin
+      segundo copiado del spike) está documentado en el
+      `README.md`. La rama TUI / default queda **intacta**:
+      mismas pruebas, mismo contrato D2, mismo comportamiento
+      observable. Tests focales nuevos en
+      `src/main.rs::tests` (4: locator puro contra
+      `current_exe` inyectado, exact-sufijo de plataforma
+      única — sin fallback a otras extensiones —,
+      no-match de archivos adyacentes no-companion, y
+      spawn-and-wait con proceso falso en `TempDir` —
+      `cmd.exe` renombrado en Windows, script shebang en
+      Unix); tests de integración actualizados en
+      `tests/cli_launch.rs` (5: 2 de rechazo con mensaje
+      compañero-ausente sobre copia aislada del binario en
+      `TempDir` — el suite ya no asume que `target/debug`
+      está limpio; un `agenthd-gui(.exe)` adyacente al bin
+      de producción no rompe los tests — más 3 de
+      companion-present: persistencia de `--repo` con
+      `settings.json` escrito y `state.json` / OpenCode / Pi
+      target trees no escritos; no-rewrite cuando `--repo`
+      iguala el valor persistido (la rama
+      `save-if-changed` en `resolve_checkout_path` mantiene
+      sus bytes, ahora ejercitada también en integración);
+      y `--repo` inválido falla cerrado sin `settings.json`).
+      El test unitario de no-rewrite para `--repo` igual al
+      valor persistido se sigue cubriendo en `launcher::tests
+      ::resolve_repo_override_does_not_rewrite_settings_when_unchanged`
+      (independiente de plataforma) en paralelo a la nueva
+      cobertura de integración. El spike
+      `spikes/tauri-angular/src-tauri/` renombra su binario a
+      `agenthd-gui` vía `[[bin]]` y baja el branding "spike"
+      en `productName` / `identifier` / título de ventana /
+      `<h1>` Angular; comandos, capabilities, CSP y
+      comportamiento read-only **sin cambios**. Sin campos
+      nuevos en `settings.json`, sin permisos nuevos, sin
+      escrituras nuevas desde la GUI, sin D3/D4/D5 tocados.
+      Ver `README.md` → "Paired install contract (CLI +
+      companion GUI)" y "Modes (TUI today, GUI planned)"
+      para los detalles exactos y el contrato observable.
+- [ ] Slice vertical (subfases largas además D3): mutaciones,
+      sync, agent editor, skills — D3 no aplica a este slice.
 
 ### Fase 6 — Verificar empaquetado
 
@@ -317,20 +449,21 @@ extracciones de Fase 2.
    override sigue re-parseando argv vía `parse_repo_override`
    (contrato legado: save-if-changed, primer `--repo` gana).
    Ver "Decisiones pendientes → D2".
-4. **Acción siguiente (Fase 4 / D1).** Fase 2 cerrada:
-   `plan_then_apply_skills`, `plan_then_apply_agents_safe`,
-   `save_agent` extraídos a `workflows.rs`; `tools` y
-   dispatch en `app/mod.rs` evaluados UI-only y no
-   extraíbles (documentado arriba). El spike de Tauri +
-   Angular está **ejecutado** (etapas 1 y 2, ver más abajo);
-   **D1 (forma GUI) sigue sin cerrarse** — la decisión es
-   entre escritorio nativo (Tauri, GTK4-rs, egui, iced) o
-   servidor web local, y requiere comparar la evidencia del
-   spike ya hecho con el resto de candidatos y la firma
-   explícita antes de cualquier extracción nueva o slice
-   vertical. Sin cambios de contrato CLI/GUI; `gui` sigue
-   siendo solo la rama de rechazo. Fase 3 sigue cerrada
-   (launcher aislado, D2 sellado).
+4. **Acción siguiente (Fase 4 cerrada / D1 cerrado).** Fase 2
+   cerrada: `plan_then_apply_skills`,
+   `plan_then_apply_agents_safe`, `save_agent` extraídos a
+   `workflows.rs`; `tools` y dispatch en `app/mod.rs`
+   evaluados UI-only y no extraíbles (documentado arriba).
+   El spike de Tauri + Angular está **ejecutado** (etapas
+   1 y 2, ver más abajo) y **D1 (forma GUI) está cerrado
+   por elección explícita del usuario** — Tauri + Angular
+   por familiaridad del usuario con Angular y por la
+   existencia del spike; **no** se afirma comparación
+   factual con GTK4-rs / egui / iced / servidor web local.
+   Sin cambios de contrato CLI/GUI; `gui` sigue siendo
+   solo la rama de rechazo. Fase 3 sigue cerrada
+   (launcher aislado, D2 sellado). Próxima tarea
+   estrecha: ver punto 5.
 
    **Spike etapa 1 ejecutado: seam `lib` creado (single
    source of truth, sin fixtures en producción).**
@@ -383,6 +516,12 @@ extracciones de Fase 2.
    (rechazo `gui` y `gui --repo` sin efectos colaterales,
    contrato CLI intacto); `cargo clippy --all-targets` sin
    warnings nuevos (diff textual vs baseline: vacío).
+   **Este 474 es la snapshot del root crate en Linux
+   al cierre del spike etapa 1, antes del slice
+   "binario acompañante" de Fase 5; el conteo
+   post-slice actual del root crate es 491 ok
+   (Windows 11 MSYS — ver "Validación y plataforma").
+   El conteo Linux post-slice no se re-ejecutó.**
 
    Cambio API mínimo asociado: el método `Mode::prev` que
    vivía como `impl Mode { pub(super) fn prev }` en
@@ -391,10 +530,18 @@ extracciones de Fase 2.
    por orphan rules porque el `impl` ya no puede estar
    en el crate del bin tras mover `Mode` al lib.
 
-   **D1 sigue sin cerrarse** tras este paso: la etapa 1
-   solo habilita la dependencia por path; la elección de
-   framework GUI y el slice vertical siguen bloqueados por
-   la comparación y firma de D1 (etapa 2 ya ejecutada).
+   **D1 no se cerró tras este paso:** la decisión de
+   mantener Tauri + Angular fue posterior, por elección
+   explícita del usuario. Este spike etapa 1 es solo el
+   seam `lib` que habilita la dependencia por path que
+   el slice read-only de Fase 5 reutilizará. La base
+   del slice read-only (binario acompañante, paired
+   install contract en `README.md`) está ejecutada en
+   Fase 5 [x]; las **subfases largas del slice vertical**
+   (mutaciones, sync, agent editor, skills — D3 no
+   aplica al read-only) quedan descritas como
+   próxima tarea estrecha (ver punto 5); su
+   ejecución queda pendiente.
 
    **Spike etapa 2 ejecutado: prototipo aislado
    `spikes/tauri-angular/`.** Scaffold oficial Tauri v2 +
@@ -459,6 +606,12 @@ extracciones de Fase 2.
    (`cargo test --all-targets` = 474 ok + 1 ignored,
    mismos números que antes del spike; `agenthd gui`
    sigue rechazado por `src/main.rs` con exit code 2).
+   **Este 474 es la snapshot del root crate en Linux
+   al cierre del spike etapa 2, antes del slice
+   "binario acompañante" de Fase 5; el conteo
+   post-slice actual del root crate es 491 ok
+   (Windows 11 MSYS — ver "Validación y plataforma").
+   El conteo Linux post-slice no se re-ejecutó.**
    Lockfiles generados y versionados con el spike:
    `spikes/tauri-angular/src-tauri/Cargo.lock` (115 KB,
    Tauri 2.12.0, wry 0.57.0) y
@@ -479,32 +632,164 @@ extracciones de Fase 2.
    Instrucciones para ejecutar el spike end-to-end
    (`npm install && npm run tauri dev`) en
    `spikes/tauri-angular/README.md`.
-   **D1 sigue sin cerrarse**: este spike es solo una
-   pieza de evidencia, no valida el runtime gráfico ni
-   marca D1 como decidido. **El próximo paso no es
-   invertir en el slice vertical de Fase 5 — eso viene
-   después de D1.** El siguiente paso real es comparar
-   pros/contras factuales de Tauri vs GTK4-rs vs egui
-   vs iced vs servidor web local, tomando como entrada
-   (a) la evidencia de este spike (scaffold reproducible,
-   8/8 tests focales, lockfiles generados y versionados
-   con el spike, lockfile doble, dependencia
-   cruzada por path), (b) las validaciones pendientes
-   (ejecución real con display del binario Tauri, Arch
-   vía `pacman`, otros Linux, Windows vía WebView2 +
-   MSVC; pruebas del runtime gráfico y del dispatch
-   Tauri end-to-end), y (c) la aceptación explícita del
-   usuario. La decisión D1 es bloqueante para Fase 4 y
-   precede a Fase 5; Fase 5 no se inicia hasta que D1
-   esté cerrado.
+   **D1 cerrado por elección explícita del usuario**
+   (Tauri + Angular — familiaridad con Angular + spike ya
+   ejecutado). Este spike sigue siendo una pieza de
+   evidencia; **no** se afirma validación de visualización
+   ni de IPC end-to-end en este host. El siguiente paso
+   es el slice read-only de Fase 5 (ver punto 5).
+5. **Próxima tarea estrecha (Fase 5).** D1 cerrado por
+   elección explícita del usuario (Tauri + Angular). El
+   spike ya ejecutado deja dos comandos read-only
+   (`compose_settings_status`, `compose_agents_list`)
+   reusando el lib. **Confirmación manual user-reported
+   (Windows 11 interactivo):** el usuario reportó que
+   Settings y Agents aparecen y que Refresh both
+   actualiza — ver
+   `spikes/tauri-angular/EVIDENCE.md` → "Observaciones
+   Windows 11 MSYS → Verificación manual user-reported".
+   Esa confirmación es **manual y user-reported**, **no**
+   instrumentada ni capturada por el agente: **no** se
+   capturaron payloads de IPC, **no** se inspeccionaron
+   CSP / devtools / red, **no** se inspeccionó el DOM,
+   **no** se tomaron screenshots, **no** se afirmó
+   contenido específico mostrado, y **no** se ejecutó
+   el runtime empaquetado en otras plataformas.
+
+   **Lo que la confirmación manual establece:** el gate
+   visual del primer slice read-only de Fase 5
+   (aparición de los paneles Settings y Agents, y
+   refresco manual al pulsar "Refresh both") queda
+   **satisfecho** por el reporte manual del usuario
+   en una sesión `npm run tauri dev` interactiva en
+   Windows 11. La atribución es honesta — el agente
+   no instrumentó esa sesión — pero **sí** se da por
+   satisfecho lo que el usuario atestiguó sobre esos
+   tres puntos. **Lo que la confirmación manual NO
+   hace:** no inspecciona payloads de IPC, no
+   inspecciona CSP en runtime, no inspecciona
+   devtools ni red, no afirma contenido específico
+   mostrado, y no cubre otras plataformas
+   (empaquetado Arch / otros Linux / Windows sigue
+   siendo gate **separado** de Fase 6, D4 pendiente).
+   Un eventual probe automatizado end-to-end — si se
+   ejecuta — sería validación adicional para
+   profundizar confianza, pero **no** es cierre
+   formal obligatorio del gate visual de Fase 5,
+   que queda satisfecho por la confirmación
+   user-reported.
+
+**Estado actual del primer slice read-only
+   (Fase 5).** La integración **ya está ejecutada**
+   (el slice "binario acompañante" de Fase 5 está
+   marcado [x]): la rama `agenthd gui` de `src/main.rs`
+   ya no rechaza `gui` por "no implementado"; localiza
+   el binario `agenthd-gui` adyacente al ejecutable y
+   aborta con exit `2` y stderr claro si falta **antes**
+   de tocar `settings.json` (acompañante ausente ⇒
+   exit `2` con stderr, **sin escrituras** a
+   `settings.json` / `state.json` / OpenCode / Pi); cuando
+   el acompañante está presente lo lanza con el mismo
+   argv y reenvía su código de salida. `--repo` aplica
+   y persiste igual que en la TUI cuando el
+   acompañante está presente (`settings.json` se
+   escribe por la rama save-if-changed de
+   `resolve_checkout_path`); `--repo` igual al valor
+   persistido **no** reescribe `settings.json`. Los
+   comandos `compose_settings_status` y
+   `compose_agents_list` del acompañante son read-only
+   y reusan el lib; `ensure_dirs` y `TerminalGuard` /
+   panic hook **no** se llaman en la rama GUI. La
+   semántica de la TUI y de `--repo` queda intacta
+   (TUI **sin cambios observables**; mismas pruebas,
+   mismo contrato D2, misma precedencia override /
+   save-if-changed). El contrato de instalación
+   "emparejada" (CLI + GUI como dos crates separados,
+   sin segundo copiado del spike) está documentado en
+   `README.md` → "Paired install contract (CLI +
+   companion GUI)". El binario del spike se renombró a
+   `agenthd-gui` y bajó el branding "spike" en
+   `productName` / `identifier` / título de ventana /
+   `<h1>` Angular; comandos, capabilities, CSP y
+   comportamiento read-only **sin cambios**.
+
+   **Qué se ha validado a nivel de paired build
+   (Windows 11 MSYS):** instalación con `cargo install
+   --path . --locked --root <isolated temp>` (CLI) +
+   `cargo install --path spikes/tauri-angular/src-tauri
+   --locked --bin agenthd-gui --root <same isolated
+   temp>` (GUI) → `agenthd.exe gui` cronometrado
+   produjo un proceso acompañante `agenthd-gui.exe` con
+   `MainWindowHandle=789140` y título `'agenthd GUI'`.
+   **Solo** se observó el handle / título por
+   enumeración de procesos; **no** se instrumentó
+   contenido Angular, **no** se capturaron payloads de
+   IPC, **no** se inspeccionaron CSP / devtools / red,
+   **no** se tomó screenshot del runtime de
+   producción, y **no** se inspeccionó el DOM. **No
+   se afirma** validación de los contenidos UI ni de
+   IPC end-to-end del binario de producción: el gate
+   visual del primer slice read-only **sigue
+   pendiente** de la validación del usuario contra la
+   configuración real compartida (siguiente tarea).
+   El cleanup de la paired build se hizo por timeout;
+   **no** se reclama empaquetado ni distribución por
+   paquete (riesgo de reproducibilidad: `cargo`
+   advirtió que `yoke-derive v0.8.3` está yanked del
+   registro `locked`; la instalación completó pero un
+   rerun con `--locked` puede fallar si el resolver no
+   encuentra esa versión). La confirmación manual
+   user-reported del spike en `tauri dev` (Settings +
+   Agents + Refresh both) **sigue siendo evidencia
+   aparte y separada**: es del spike en modo dev, no
+   del binario de producción, y **no** captura
+   payloads IPC, **no** inspecciona CSP / devtools /
+   red, **no** afirma contenido específico mostrado,
+   **no** cubre otras plataformas.
+
+   **Próxima tarea estrecha (validación del usuario
+   contra configuración real compartida).** El usuario
+   debe validar el binario acompañante **contra la
+   misma configuración real que la TUI usa hoy** —
+   **sin** `--repo`, **sin** aislamiento de `HOME`,
+   mismo `HOME` que la TUI — y confirmar que los
+   paneles Settings y Agents de la GUI muestran el
+   mismo estado que la TUI observa desde el mismo
+   checkout. Esa validación es el cierre pendiente
+   del gate visual del primer slice read-only de Fase
+   5; **no** requiere una integración nueva (la
+   integración del slice ya está hecha), solo
+   ejecución del binario de producción con la paired
+   install del `README.md` y comparación lado-a-lado
+   con la TUI sobre el mismo checkout. Hasta que esa
+   validación se complete, el gate visual de Fase 5
+   **no** está cerrado por instrumento del agente: la
+   satisfacción que se registra es la del reporte
+   manual del spike en `tauri dev`, que es
+   **evidencia aparte y separada**, no del binario
+   de producción. **D3, D4 y D5 siguen pendientes.**
+   D3 bloquea las subfases largas que extiendan el
+   slice read-only (mutaciones, sync, agent editor,
+   skills). D4 (empaquetado Arch / otros Linux /
+   Windows) y la validación por plataforma son gate
+   **separado y distinto** de Fase 6, **independiente**
+   del gate visual de Fase 5 satisfecho por la
+   confirmación user-reported del spike.
 
 ## Validación y plataforma
 
-- `cargo test --all-targets` — 233 (lib) + 61 (bin) + 2 (cli_launch integ) + 178 (smoke) ok, 1 ignored — **única duplicación: 2 tests del fixture `starter_fixture::tests::starter_registry_*` corren 2x (una en el lib, otra en el bin)**; los demás tests no se duplican. El lib corre los 233 tests de los módulos compartidos (`agent`, `launcher`, `models`, `store`, `tools`, `workflows`) y el bin corre 61 tests (59 TUI-specific de `app::tests::*` + 2 del fixture re-incluido en `src/main.rs`). `Cargo.lock` confirma tamaño de binario de producción sin fixtures (verificado por `strings`: cero markdown de los `agents/*.md`). (D2 añadió
+- `cargo test --all-targets` — conteo **histórico** del root crate (Linux, **antes** de la integración del slice "binario acompañante"): 233 (lib) + 61 (bin) + 2 (cli_launch integ) + 178 (smoke) = **474 ok, 1 ignored** — **única duplicación: 2 tests del fixture `starter_fixture::tests::starter_registry_*` corren 2x (una en el lib, otra en el bin)**; los demás tests no se duplican. **El conteo Linux post-slice no se re-ejecutó:** los conteos observados del root crate **después** de integrar el slice "binario acompañante" son los de **Windows 11 MSYS** documentados más abajo — **interim 490 ok, 0 failed, 0 ignored** (run anterior del root crate en Windows 11 MSYS, con 4 tests `cli_launch`); **current 491 ok, 0 failed, 0 ignored** (run posterior tras habilitar el quinto test de integración `cli_launch`). El lib corre los 233 tests de los módulos compartidos (`agent`, `launcher`, `models`, `store`, `tools`, `workflows`) y el bin corre **65 tests post-slice** (59 TUI-specific de `app::tests::*` + 2 del fixture re-incluido en `src/main.rs` + **4 nuevos del slice "binario acompañante"** en `src/main.rs::tests`: `locate_companion_returns_none_when_no_companion_adjacent`, `locate_companion_finds_platform_native_companion_adjacent`, `locate_companion_ignores_non_companion_files`, `spawn_propagates_companion_exit_code`); pre-slice eran 61 bin (59 + 2). Los **5** tests de integración en `tests/cli_launch.rs` (`agenthd_gui_rejects_with_clear_error_and_no_side_effects`, `agenthd_gui_with_repo_rejects_without_writing_settings`, **`agenthd_gui_with_companion_present_persists_repo_without_target_writes`**, **`agenthd_gui_with_companion_does_not_rewrite_settings_when_unchanged`**, **`agenthd_gui_with_companion_present_and_invalid_repo_fails_closed`**) se ejecutan contra una copia aislada del binario en un `TempDir` (no contra el `target/debug/agenthd(.exe)` directo, para que un `agenthd-gui(.exe)` instalado o copiado por el usuario junto al binario de producción no falsifique los tests de compañero-ausente). Los 2 tests originales (`gui` y `gui --repo`) ahora usan la copia aislada y esperan el nuevo mensaje de stderr (`companion binary \`agenthd-gui...`); los 3 nuevos (companion-present) copian un companion falso (script shebang en Unix, `cmd.exe` renombrado en Windows), validan que `settings.json` se persiste con el `--repo`, que `state.json` / OpenCode / Pi target trees no se escriben, que `--repo` igual al valor persistido no reescribe `settings.json` (la rama `save-if-changed` en `resolve_checkout_path` mantiene sus bytes), y que `--repo <path-inexistente>` falla cerrado (exit 1, sin `settings.json`). El contrato verificable (exit code 2 con stderr claro y sin `settings.json` cuando el acompañante falta) se preserva bit-for-bit. `Cargo.lock` confirma tamaño de binario de producción sin fixtures (verificado por `strings`: cero markdown de los `agents/*.md`). **Bloqueador pre-existente en Windows para `cargo test --all-targets`: resuelto.** Los call sites problemáticos en `src/store/{tests, settings}.rs` que usaban `std::os::unix::fs::symlink` / paths Unix-style absolutos sin `#[cfg(unix)]` se corrigieron (5 call sites: `canonical_dir_from` en `settings.rs` y tests; arm `unix_symlink` en tests de symlink-rejection y validate; paths absolutos en tests de missing-checkout) junto con la construcción de sufijos del `rename_seam` con separador nativo del host. Conteos observados en Windows 11 MSYS post-corrección (run **current** con 5 tests `cli_launch`): 238 (lib) + 65 (bin) + 5 (cli_launch integ) + 183 (tools_install_smoke) = **491 ok, 0 failed, 0 ignored** — el comando `cargo test --all-targets` ahora pasa entero en Windows. La corrección confirma que los tests del root crate ya no tropiezan con la falta de `std::os::unix` en MSVC; **no** se afirma validación cross-platform end-to-end del runtime gráfico ni del empaquetado Windows (siguen siendo gate de Fase 6, D4 pendiente), y Arch / otros Linux siguen pendientes en máquina real. (D2 añadió
   13 tests focales del parser y 2 tests de integración del rechazo
-  `gui`; la primera extracción de Fase 2 añadió 3 tests focales del
-  workflow `plan_then_apply_skills`; la segunda extracción añade
-  4 tests focales del workflow `plan_then_apply_agents_safe` y 2
+  `gui`; el slice "binario acompañante" actualiza los 2 tests
+  originales de `cli_launch` (mismo contrato, mensaje actualizado,
+  ahora con copia aislada del binario en `TempDir`) y añade 2
+  tests de integración nuevos (companion-present con
+  `--repo` válido y con `--repo` inválido), más 4 tests focales
+  en `src/main.rs::tests` (locator puro, decoy,
+  fake-process spawn-and-wait, exact-sufijo); la primera
+  extracción de Fase 2 añadió 3 tests focales del workflow
+  `plan_then_apply_skills`; la segunda extracción añade 4
+  tests focales del workflow `plan_then_apply_agents_safe` y 2
   tests TUI directos del handler `apply_safe_install` para fijar
   el orden observable `load_canonical → guard target` y el mensaje
   `pick a harness first`; la tercera extracción añade 5 tests
@@ -535,7 +820,68 @@ extracciones de Fase 2.
   como Linux genérico, no como Arch específica); Arch, otros Linux
   y Windows pendientes en máquina real (`MoveFileW`, shim
   npm-via-node, `cfg(windows)`); el README no debe declarar Arch ni
-  Windows soportados hasta entonces.
+  Windows soportados hasta entonces. **Windows 11 MSYS:** hay un
+  smoke parcial registrado en `spikes/tauri-angular/EVIDENCE.md`
+  ("Observaciones Windows 11 MSYS") — `cargo test --lib` 8/8 OK,
+  `npm run build` OK, `npm run tauri dev` arrancó y
+  `Get-Process` observó un `MainWindowHandle` con título
+  `agenthd spike (D1 / Tauri + Angular)` (PID 11624) a los 12 s,
+  con un run timed interrumpido a los 55 s (exit 143) sin
+  observarse contenido Angular ni respuesta IPC. **No** equivale a
+  Windows validado: el runtime gráfico y el IPC end-to-end
+  siguen pendientes — el smoke reduce incertidumbre sobre
+  arranque del binario y presencia de WebView2, no sobre
+  visualización ni IPC. **Confirmación manual user-reported
+  (Windows 11 interactivo):** el usuario reportó que Settings
+  y Agents aparecen y que Refresh both actualiza (ver
+  `spikes/tauri-angular/EVIDENCE.md` → "Observaciones Windows
+  11 MSYS → Verificación manual user-reported"); esa
+  confirmación es **user-reported**, **no** instrumentada por
+  el agente, **no** captura payloads IPC, **no** inspecciona
+  CSP / devtools / red, **no** afirma contenido específico, y
+  **no** equivale a Windows validado ni empaquetado.
+  Empaquetado Windows sigue siendo gate de Fase 6.
+- Root crate `cargo test --all-targets` en Windows 11 MSYS:
+  verde tras la corrección de portabilidad de los tests
+  `unix_symlink` / unix-path en `src/store/{skills_tests,
+  settings, tests}` y de la construcción de sufijos del
+  `rename_seam` con separador nativo del host; los conteos
+  observados son 238 (lib) + 65 (bin) + 5 (cli_launch integ) +
+  183 (tools_install_smoke) = **491 ok, 0 failed, 0 ignored**.
+  `cargo test --test cli_launch` corre los 5 tests verde
+  (incluidos los `companion-present` con el fake `cmd.exe`).
+  `cargo fmt --check` limpio. **No** se afirma validación
+  cross-platform end-to-end: la corrección confirma que los
+  tests del root crate ya no tropiezan con la falta de
+  `std::os::unix` en MSVC, no que el runtime gráfico o el
+  empaquetado Windows estén validados — esos siguen siendo
+  gate de Fase 6 (D4 pendiente), y Arch / otros Linux siguen
+  pendientes en máquina real.
+- **Observación Fase 5 — paired build instalada por
+  orquestador en raíz temporal preaprobada (Windows 11
+  MSYS).** El orquestador instaló ambos binarios en una
+  raíz temporal preaprobada en Windows con `cargo install
+  --path . --locked --root <isolated temp>` (CLI) y
+  `cargo install --path spikes/tauri-angular/src-tauri
+  --locked --bin agenthd-gui --root <same isolated temp>`
+  (GUI); un `agenthd.exe gui` cronometrado tuvo un proceso
+  acompañante `agenthd-gui.exe` con `MainWindowHandle=789140`
+  y título `'agenthd GUI'`. La paired build **no**
+  instrumentó contenido Angular ni IPC (solo se observó
+  el handle / título por enumeración de procesos) y el
+  cleanup se hizo por timeout. **No** se reclama empaquetado
+  ni distribución por paquete. **Riesgo de
+  reproducibilidad:** cargo advirtió durante la
+  instalación que `yoke-derive v0.8.3` está yanked del
+  registro `locked`; la instalación completó, pero un rerun
+  con `--locked` puede fallar si el resolver no encuentra
+  esa versión. La confirmación manual user-reported del
+  spike (Settings + Agents + Refresh both, ver
+  `spikes/tauri-angular/EVIDENCE.md` → "Observaciones
+  Windows 11 MSYS → Verificación manual user-reported")
+  sigue siendo **distinta y separada**: es manual,
+  no-instrumentada, y no captura payloads IPC ni inspecciona
+  CSP / devtools / red.
 
 ## Handoff (importante)
 

@@ -141,7 +141,13 @@ fn with_settings_repoints_canonical_dir() {
 fn with_settings_rejects_missing_checkout() {
     let dir = TempDir::new().unwrap();
     let paths = setup_paths(&dir);
-    let settings = Settings::new("/this/path/does/not/exist/agenthd-test");
+    // Use a non-existent subpath of an existing tempdir so the
+    // path is absolute on the host platform. The Unix-style
+    // literal `/this/path/...` is NOT absolute on Windows and
+    // would trip the absolute-path gate instead of the
+    // missing-checkout gate this test is asserting.
+    let missing = dir.path().join("does-not-exist");
+    let settings = Settings::new(missing.to_string_lossy());
     let err = paths.with_settings(&settings).unwrap_err().to_string();
     assert!(
         err.contains("does not exist"),
@@ -728,7 +734,13 @@ fn settings_round_trip() {
 fn canonical_dir_from_rejects_missing_checkout() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join(".agenthd");
-    let settings = Settings::new("/this/path/does/not/exist/agenthd-test");
+    // Non-existent subpath of an existing tempdir so the path is
+    // absolute on the host platform (the Unix-style literal
+    // `/this/path/...` is NOT absolute on Windows and would trip
+    // the absolute-path gate instead of the missing-checkout
+    // gate this test is asserting).
+    let missing = dir.path().join("does-not-exist");
+    let settings = Settings::new(missing.to_string_lossy());
     let err = canonical_dir_from(&root, &settings)
         .unwrap_err()
         .to_string();
@@ -814,8 +826,13 @@ fn load_canonical_rejects_symlinked_source() {
     let target = dir.path().join("real-source");
     fs::create_dir_all(target.join("agents")).unwrap();
     let link = dir.path().join("checkout-link");
-    if std::os::unix::fs::symlink(&target, &link).is_err() {
-        // Symlink creation can fail in sandboxed CI environments.
+    #[cfg(unix)]
+    let made_link = std::os::unix::fs::symlink(&target, &link).is_ok();
+    #[cfg(windows)]
+    let made_link = std::os::windows::fs::symlink_dir(&target, &link).is_ok();
+    if !made_link {
+        // Symlink creation can fail in sandboxed CI environments
+        // or on Windows without SeCreateSymbolicLinkPrivilege.
         return;
     }
     let paths = Paths {
@@ -1561,8 +1578,13 @@ fn apply_safe_skips_when_canonical_is_symlink_after_plan() {
     fs::remove_file(&canonical_path).unwrap();
     let real_target = dir.path().join("real-canonical.md");
     fs::write(&real_target, b"symlink-target\n").unwrap();
-    if std::os::unix::fs::symlink(&real_target, &canonical_path).is_err() {
-        // Symlink creation can fail in sandboxed CI environments.
+    #[cfg(unix)]
+    let made_link = std::os::unix::fs::symlink(&real_target, &canonical_path).is_ok();
+    #[cfg(windows)]
+    let made_link = std::os::windows::fs::symlink_file(&real_target, &canonical_path).is_ok();
+    if !made_link {
+        // Symlink creation can fail in sandboxed CI environments
+        // or on Windows without SeCreateSymbolicLinkPrivilege.
         return;
     }
 
@@ -1608,7 +1630,11 @@ fn apply_safe_skips_when_target_is_symlink_after_plan() {
     let real_target = dir.path().join("real-target.md");
     fs::write(&real_target, b"target-backing-content\n").unwrap();
     fs::remove_file(&target_path).unwrap();
-    if std::os::unix::fs::symlink(&real_target, &target_path).is_err() {
+    #[cfg(unix)]
+    let made_link = std::os::unix::fs::symlink(&real_target, &target_path).is_ok();
+    #[cfg(windows)]
+    let made_link = std::os::windows::fs::symlink_file(&real_target, &target_path).is_ok();
+    if !made_link {
         return;
     }
 

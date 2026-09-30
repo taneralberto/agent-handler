@@ -14,6 +14,19 @@ edition = "2021"
 name = "agenthd_tauri_angular_spike_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+# Production binary name. The crate package name stays
+# `agenthd-tauri-angular-spike` (internal / historical); the
+# binary that ships is `agenthd-gui` (or `agenthd-gui.exe` on
+# Windows). The root `agenthd` CLI locates the companion by
+# this exact filename adjacent to itself; see the paired-install
+# contract in the README. The crate directory stays under
+# `spikes/tauri-angular/`; only the binary name and displayed
+# branding dropped the "spike" marker. Commands, capabilities,
+# CSP, and read-only behavior are unchanged.
+name = "agenthd-gui"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

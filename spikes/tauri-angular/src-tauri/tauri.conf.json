@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "agenthd-tauri-angular-spike",
+  "productName": "agenthd-gui",
   "version": "0.1.0",
-  "identifier": "dev.agenthd.spike.tauri-angular",
+  "identifier": "dev.agenthd.gui",
   "build": {
     "beforeDevCommand": "npm run start",
     "devUrl": "http://127.0.0.1:14720",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "agenthd spike (D1 / Tauri + Angular)",
+        "title": "agenthd GUI",
         "width": 900,
         "height": 700
       }

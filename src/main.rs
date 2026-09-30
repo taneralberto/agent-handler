@@ -48,6 +48,7 @@ use std::panic;
 use crate::app::App;
 use crate::launcher::{parse_launch, resolve_checkout_path, Mode, ResolveOutcome};
 use crate::store::{Paths, Settings, State};
+use std::path::{Path, PathBuf};
 
 struct TerminalGuard {
     armed: bool,
@@ -77,10 +78,11 @@ impl Drop for TerminalGuard {
 fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Parse argv into a launch plan before touching the filesystem
-    // or the persisted `settings.json`. The GUI mode is rejected
-    // here — implementation lives behind D1 / phase 5 — so a user
-    // typo or a `--repo` that collides with the mode keyword never
-    // produces side effects.
+    // or the persisted `settings.json`. The GUI branch locates
+    // its companion binary next to the running executable and
+    // rejects with exit `2` before any settings.json write can
+    // happen, so a user typo or a `--repo` that collides with
+    // the mode keyword never produces side effects.
     //
     // `parse_launch` is the CLI-surface parser: it owns the mode
     // keyword and the `--repo` value-shape validation that the
@@ -96,11 +98,7 @@ fn run() -> Result<()> {
     // implemented TUI mode.
     let plan = parse_launch(&args)?;
     if plan.mode == Mode::Gui {
-        eprintln!(
-            "agenthd: GUI mode is not implemented yet; \
-             use `agenthd` or `agenthd tui` for now"
-        );
-        std::process::exit(2);
+        return run_gui(&args);
     }
     let paths = Paths::from_env().context("resolve config paths")?;
     // `ensure_dirs` only creates the agenthd root (settings + state
@@ -207,9 +205,229 @@ fn run() -> Result<()> {
     result
 }
 
+/// Run the `agenthd gui` branch. Locate the companion binary
+/// adjacent to the current executable; if it is missing, exit
+/// with code `2` and a stderr message that names the missing
+/// file **before** `resolve_checkout_path` runs (so no
+/// `settings.json` write can happen). When the companion is
+/// present, run `resolve_checkout_path` to honour the
+/// `--repo` / save-if-changed contract the TUI branch uses,
+/// then spawn the companion and forward its exit code.
+///
+/// The GUI branch does NOT call `Paths::ensure_dirs` and does
+/// NOT install the `TerminalGuard` / panic hook: the companion
+/// owns its own windowing surface, and the TUI restoration
+/// primitives only apply to a TTY the CLI boot path allocates.
+/// `save_settings` creates the parent directory, so the
+/// missing-agenthd-root case still works without an explicit
+/// `ensure_dirs` call.
+fn run_gui(args: &[String]) -> Result<()> {
+    // Adjacent-exact-filename lookup only — PATH is intentionally
+    // not consulted so a hostile PATH cannot masquerade as the
+    // companion. See the paired-install contract in the README.
+    let current_exe = std::env::current_exe().context("locate current executable")?;
+    let companion = match locate_companion(&current_exe) {
+        Some(c) => c,
+        None => {
+            eprintln!(
+                "agenthd: GUI mode requires the companion binary `{}` adjacent to {}; \
+                 `cargo install` of agenthd alone does not produce it. \
+                 See the paired-install contract in the README.",
+                companion_filename(),
+                current_exe.display(),
+            );
+            std::process::exit(2);
+        }
+    };
+
+    // Honour the `--repo` / save-if-changed contract before the
+    // companion starts. The companion reads the checkout itself;
+    // `resolve_checkout_path` is called here only to persist the
+    // override the user asked for.
+    let paths = Paths::from_env().context("resolve config paths")?;
+    let _ = resolve_checkout_path(&paths, args).context("resolve configured checkout")?;
+
+    // Env is inherited by default; `status()` waits and surfaces
+    // non-zero exits / signal terminations so the caller observes
+    // the companion's true outcome.
+    let status = std::process::Command::new(&companion)
+        .args(args)
+        .status()
+        .with_context(|| format!("spawn companion `{}`", companion.display()))?;
+    match status.code() {
+        Some(code) => std::process::exit(code),
+        None => {
+            eprintln!(
+                "agenthd: companion `{}` terminated by signal",
+                companion.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Companion binary filename the boot path looks for next to
+/// the current executable. Cargo emits `agenthd-gui.exe` on
+/// Windows and `agenthd-gui` on Unix, so the lookup uses the
+/// platform-native suffix only — neither fallback nor PATH
+/// lookup is performed.
+fn companion_filename() -> &'static str {
+    #[cfg(windows)]
+    {
+        "agenthd-gui.exe"
+    }
+    #[cfg(not(windows))]
+    {
+        "agenthd-gui"
+    }
+}
+
+/// Locate the companion binary adjacent to `current_exe`.
+/// Returns the platform-native companion path if it exists,
+/// `None` otherwise. Pure: no I/O outside the directory
+/// containing `current_exe`; safe to call before any
+/// settings.json write.
+fn locate_companion(current_exe: &Path) -> Option<PathBuf> {
+    let candidate = current_exe.parent()?.join(companion_filename());
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("agenthd: {}", err);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the GUI companion slice. Two seams are
+    //! pinned here: [`locate_companion`] (pure directory lookup
+    //! against an injected `current_exe` path; no real binary
+    //! spawned) and the spawn-and-wait contract `run_gui`
+    //! exposes to its caller (exercised with a fake process in a
+    //! `TempDir`: a shebang script on Unix, a copy of `cmd.exe`
+    //! renamed to the companion filename on Windows). The fake
+    //! lives and dies inside the tempdir; nothing is written to
+    //! the user's `target/` tree or to `$HOME`. Integration
+    //! coverage (exit code 2 + clear error message + no
+    //! filesystem side effects when the companion is absent, and
+    //! companion-present `--repo` persistence) lives in
+    //! `tests/cli_launch.rs`.
+    use super::*;
+
+    /// Drop a placeholder file in `dir` named like the current
+    /// executable. `locate_companion` only consults the
+    /// directory, never the file itself, so an empty file is
+    /// enough.
+    fn write_fake_current_exe(dir: &std::path::Path) -> PathBuf {
+        let name = if cfg!(windows) {
+            "agenthd.exe"
+        } else {
+            "agenthd"
+        };
+        let path = dir.join(name);
+        std::fs::write(&path, b"").expect("write fake current_exe placeholder");
+        path
+    }
+
+    /// The locator returns `None` when the platform-native
+    /// companion filename is not adjacent to `current_exe`.
+    #[test]
+    fn locate_companion_returns_none_when_no_companion_adjacent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let fake_exe = write_fake_current_exe(dir.path());
+        assert!(
+            locate_companion(&fake_exe).is_none(),
+            "locator must return None when the platform-native companion is missing"
+        );
+    }
+
+    /// The locator returns the platform-native companion path
+    /// when present. Pin the equality on the exact path so a
+    /// future refactor that searches PATH (or returns a
+    /// relative path) trips this test.
+    #[test]
+    fn locate_companion_finds_platform_native_companion_adjacent() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let fake_exe = write_fake_current_exe(dir.path());
+        let companion = dir.path().join(companion_filename());
+        std::fs::write(&companion, b"").expect("write fake companion placeholder");
+        let found = locate_companion(&fake_exe).expect("locator must find adjacent companion");
+        assert_eq!(
+            found, companion,
+            "locator must return the exact adjacent companion path"
+        );
+    }
+
+    /// Adjacent files that are not the exact platform-native
+    /// companion filename must not match. The locator is
+    /// exact-filename: an `agenthd-gui.bak` decoy (or any other
+    /// sibling) must not be confused with the companion.
+    #[test]
+    fn locate_companion_ignores_non_companion_files() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let fake_exe = write_fake_current_exe(dir.path());
+        let decoy = dir.path().join("agenthd-gui.bak");
+        std::fs::write(&decoy, b"").expect("write decoy");
+        assert!(
+            locate_companion(&fake_exe).is_none(),
+            "decoy must not be confused with the companion; locator is exact-filename only"
+        );
+    }
+
+    /// Spawn-and-wait contract: when the GUI branch launches a
+    /// companion process, its exit code is propagated. The
+    /// "fake process" is a file in a `TempDir`: a shell script
+    /// with `exit 42` (Unix) or a copy of `cmd.exe` invoked
+    /// with `/c exit 42` (Windows).
+    #[test]
+    fn spawn_propagates_companion_exit_code() {
+        use std::process::Command;
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let fake_exe = write_fake_current_exe(dir.path());
+        let companion = dir.path().join(companion_filename());
+
+        #[cfg(unix)]
+        {
+            std::fs::write(&companion, "#!/bin/sh\nexit 42\n").expect("write fake");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&companion, std::fs::Permissions::from_mode(0o755))
+                .expect("set exec bit");
+        }
+        #[cfg(windows)]
+        {
+            // Copy cmd.exe (via ComSpec) to the companion
+            // filename so the fake is recognised as an
+            // executable by the OS; pass `/c exit 42` so it
+            // exits 42. Fall back to the canonical path if
+            // ComSpec is unset (e.g. on minimal hosts).
+            let comspec = std::env::var("ComSpec")
+                .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
+            std::fs::copy(&comspec, &companion).expect("copy cmd.exe as fake companion");
+        }
+
+        let located = locate_companion(&fake_exe).expect("locator must find the fake");
+        assert_eq!(located, companion);
+
+        #[cfg(unix)]
+        let spawn_args: Vec<String> = Vec::new();
+        #[cfg(windows)]
+        let spawn_args: Vec<String> = vec!["/c".to_string(), "exit".to_string(), "42".to_string()];
+
+        let status = Command::new(&located)
+            .args(&spawn_args)
+            .status()
+            .expect("spawn fake companion");
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "GUI branch must propagate the companion's exit code; got: {status:?}"
+        );
     }
 }
