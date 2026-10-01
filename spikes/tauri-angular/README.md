@@ -18,6 +18,21 @@ servidor web local). Ver
 "Estado del spike" abajo y `GUI_ROADMAP.md` → "Decisiones
 pendientes → D1".
 
+## Instalación recomendada (orquestadora en raíz)
+
+Para instalar el CLI + companion binario en una sola pasada,
+el repositorio raíz ofrece `scripts/install.mjs` (referenciado
+en `README.md` → "Install"). Esa orquestadora resuelve el
+install root, preflights `cargo` / `npm` / `node`, corre
+`npm ci --include=dev` + `npm run build` aquí, confirma que
+`dist/agenthd-tauri-angular-spike/browser/index.html` existe, y
+ejecuta ambos `cargo install` con el mismo `--root` y la feature
+`custom-protocol`. Soporta `--force` para sobreescribir
+binarios previos. Las instrucciones de abajo (`npm ci`,
+`npm run build`, `cargo install`) son el detalle manual del
+paso 3 del contrato en pareado; la orquestadora ya hace todo
+eso.
+
 ## Qué demuestra
 
 Dos comandos Tauri read-only, ambos compuestos sobre el lib
@@ -158,6 +173,13 @@ npm run build
 npm run tauri dev
 
 # 3) Build de producción (Angular a dist/, Tauri a bundle).
+#    `npm run tauri build` / `cargo tauri build` activan la
+#    feature `custom-protocol` por el wrapper; si invocas el
+#    backend directamente (sin el wrapper npm), pasa el flag
+#    a mano — la feature es opt-in por diseño para preservar
+#    `tauri dev`:
+#       cd src-tauri
+#       cargo build --release --features custom-protocol --bin agenthd-gui
 npm run tauri build
 ```
 

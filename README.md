@@ -115,23 +115,34 @@ npm run build     # Angular bundle into dist/
 #    `agenthd-gui(.exe)` without any copy step. If you customized
 #    `CARGO_HOME` or passed `--root <dir>` to step 1, pass the
 #    same value to step 3 (e.g. `CARGO_HOME=<dir> cargo install
-#    --path src-tauri --locked --bin agenthd-gui --root <dir>`)
-#    so both binaries land next to each other — otherwise the
-#    CLI's adjacent-companion lookup will not find the
-#    companion. The package name
+#    --path src-tauri --locked --bin agenthd-gui --features
+#    custom-protocol --root <dir>`) so both binaries land next
+#    to each other — otherwise the CLI's adjacent-companion
+#    lookup will not find the companion. The package name
 #    is still `agenthd-tauri-angular-spike` (historical / internal);
 #    `--bin agenthd-gui` pins the production-style binary name the
-#    root CLI actually looks for. **Note:** this command does
-#    **not** overwrite a preexisting `agenthd-gui(.exe)` at the
-#    destination. `cargo install` refuses to replace an existing
-#    binary at the target path unless `--force` is passed, so any
-#    companion you already installed (from a previous install or
-#    from your own `cargo build`) stays in place and is not
-#    silently overwritten by this step. Updating an existing
-#    companion requires a deliberate user action: re-run this
-#    command with `--force` only when you intend to replace your
-#    currently installed `agenthd-gui(.exe)`.
-cargo install --path src-tauri --locked --bin agenthd-gui
+#    root CLI actually looks for. `--features custom-protocol` is
+#    required for production installs: the feature is intentionally
+#    opt-in (not in `default`) so `tauri dev` keeps working, but
+#    a direct `cargo install` / `cargo build` of the companion
+#    without it leaves `dev = true` in `tauri-macros` and the
+#    codegen does not embed the frontend assets the production
+#    runtime expects. **`cargo install --path` updates the
+#    same package without `--force`** when the package being
+#    installed is identical to the one already at the destination
+#    (same crate); cargo refuses overwrites only when the
+#    destination binary does not match the one cargo would
+#    produce. Pass `--force` only when you intend to replace a
+#    `agenthd-gui(.exe)` whose bytes do not match what this
+#    command would install — i.e. an out-of-band build, a
+#    different commit, or a `dev`-feature artifact. Forward
+#    `--features custom-protocol` on the rerun as well; without
+#    it cargo installs the dev-feature artifact that fails at
+#    runtime. The orchestrator
+#    `scripts/install.mjs --force` forwards `--force` to both
+#    installs and is the recommended way to update an existing
+#    paired build.
+cargo install --path src-tauri --locked --bin agenthd-gui --features custom-protocol
 ```
 
 The companion crate is the existing `spikes/tauri-angular/src-tauri/`
@@ -204,6 +215,62 @@ fetch, or bootstrap step.
 
 ## Install
 
+The recommended command installs / updates both the CLI and the
+companion GUI into the same cargo root, building the Angular
+frontend first:
+
+```sh
+node scripts/install.mjs
+```
+
+This is a thin orchestrator: it preflights `cargo` / `npm` / `node`,
+runs `npm ci --include=dev` and `npm run build` in
+`spikes/tauri-angular/`, confirms `dist/.../browser/index.html`
+was produced, and then runs both `cargo install` invocations from
+the repo root with the same `--root`. By default the install
+root is `~/.cargo` (or `$CARGO_HOME`, or `$CARGO_INSTALL_ROOT`,
+in that order); pass `--root <dir>` to override. Pass `--force`
+to overwrite a preexisting `agenthd(.exe)` / `agenthd-gui(.exe)`
+at the destination. Use `node scripts/install.mjs --help` for
+the full flag reference.
+
+### Update
+
+Before updating an existing paired build, **close both the TUI
+and the GUI** so the destination binaries (`agenthd(.exe)` and
+`agenthd-gui(.exe)`) are not locked on Windows. From the
+repository root run the same orchestrator with `--force` so it
+forwards `--force` to both `cargo install` invocations (the
+companion one keeps `--features custom-protocol`, both land in
+the same cargo root):
+
+```sh
+node scripts/install.mjs --force
+```
+
+After the orchestrator reports `completed`, launch the GUI via
+`agenthd gui` or fall back to the TUI with `agenthd`. There is no
+separate "GUI install" step: the orchestrator already produced
+both, and `agenthd` locates the companion adjacent to itself.
+
+`cargo install --path . --locked --force` from the repo root is
+**not** the recommended update path. It installs **only** the
+CLI, leaves the companion `agenthd-gui(.exe)` untouched, and
+without `--features custom-protocol` it is also not the right
+shape for the companion crate. Prefer the orchestrator above;
+reach for the manual CLI-only install only when the GUI
+companion is intentionally out of scope.
+
+Prerequisites: Node.js with `npm` on `PATH` (Angular 22 / npm
+lockfile-driven), Rust with `cargo` on `PATH`, and the Tauri
+WebView2 runtime on Windows plus `webkit2gtk-4.1` (and friends)
+on Linux. The orchestrator reports a missing tool as a preflight
+abort and does not write anything. See
+"Paired install contract (CLI + companion GUI)" below for the
+manual cargo steps (single CLI install without the orchestrator).
+
+Manual single-CLI install (no companion GUI):
+
 ```sh
 cargo install --path . --locked
 ```
@@ -211,7 +278,8 @@ cargo install --path . --locked
 Update with `cargo install --path . --locked --force`, remove with
 `cargo uninstall agenthd`. The binary installs to `~/.cargo/bin`, which
 is typically on `PATH` already via `~/.cargo/env`; add it to your
-shell's `PATH` if it is not.
+shell's `PATH` if it is not. The CLI alone is enough to run `agenthd
+tui` but not `agenthd gui`.
 
 Installing the CLI alone is not enough to run `agenthd gui`: the GUI
 branch requires the companion binary `agenthd-gui(.exe)` next to the

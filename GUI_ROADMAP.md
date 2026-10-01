@@ -106,6 +106,13 @@ confirmación explícita; skills sin force-overwrite.
   > confunda valor por modo. Tests focales en `src/launcher.rs`
   > (`parse_launch_*`) y de integración en `tests/cli_launch.rs`
   > (`agenthd_gui_*`) verifican el contrato sin efectos.
+  >
+  > **Estado actual (Fase 5, slice "binario acompañante"):** el
+  > "rechazo" documentado arriba es **histórico**; la rama actual
+  > de `agenthd gui` localiza el binario `agenthd-gui` adyacente
+  > al ejecutable y reenvía argv + exit code (abort con exit `2`
+  > si falta, sin escrituras). El parser CLI y el contrato D2 no
+  > cambiaron.
 - **D3 — Operaciones largas.** Canal de progreso y cancelación para
   `install_tool`, `Discovery` y futuros sync/plan.
 - **D4 — Empaquetado.** Arch vía PKGBUILD/AUR; otros Linux vía
@@ -362,6 +369,52 @@ usuario — ver "Decisiones pendientes → D1" y "Fase 4".
       separado de Fase 6 (D4 pendiente).
 
 ### Fase 5 — Slice Settings + Agents y expandir
+
+- [x] **Instalador fuente (orquestadora `scripts/install.mjs`).**
+  Wrapper del proceso manual de "Paired install contract" en
+  `README.md`: preflight `cargo` / `npm` / `node`, valida que
+  `spikes/tauri-angular/{package.json,package-lock.json}` y
+  `spikes/tauri-angular/src-tauri/Cargo.toml` existan, corre
+  `npm ci --include=dev` + `npm run build`, confirma
+  `dist/agenthd-tauri-angular-spike/browser/index.html`, y
+  ejecuta **dos** `cargo install` desde el repo root con el
+  mismo `--root`. CLI: `--locked --bin agenthd` (la GUI no se
+  build-ea aquí). GUI: `--locked --bin agenthd-gui
+  --features custom-protocol`. El `--root` se resuelve **una
+  vez** (precedencia `--root > CARGO_INSTALL_ROOT >
+  CARGO_HOME > $HOME/.cargo`, cwd-relative si el usuario pasó
+  un path relativo) y se pasa idéntico a ambos `cargo install`.
+  En Windows, npm se invoca vía `cmd /c npm ...args` con argv
+  fijo y nunca se interpola el `--root` en el shell; cargo
+  se lanza con `spawn(cmd, args)` sin shell. Soporta
+  `--force` (forward a ambos `cargo install`, **no**
+  siempre). El instalador aborta ante cualquier exit no-cero
+  con `phase` / `path` / `code` claros y nunca escribe
+  `settings.json` ni lanza el binario; **no** se promete
+  atomicidad. Documenta **deliberadamente** que
+  `[install].root` en `Cargo.toml` **no** se respeta (el
+  usuario debe `--root` para alinearlo). CLI guard con
+  `pathToFileURL(process.argv[1]).href === import.meta.url`
+  para que los tests importen sin auto-ejecutar; `main`,
+  `parseArgs`, `resolveInstallRoot`, `buildPlan`, `run`,
+  `HELP_TEXT` exportados. **29 tests** (`node --test
+  scripts/install.test.mjs`, **padre re-run PASS**)
+  sin dependencias externas: parser strict, precedencia
+  `--root`, orden del plan, flags en ambos installs,
+  `--force` opcional, feature `custom-protocol` solo en GUI,
+  dispatch Windows npm sin interpolar root + fallback
+  `ComSpec`, dispatch Linux npm directo + `shell:false`,
+  cargo siempre directo + `shell:false`, aborts
+  npm / preflight / CLI / GUI sin éxito falso, `--help`
+  sin invocar herramientas, errores del parser abortan
+  código 1 sin tools. Ver bloque "Validación y plataforma →
+  Instalador fuente" para el detalle de la corrida real.
+  **Esta orquestadora NO cierra D4** (empaquetado Arch /
+  otros Linux / Windows) ni sustituye el gate visual de Fase
+  5 (ver "Decisiones pendientes → D2 → Estado actual" y
+  "Defecto user-reported y fix acotado" para los gates
+  visuales pendientes y sus límites). Es solo un
+  instalador fuente: el slice ya estaba aprobado.
 
 - [x] **Binario acompañante (slice read-only, fase 5 — primer
       paso).** El CLI `agenthd` localiza el binario
@@ -747,34 +800,26 @@ usuario — ver "Decisiones pendientes → D1" y "Fase 4".
    red, **no** afirma contenido específico mostrado,
    **no** cubre otras plataformas.
 
-   **Próxima tarea estrecha (validación del usuario
-   contra configuración real compartida).** El usuario
-   debe validar el binario acompañante **contra la
-   misma configuración real que la TUI usa hoy** —
-   **sin** `--repo`, **sin** aislamiento de `HOME`,
-   mismo `HOME` que la TUI — y confirmar que los
-   paneles Settings y Agents de la GUI muestran el
-   mismo estado que la TUI observa desde el mismo
-   checkout. Esa validación es el cierre pendiente
-   del gate visual del primer slice read-only de Fase
-   5; **no** requiere una integración nueva (la
-   integración del slice ya está hecha), solo
-   ejecución del binario de producción con la paired
-   install del `README.md` y comparación lado-a-lado
-   con la TUI sobre el mismo checkout. Hasta que esa
-   validación se complete, el gate visual de Fase 5
-   **no** está cerrado por instrumento del agente: la
-   satisfacción que se registra es la del reporte
-   manual del spike en `tauri dev`, que es
-   **evidencia aparte y separada**, no del binario
-   de producción. **D3, D4 y D5 siguen pendientes.**
-   D3 bloquea las subfases largas que extiendan el
-   slice read-only (mutaciones, sync, agent editor,
-   skills). D4 (empaquetado Arch / otros Linux /
-   Windows) y la validación por plataforma son gate
-   **separado y distinto** de Fase 6, **independiente**
-   del gate visual de Fase 5 satisfecho por la
-   confirmación user-reported del spike.
+   **Próxima tarea estrecha (validación paired contra HOME
+   real compartido con la TUI).** Receta: (1) cerrar TUI
+   y GUI en curso; (2) desde la **raíz del repo** (cwd =
+   repo root, no HOME — HOME es env, no cwd), actualizar
+   con `node scripts/install.mjs --force` (el instalador
+   resuelve `--root` desde el cwd del invocador +
+   precedencia `--root > CARGO_INSTALL_ROOT > CARGO_HOME
+   > $HOME/.cargo`; `--force` autorizado cuando hay un
+   binario previo con bytes distintos); (3) abrir TUI y
+   GUI desde el mismo HOME, sin `--repo`, mismo checkout;
+   comparar Settings y Agents lado-a-lado y pulsar
+   **Refresh both** en la GUI. Esa comparación paired es
+   el cierre pendiente del gate visual del primer slice
+   read-only de Fase 5; **no** requiere integración nueva
+   (la receta del orquestador ya está hecha). El render
+   suelto del binario temporal ("Sí se mostraba", esta
+   sesión) y la sesión `tauri dev` del spike son
+   **evidencias distintas y separadas**. D3 antes de
+   subfases largas; D4 y D5 pendientes como gates
+   separados.
 
 ## Validación y plataforma
 
@@ -841,6 +886,36 @@ usuario — ver "Decisiones pendientes → D1" y "Fase 4".
   CSP / devtools / red, **no** afirma contenido específico, y
   **no** equivale a Windows validado ni empaquetado.
   Empaquetado Windows sigue siendo gate de Fase 6.
+- **Instalador fuente `scripts/install.mjs` (orquestadora
+  node portable, sin dependencias externas).** `node --test
+  scripts/install.test.mjs` — **29 ok, 0 failed**, suite
+  verde en el host real Windows 11 MSYS y simulada en
+  `linux` vía `main({platformName: "linux"})`. Cobertura
+  puntual (no exhaustiva): parser strict, precedencia
+  `--root > CARGO_INSTALL_ROOT > CARGO_HOME > $HOME/.cargo`
+  con env vars vacíos = ausentes, plan completo
+  (preflight → `npm ci --include=dev` → `npm run build` →
+  CLI install → GUI install con `--features custom-protocol`),
+  `--force` solo cuando se pasa, dispatch Windows npm vía
+  `ComSpec /d /s /c <line>` con root nunca en argv, fallback
+  a `cmd.exe`, dispatch Linux npm directo + `shell:false`,
+  cargo siempre directo + `shell:false`, aborts npm /
+  preflight / cargo CLI / cargo GUI sin éxito falso,
+  `--help` y errores del parser sin invocar herramientas.
+  Validación end-to-end real (no solo tests): el
+  orquestador ejecutó en una raíz temporal preaprobada
+  `…/opencode/unified-install-1790880069/bin/`, produciendo
+  `agenthd.exe` y `agenthd-gui.exe` (este con la feature).
+  El orquestador **no** se ejecutó contra `~/.cargo/bin/`
+  (HOME real **no certificado**). El flujo paired desde
+  esa raíz no fue cronometrado. Riesgo de reproducibilidad:
+  `yoke-derive v0.8.3` yanked del registro `locked`; el
+  `Cargo.lock` no se tocó por esta sesión — un rerun con
+  `--locked` puede fallar (riesgo no cerrado). `cargo fmt
+  --check` falló por diffs preexistentes en `src/lib.rs` y
+  companions (no introducidos aquí; código ajeno no
+  tocado). `git diff --check` solo emite advertencias
+  LF/CRLF preexistentes (sin errores).
 - Root crate `cargo test --all-targets` en Windows 11 MSYS:
   verde tras la corrección de portabilidad de los tests
   `unix_symlink` / unix-path en `src/store/{skills_tests,
@@ -857,31 +932,138 @@ usuario — ver "Decisiones pendientes → D1" y "Fase 4".
   empaquetado Windows estén validados — esos siguen siendo
   gate de Fase 6 (D4 pendiente), y Arch / otros Linux siguen
   pendientes en máquina real.
-- **Observación Fase 5 — paired build instalada por
-  orquestador en raíz temporal preaprobada (Windows 11
-  MSYS).** El orquestador instaló ambos binarios en una
-  raíz temporal preaprobada en Windows con `cargo install
-  --path . --locked --root <isolated temp>` (CLI) y
-  `cargo install --path spikes/tauri-angular/src-tauri
-  --locked --bin agenthd-gui --root <same isolated temp>`
-  (GUI); un `agenthd.exe gui` cronometrado tuvo un proceso
-  acompañante `agenthd-gui.exe` con `MainWindowHandle=789140`
-  y título `'agenthd GUI'`. La paired build **no**
-  instrumentó contenido Angular ni IPC (solo se observó
-  el handle / título por enumeración de procesos) y el
-  cleanup se hizo por timeout. **No** se reclama empaquetado
-  ni distribución por paquete. **Riesgo de
-  reproducibilidad:** cargo advirtió durante la
-  instalación que `yoke-derive v0.8.3` está yanked del
-  registro `locked`; la instalación completó, pero un rerun
-  con `--locked` puede fallar si el resolver no encuentra
-  esa versión. La confirmación manual user-reported del
-  spike (Settings + Agents + Refresh both, ver
-  `spikes/tauri-angular/EVIDENCE.md` → "Observaciones
-  Windows 11 MSYS → Verificación manual user-reported")
-  sigue siendo **distinta y separada**: es manual,
-  no-instrumentada, y no captura payloads IPC ni inspecciona
-  CSP / devtools / red.
+- **Observación Fase 5 — paired build instalada en raíz
+  temporal preaprobada (Windows 11 MSYS).** Comandos
+  manuales previos a `scripts/install.mjs` instalaron
+  ambos binarios en una raíz temporal preaprobada en
+  Windows con `cargo install --path . --locked --root
+  <isolated temp>` (CLI) y `cargo install --path
+  spikes/tauri-angular/src-tauri --locked --bin
+  agenthd-gui --root <same isolated temp>` (GUI); esta
+  última **sin** `--features custom-protocol` (receta
+  anterior al fix). Un `agenthd.exe gui` cronometrado tuvo
+  un proceso acompañante `agenthd-gui.exe` con
+  `MainWindowHandle=789140` y título `'agenthd GUI'`. La
+  paired build **no** instrumentó contenido Angular ni IPC
+  (solo handle / título por enumeración de procesos);
+  cleanup por timeout. **No** se reclama empaquetado ni
+  distribución por paquete. **Riesgo de reproducibilidad:**
+  `yoke-derive v0.8.3` yanked del registro `locked`;
+  rerun con `--locked` puede fallar (riesgo no cerrado).
+  **Esta paired build (sin la feature) fue la que disparó
+  el defecto "Hmmm… can't reach this page" del usuario**;
+  ver "Defecto user-reported y fix acotado". La confirmación
+  manual user-reported del spike (Settings + Agents +
+  Refresh both, ver
+  `spikes/tauri-angular/EVIDENCE.md` → "Verificación
+  manual user-reported") sigue siendo **distinta y
+  separada**: manual, no-instrumentada, no captura payloads
+  IPC ni inspecciona CSP / devtools / red.
+
+### Defecto user-reported y fix acotado
+
+- **Síntoma:** el usuario reportó "Hmmm… can't reach this
+  page" en su GUI `agenthd-gui` instalada. La causa
+  operativa confirmada por fuentes oficiales es que el
+  `cargo install --path src-tauri --locked --bin
+  agenthd-gui` previo se hizo sin la feature
+  `custom-protocol`; sin ella `tauri-macros` deja
+  `dev = cfg!(not(feature = "custom-protocol"))` en
+  `true` y el codegen cae en la rama de dev, que omite
+  el embedding del frontend. Fuentes: `tauri-macros
+  src/context.rs::generate_context` (campo `dev`
+  gobernado por `cfg!(not(feature = "custom-protocol"))`)
+  y la receta de release del companion en README que
+  requería la feature opt-in. **No** se inspeccionaron
+  strings específicos del binario fallido ni se tomaron
+  capturas del error: la diagnosis se hizo por
+  documentación, no por instrumentación.
+- **Fix:** `spikes/tauri-angular/src-tauri/Cargo.toml`
+  añade `[features] custom-protocol = ["tauri/custom-protocol"]`
+  (sin `default`, para preservar `tauri dev`). README
+  raíz (paso 3) y spike README (paso 3) pasan a requerir
+  `--features custom-protocol` en `cargo install` /
+  `cargo build` directos. La orquestadora
+  `scripts/install.mjs` lo aplica por defecto en el
+  install del GUI (ver entrada [x] arriba). Comandos
+  históricos no reescritos.
+- **Validación de codegen y receta:** `cargo tree -e
+  features` con la feature muestra `tauri custom-protocol`
+  y `tauri-macros custom-protocol` activas; sin la feature
+  ninguna de las dos aparece. `cargo test --lib` 8/8 OK
+  con y sin feature. `npm run build` regenera `dist/`.
+  `cargo install --locked --bin agenthd-gui --features
+  custom-protocol --root <temp>` produce `agenthd-gui.exe`
+  en la raíz temporal. `scripts/install.mjs` cubre el
+  flujo end-to-end con 29 tests `node --test` en verde
+  (ver "Validación y plataforma → Instalador fuente").
+  **No** se reemplazaron binarios en `~/.cargo/bin/` por
+  la sesión del fix; el estado actual de HOME **no está
+  certificado**. `cargo fmt --check` FALLÓ por diffs
+  preexistentes en `src/lib.rs` y companions (no
+  introducidos por este fix; código ajeno no tocado).
+  `git diff --check` solo LF/CRLF preexistentes (sin
+  errores).
+- **Confirmación user-reported del render (producción,
+  aislada del flujo paired).** El worker compiló
+  `agenthd-gui.exe` con la feature aplicada en
+  `…/opencode/gui-custom-protocol-1790876724499052800/bin/`,
+  el padre lo lanzó DIRECTO como exe suelto (no como
+  acompañante del CLI — no fue flujo paired) y el usuario
+  reportó "Sí se mostraba". Confirmación **manual,
+  user-reported, no instrumentada**; cubre solo el render
+  del binario temporal con la receta corregida. El render
+  del binario suelto con la feature ya **no** es gate
+  pendiente.
+- **Reinstall con el orquestador (raíz temporal).** El
+  orquestador `scripts/install.mjs` (sin `--force`,
+  ejecución real desde el repo root en Windows 11 MSYS)
+  reinstaló en `…/opencode/unified-install-1790880069/bin/`:
+  ambos `agenthd.exe` y `agenthd-gui.exe` (este con la
+  feature aplicada). **No** se ejecutó contra `~/.cargo/bin/`;
+  HOME real no certificado. Flujo paired desde esa raíz
+  **no** cronometrado.
+- **Gate visual de Fase 5 — tres observaciones distintas
+  y separadas:** (1) **Render suelto del binario temporal**
+  (esta sección) — user-reported "Sí se mostraba", **ya
+  no** es gate pendiente; no cubre paired/IPC. (2) **Spike
+  en `tauri dev`** — Settings + Agents + Refresh both,
+  user-reported manual, **evidencia aparte** del binario
+  de producción; no captura payloads IPC. (3) **Validación
+  paired contra TUI** (siguiente tarea estrecha) — única
+  pendiente que cierra el gate visual del primer slice
+  read-only de Fase 5.
+
+## Estado de la sesión y fuente de verdad
+
+- **Cerrado:** Fases 1–4, Fase 3 (D2 — el "rechazo" de
+  `agenthd gui` documentado en D2 es **histórico**; ver
+  "Decisiones pendientes → D2 → Estado actual"); slice
+  "binario acompañante" de Fase 5; instalador fuente
+  `scripts/install.mjs` (29 tests `node --test` en
+  verde); fix acotado del defecto "Hmmm… can't reach
+  this page" (feature `custom-protocol` añadida + receta
+  documentada); confirmación user-reported del render del
+  binario suelto ("Sí se mostraba").
+- **Pendiente (fuente de verdad para próxima tarea):**
+  comparación paired Settings/Agents + Refresh both de la
+  GUI vs. la TUI sobre el mismo HOME y checkout (receta
+  exacta en "Próxima tarea estrecha → punto 5"). D3 antes
+  de subfases largas; D4 y D5 pendientes como gates
+  separados. `scripts/install.mjs` **no** cierra D4.
+- **No certificado:** HOME real (`~/.cargo/bin/`) no
+  sobreescrito por el orquestador en esta sesión;
+  comparación paired Settings/Agents + Refresh both; payloads
+  IPC y CSP en runtime del flujo paired en HOME real;
+  screenshots de la GUI en HOME real.
+- **Cambios locales no publicados** (sin `commit` /
+  `push`): `README.md`, `spikes/tauri-angular/README.md`,
+  `spikes/tauri-angular/EVIDENCE.md`,
+  `spikes/tauri-angular/src-tauri/Cargo.toml`,
+  `scripts/install.mjs`, `scripts/install.test.mjs`, este
+  `GUI_ROADMAP.md`. Cambios ajenos preservados sin tocar:
+  `agents/{lukateric,oracle,planner}.md`, `src/models.rs`.
+  `PLAN.md` y `TOOL_INSTALLER_PLAN.md` no restaurados.
 
 ## Handoff (importante)
 

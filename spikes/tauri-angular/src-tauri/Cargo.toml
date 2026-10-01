@@ -57,6 +57,15 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# `tauri dev` keeps the default feature set; production
+# installs / production builds opt in via
+# `--features custom-protocol` so the codegen embeds the
+# frontend assets instead of relying on `devUrl`. See
+# `tauri-macros/src/context.rs::generate_context`:
+# `dev: cfg!(not(feature = "custom-protocol"))`.
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dev-dependencies]
 # Focals for the two read-only commands build `Paths`
 # inside a `tempfile::TempDir` (the same pattern the lib

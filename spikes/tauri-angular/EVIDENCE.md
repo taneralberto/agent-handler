@@ -642,3 +642,40 @@ Estado de los lockfiles en git: ambos
 `spikes/tauri-angular/package-lock.json`) están
 generados y versionados con el spike para garantizar
 reproducibilidad.
+
+## Defecto user-reported y fix acotado
+
+- **Síntoma user-reported:** "Hmmm… can't reach this
+  page" en la GUI `agenthd-gui` instalada por el
+  usuario. La causa operativa propuesta es que el
+  `cargo install --path src-tauri --locked --bin
+  agenthd-gui` previo no pasó `--features
+  custom-protocol`; sin la feature `tauri-macros` deja
+  `dev = cfg!(not(feature = "custom-protocol"))` en
+  `true` y el codegen cae en la rama de dev (no se
+  observaron strings específicos de assets ni capturas
+  que demuestren ausencia de contenido).
+- **Fix:** `spikes/tauri-angular/src-tauri/Cargo.toml`
+  añade `[features] custom-protocol =
+  ["tauri/custom-protocol"]` sin `default`. README
+  raíz paso 3 y spike README paso 3 pasan a requerir
+  `--features custom-protocol` en `cargo install` /
+  `cargo build` directos. Comandos históricos no
+  reescritos.
+- **Validación:** `cargo tree -e features` con la
+  feature activa `tauri custom-protocol` y `tauri-
+  macros custom-protocol`; sin la feature ninguna
+  aparece. `cargo test --lib` 8/8 OK con y sin
+  feature. `npm run build` regenera `dist/`. `cargo
+  install --locked --bin agenthd-gui --features
+  custom-protocol --root <temp>` produce el binario.
+  `cargo fmt --check` FALLÓ por diffs preexistentes
+  en `src/lib.rs` (no introducidos por este fix;
+  código ajeno no tocado). Binarios en `~/.cargo/bin/`
+  no reemplazados.
+- **Gate visual PENDIENTE.** El fix elimina la causa
+  operativa propuesta a nivel de codegen / comando;
+  la confirmación visual de que la WebView sirve el
+  bundle Angular desde el binario de producción
+  instalado sigue siendo tarea aparte del usuario
+  contra la configuración real compartida con la TUI.
