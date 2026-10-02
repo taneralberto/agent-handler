@@ -286,6 +286,58 @@ branch requires the companion binary `agenthd-gui(.exe)` next to the
 CLI's binary. See "Paired install contract (CLI + companion GUI)"
 above for the build steps.
 
+### GUI Settings slice (Fase 5, mutación pequeña síncrona)
+
+Slice vertical aprobado: la GUI Settings ahora persiste la ruta
+del checkout que el usuario teclea, reutilizando
+`workflows::apply_checkout` (la misma función que invoca la
+pantalla Settings del TUI). Una caja de texto + botón Guardar
+en la sección Settings invocan un tercer comando Tauri
+(`apply_checkout`) que delega en el workflow; en éxito el
+frontend re-dispara `settings_status` + `list_agents` para
+recomponer las dos pantallas, en fallo preserva el borrador y
+muestra el texto exacto de `ApplyError::message()` (mismas
+cadenas que el TUI). El lock `busy` serializa TODAS las
+acciones públicas (refresh + save) para que un refresh manual
+no pueda correr contra un save en vuelo. El input queda
+deshabilitado solo mientras `saving` está activo (teclear
+durante el refresh inicial está permitido y `draftSeeded`
+preserva el buffer). El botón Guardar queda deshabilitado
+solo mientras `busy` está activo; no se bloquea por buffer
+vacío (esa restricción era del flujo TUI, no del flujo GUI).
+
+Evidencia de tests focales del backend
+(`spikes/tauri-angular/src-tauri/`):
+
+- `cargo test --locked --lib`: 16/16 OK (8 previos + 8 nuevos).
+  Los 8 nuevos cubren el camino feliz (valid trim persiste y
+  recomponer Settings/Agents del nuevo checkout), el cambio
+  entre dos checkouts con agentes distintos (recompose Agents
+  con el nuevo set), y cinco rechazos (vacío, relativo, no
+  existe, sin `agents/`, fallo de escritura) que conservan
+  `settings.json` byte-exact y `paths.canonical_dir` original.
+  El test de symlink se mantiene `#[cfg(unix)]` igual que el
+  resto del lib. Sin alias, sin copiar validación, sin `ensure_dirs`,
+  sin escrituras en `canonical`/`targets`/`skills`/`state`/`canonical`.
+  Sin cambios de schema, sin permisos nuevos, capabilities
+  intactas (`["core:default"]`), CSP intacta, proyección
+  sigue sin `prompt`/`permissions`.
+- `cargo test --locked --lib --features custom-protocol`: 16/16 OK.
+- `cargo clippy --locked --lib --tests [--features custom-protocol]`:
+  sin warnings nuevos vs baseline (3 warnings preexistentes en
+  `src/tools/mod.rs` del crate raíz, no tocados).
+- `cargo fmt --check` y `npm run build` limpios.
+
+Gate visual pendiente: end-to-end del runtime gráfico paired
+GUI↔TUI (Save → refresh ambos → ver el mismo checkout y los
+mismos agentes en ambas superficies). El gate visual del
+slice read-only previo (comparación paired sobre mismo HOME)
+sigue cerrado por reporte manual user-reported; este nuevo
+slice mutación síncrona pequeña **NO** invalida ese gate
+ni lo da por demostrado, requiere su propia confirmación
+visual no instrumentada con `apply_checkout` Save →
+refresh + commit/push fuera de alcance aquí.
+
 ## Paths
 
 | Purpose | Path |

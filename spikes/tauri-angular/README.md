@@ -35,8 +35,10 @@ eso.
 
 ## Qué demuestra
 
-Dos comandos Tauri read-only, ambos compuestos sobre el lib
-`agenthd` (single source of truth):
+Tres comandos Tauri, dos estrictamente read-only y uno
+mutante (Fase 5 — slice vertical de mutación pequeña
+síncrona aprobado). Todos compuestos sobre el lib `agenthd`
+(single source of truth):
 
 1. **`settings_status`** → clasifica `settings.json` en
    `Empty` / `Ready` / `Stale` / `Error` usando
@@ -46,21 +48,37 @@ Dos comandos Tauri read-only, ambos compuestos sobre el lib
    `read_checkout` + `Paths::with_settings` +
    `workflows::list_canonical_agents`, y proyecta
    `name` / `mode` / `model` / `description`.
+3. **`apply_checkout`** (Fase 5, slice mutación pequeña
+   síncrona) → envuelve `agenthd::workflows::apply_checkout`
+   (el mismo workflow que llama la pantalla Settings del TUI)
+   vía un helper `compose_apply_checkout(&Paths, &str) ->
+   Result<String, String>`. El comando Tauri reenvía esa
+   `Result` literal: en `Ok` el frontend recibe el path
+   absoluto (trimmed) que el helper acaba de escribir; en `Err`
+   recibe como rejection el texto de `ApplyError::message()`
+   intacto (mismas cadenas que el TUI). Después de un save
+   exitoso el frontend re-invoca `settings_status` +
+   `list_agents` para recomponer Settings + Agents; si la
+   revalidación post-escritura falla (puede pasar incluso
+   cuando el write tuvo éxito), el lib persiste pero devuelve
+   el error para que la GUI lo muestre sin rollback (el TUI
+   hace lo mismo).
 
 **Lo que NO hace el prototipo** (decisiones explícitas):
 
 - No expone `prompt` ni `permissions` en la proyección
   de agentes.
-- No acepta ningún argumento del frontend (los comandos
-  no tienen parámetros).
-- No llama a `Paths::ensure_dirs`, no `save_*`, no
-  `delete_*`, no escribe nada en el host desde esta
-  superficie.
+- No llama a `Paths::ensure_dirs`, no escribe en
+  `canonical/`/`targets/`/`skills/`/`state.json` desde
+  esta superficie. El único write es
+  `apply_checkout` → `save_settings` → `write_target`
+  sobre `settings.json`, y solo cuando el path validó.
 - No incluye plugins (`fs`, `shell`, `dialog`, `opener`,
   `http`, ...). Solo `core:default` en capabilities.
 - No está acoplado al binario `agenthd`. No lee argv. No
   reemplaza a la TUI. La configuración del checkout sigue
-  siendo exclusivamente TUI-only por ahora.
+  siendo edit-able en la TUI y en la GUI, mismos textos,
+  mismo `settings.json`.
 - No marca D1 como cerrado.
 
 ## Estructura
@@ -189,7 +207,7 @@ inicializa WebKit):
 
 ```bash
 cd src-tauri
-cargo test --lib   # 8/8 OK
+cargo test --lib   # 16/16 OK (8 read-only + 8 apply_checkout)
 ```
 
 Los tests usan `tempfile::TempDir` para construir `Paths`

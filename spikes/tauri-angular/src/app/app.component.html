@@ -1,10 +1,13 @@
 <main>
   <h1>agenthd GUI</h1>
   <p>
-    Read-only prototype. The frontend invokes two commands
-    (<code>settings_status</code>, <code>list_agents</code>)
-    against the agenthd library — no other surface. Carga al
-    abrir y refresco manual; sin auto-poll.
+    Settings + Agents view backed by the agenthd library.
+    Two read-only commands (<code>settings_status</code>,
+    <code>list_agents</code>) and one mutating command
+    (<code>apply_checkout</code>) — all routed through the
+    lib's pure composition helpers. Refresh is manual; the
+    Save button persists the typed checkout path through the
+    same workflow the TUI Settings screen uses.
   </p>
 
   <section>
@@ -13,7 +16,7 @@
       <button
         type="button"
         (click)="refreshSettings()"
-        [disabled]="settingsLoading()"
+        [disabled]="busy()"
       >
         Refresh settings
       </button>
@@ -32,6 +35,30 @@
     } @else {
       <p class="empty">No settings loaded yet.</p>
     }
+
+    <div class="path-editor">
+      <label for="checkout-path">Checkout path (absolute)</label>
+      <input
+        id="checkout-path"
+        type="text"
+        [value]="checkoutPath()"
+        (input)="onCheckoutPathInput($any($event.target).value)"
+        [disabled]="saving()"
+        autocomplete="off"
+        spellcheck="false"
+        aria-label="Configured checkout path (absolute)"
+      />
+      <button
+        type="button"
+        (click)="saveCheckout()"
+        [disabled]="busy()"
+      >
+        @if (saving()) { Saving… } @else { Guardar }
+      </button>
+      @if (saveError(); as err) {
+        <p class="error" role="alert">{{ err }}</p>
+      }
+    </div>
   </section>
 
   <section>
@@ -40,7 +67,7 @@
       <button
         type="button"
         (click)="refreshAgents()"
-        [disabled]="agentsLoading()"
+        [disabled]="busy()"
       >
         Refresh agents
       </button>
@@ -71,7 +98,11 @@
   </section>
 
   <section>
-    <button type="button" (click)="refreshAll()" [disabled]="settingsLoading() || agentsLoading()">
+    <button
+      type="button"
+      (click)="refreshAll()"
+      [disabled]="busy()"
+    >
       Refresh both
     </button>
   </section>

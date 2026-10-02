@@ -46,33 +46,144 @@ export class AppComponent implements OnInit {
   readonly agentsError = signal<string | null>(null);
   readonly agentsLoading = signal(false);
 
-  /**
-   * Load Settings + Agents on open so the prototype
-   * window is not blank. Implemented via `ngOnInit`
-   * firing `refreshAll()` once; the spike still does
-   * not poll — refresh is also available manually via
-   * the toolbar buttons, because the underlying
-   * configuration lives in the TUI, which the user has
-   * to switch back to.
-   */
+  // Settings mutation. `checkoutPath` seeds once from the first
+  // Ready/Stale and refreshes never overwrite it while the user
+  // has it open. `saving` is a UX signal; `saveError` carries
+  // the backend's literal error text (same as the TUI).
+  readonly checkoutPath = signal<string>("");
+  readonly saving = signal(false);
+  readonly saveError = signal<string | null>(null);
+
+  // Serialization flag for every public action (refresh + save).
+  // Public so the template can bind `[disabled]` directly. The
+  // flag prevents overlap of public actions while one is in
+  // flight; it is not a global consistency guarantee against
+  // external writers. `loadSettings` / `loadAgents` are private
+  // and bypass it.
+  readonly busy = signal(false);
+
+  /** True once the draft buffer has been seeded or the user typed. */
+  private draftSeeded = false;
+
   ngOnInit(): void {
     void this.refreshAll();
   }
 
-  /**
-   * Refresh Settings by invoking the read-only
-   * `settings_status` command. Manual — the spike
-   * intentionally has no polling because the
-   * underlying configuration lives in the TUI, which
-   * the user has to switch back to. (Initial load on
-   * open is fired once from `ngOnInit`.)
-   */
+  /** Refresh Settings via the read-only `settings_status` command. */
   async refreshSettings(): Promise<void> {
+    if (this.busy()) return;
+    this.busy.set(true);
+    try {
+      await this.loadSettingsIntoState();
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  /** Refresh Agents via the read-only `list_agents` command. */
+  async refreshAgents(): Promise<void> {
+    if (this.busy()) return;
+    this.busy.set(true);
+    try {
+      await this.loadAgentsIntoState();
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  /** Refresh both panels under a single busy window. */
+  async refreshAll(): Promise<void> {
+    if (this.busy()) return;
+    this.busy.set(true);
+    try {
+      // Sequential so the busy window is identical regardless
+      // of whether the loaders share state.
+      await this.loadSettingsIntoState();
+      await this.loadAgentsIntoState();
+    } finally {
+      this.busy.set(false);
+    }
+  }
+
+  /**
+   * Save the typed checkout path. The raw buffer is forwarded
+   * verbatim; trim / empty-rejection / absolute check / validator
+   * messages all live in `workflows::apply_checkout` so TUI and
+   * GUI surface identical text. Success updates the draft to the
+   * persisted (trimmed) form; failure preserves the draft and
+   * surfaces `ApplyError::message()` verbatim. The post-write
+   * revalidate runs inside the same `busy` window so refresh
+   * errors cannot mask the save result.
+   */
+  async saveCheckout(): Promise<void> {
+    if (this.busy()) return;
+    this.busy.set(true);
+    this.saving.set(true);
+    this.saveError.set(null);
+    const draft = this.checkoutPath();
+    try {
+      const persisted = await invoke<string>("apply_checkout", {
+        checkoutPath: draft,
+      });
+      this.draftSeeded = true;
+      this.checkoutPath.set(persisted);
+    } catch (e) {
+      this.saveError.set(this.toMessage(e));
+    } finally {
+      // Always revalidate inside the same busy window before
+      // clearing saving/busy so a second save cannot slip in
+      // mid-refresh.
+      try {
+        await this.loadSettingsIntoState();
+        await this.loadAgentsIntoState();
+      } finally {
+        this.saving.set(false);
+        this.busy.set(false);
+      }
+    }
+  }
+
+  /** Native input binding (no FormsModule). */
+  onCheckoutPathInput(value: string): void {
+    this.draftSeeded = true;
+    this.checkoutPath.set(value);
+  }
+
+  /**
+   * Seed the draft once from the first Settings load.
+   * Ready and Stale prefill; Empty and Error leave the buffer
+   * alone. Never runs again — the user might be mid-edit.
+   */
+  private seedDraftFrom(response: SettingsResponse): void {
+    if (this.draftSeeded) return;
+    const s = response.status;
+    if (s.kind === "ready") {
+      this.checkoutPath.set(s.checkout_path);
+      this.draftSeeded = true;
+    } else if (s.kind === "stale") {
+      this.checkoutPath.set(s.raw_path);
+      this.draftSeeded = true;
+    }
+  }
+
+  /** Private read-only command call. No lock here. */
+  private loadSettings(): Promise<SettingsResponse> {
+    return invoke<SettingsResponse>("settings_status");
+  }
+
+  /** Private read-only command call. No lock here. */
+  private loadAgents(): Promise<AgentsList> {
+    return invoke<AgentsList>("list_agents");
+  }
+
+  /** Fetch Settings, update signals, seed the draft if first time. */
+  private async loadSettingsIntoState(): Promise<void> {
     this.settingsLoading.set(true);
     this.settingsError.set(null);
     try {
-      const response = await invoke<SettingsResponse>("settings_status");
+      const response = await this.loadSettings();
       this.settings.set(response);
+      this.seedDraftFrom(response);
     } catch (e) {
       this.settingsError.set(this.toMessage(e));
       this.settings.set(null);
@@ -81,19 +192,14 @@ export class AppComponent implements OnInit {
     }
   }
 
-  /**
-   * Refresh Agents by invoking the read-only
-   * `list_agents` command. Same manual-refresh policy
-   * as Settings — the spike does not poll. (Initial
-   * load on open is fired once from `ngOnInit`.)
-   */
-  async refreshAgents(): Promise<void> {
+  /** Fetch Agents, update signals. */
+  private async loadAgentsIntoState(): Promise<void> {
     this.agentsLoading.set(true);
     this.agentsError.set(null);
     try {
-      const response = await invoke<AgentsList>("list_agents");
-      this.agents.set(response.agents);
-      this.agentsError.set(response.error);
+      const list = await this.loadAgents();
+      this.agents.set(list.agents);
+      this.agentsError.set(list.error);
     } catch (e) {
       this.agentsError.set(this.toMessage(e));
       this.agents.set([]);
@@ -102,23 +208,7 @@ export class AppComponent implements OnInit {
     }
   }
 
-  /**
-   * Convenience for the toolbar button: refresh both
-   * screens in sequence. Each panel keeps its own
-   * loading flag so a slow list_agents does not block
-   * the settings view.
-   */
-  async refreshAll(): Promise<void> {
-    await this.refreshSettings();
-    await this.refreshAgents();
-  }
-
-  /**
-   * Settings status display label. Mirrors the four
-   * arms the Rust command returns; the rendering is
-   * deliberately close to the TUI's Settings screen so
-   * the spike is easy to compare side-by-side.
-   */
+  /** Settings status display label. Mirrors the four arms the Rust command returns. */
   settingsLabel(): string {
     const s = this.settings();
     if (!s) return "(not loaded)";
@@ -134,12 +224,7 @@ export class AppComponent implements OnInit {
     }
   }
 
-  /**
-   * Per-status details (key/value pairs) for the
-   * Settings panel. Empty for "Empty" — the TUI
-   * surfaces the same shape (a banner asking the user
-   * to pick a checkout).
-   */
+  /** Per-status details (key/value pairs) for the Settings panel. */
   settingsDetails(): Array<[string, string]> {
     const s = this.settings();
     if (!s) return [];
@@ -165,12 +250,7 @@ export class AppComponent implements OnInit {
     return rows;
   }
 
-  /**
-   * Tauri rejects `null` rejections from JS by
-   * surfacing an empty `Error`, which renders as
-   * `[object Object]` here. Normalise to a stable
-   * string so the panel does not show garbage.
-   */
+  /** Normalise a Tauri rejection into a stable string. */
   private toMessage(e: unknown): string {
     if (typeof e === "string") return e;
     if (e instanceof Error) return e.message;
