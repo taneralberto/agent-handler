@@ -107,6 +107,19 @@ mod tests {
     /// `lukateric` is a new primary that replaces the retired
     /// `orchestrator`; its baseline is computed from the current
     /// `agents/lukateric.md`.
+    ///
+    /// `rendered` SHAs for `oracle`, `planner`, and `lukateric`
+    /// were refreshed once more because their `model` frontmatter
+    /// field was updated from `openai/gpt-6-sol` to
+    /// `openai/gpt-6.1-sol`. The causal proof: with the model
+    /// overwritten back to `openai/gpt-6-sol` in memory (no .md
+    /// touched), all 24 prompt/render/pi hashes for the 8 agents
+    /// match the prior baseline; prompt and pi SHAs for the 3
+    /// affected agents are unchanged because neither surface
+    /// embeds the model. The 5 unaffected agents
+    /// (`scout`, `reviewer`, `worker`, `delegate`, `researcher`)
+    /// are byte-exact against the prior baseline, confirming the
+    /// refresh is scoped to the 3 model-metadata edits.
     const BASELINE: &[(&str, &str, &str, &str)] = &[
         (
             "scout",
@@ -135,7 +148,7 @@ mod tests {
         (
             "oracle",
             "116038d4fd892c3b793942c9a8950fdac080315137fd1f181f91f7c5c3ddd98a",
-            "252296360eb26679a00aef46ba7aa9151d90b65130db02b1fd88930ae8f5e923",
+            "af9e620cf6c9bd94b93932261706cce1e6a9c44800ac82e888debfe3b4fa1f3e",
             "351d22bb1380736268773cd62a5463b5f7ffbf200d45aaf7098b7f415c4f7330",
         ),
         (
@@ -147,13 +160,13 @@ mod tests {
         (
             "planner",
             "d18cdc987a28c4e60980a168b34f55a60842f9c0dfc6acc72e5d463ade02fd18",
-            "e9adbd058f0160d306b0b29132ce3baf511507e201ec6cffda772f13e0842c7d",
+            "a41071864dbc64d822986fbe910c76c9059b9d33093d639c73dde073b7ee5b15",
             "cf917a7c2e2a6b553074ff11ef616bf747019627c363109a96cb9f8bc8183f87",
         ),
         (
             "lukateric",
             "43e41fb53ba5160d8fb4d493fa8d8ca219b59288c807af81ceaf603cd236e58d",
-            "a048d98b68b0e5d61a5a58937d4045bec52afea778d40a1959d00f44c80dd5c6",
+            "dfe4fdb527831c8d53d11684906b3a2f4122c8874e9c7bc4fb8c27c606a80a7f",
             "464399c143e20e52a79ce53d4b8bde577fbd4d26946231d914aa0df117b6ddab",
         ),
     ];

@@ -1,7 +1,7 @@
 ---
 description: "Primary coordinator; delegates bounded work and keeps user intent, decisions, and acceptance in one place."
 mode: primary
-model: "openai/gpt-6-sol"
+model: "openai/gpt-6.1-sol"
 permission:
   bash: allow
   edit: allow
