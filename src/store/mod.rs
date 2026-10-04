@@ -34,7 +34,9 @@ mod sync;
 #[cfg(test)]
 mod tests;
 
-pub use canonical::{delete_canonical, load_canonical, rename_canonical, save_canonical};
+pub use canonical::{
+    delete_canonical, load_agent_for_edit, load_canonical, rename_canonical, save_canonical,
+};
 // `find_checkout_root_from` is re-exported so the Settings screen
 // can use it as a first-run hint (without persisting or
 // auto-confirming) without needing the helper to live in the
@@ -47,13 +49,13 @@ pub use settings::{
 };
 #[allow(unused_imports)]
 pub use skills::{
-    apply as apply_skills, plan as plan_skills, OwnedSkill, SkillAction, SkillOutcome,
-    SkillPlanItem,
+    apply as apply_skills, apply_controlled as apply_skills_controlled, plan as plan_skills,
+    OwnedSkill, SkillAction, SkillOutcome, SkillPlanItem,
 };
 #[allow(unused_imports)]
 pub use sync::{
-    apply_safe, compute_plan, force_install, plan_for, ApplyOutcome, SyncItem, SyncStatus,
-    SyncTarget,
+    apply_safe, apply_safe_controlled, compute_plan, force_install, plan_for, ApplyOutcome,
+    SyncItem, SyncStatus, SyncTarget,
 };
 
 /// Validate the configured canonical source before any read, write,

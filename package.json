@@ -1,0 +1,9 @@
+{
+  "name": "agenthd",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "install:global": "node scripts/install.mjs --force"
+  }
+}

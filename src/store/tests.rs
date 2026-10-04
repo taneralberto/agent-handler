@@ -6,6 +6,7 @@ use super::canonical::source_hash;
 use super::sha256_hex;
 use super::*;
 use crate::agent::{starter_agent, Agent, Mode, PermissionAction, STARTERS};
+use crate::operation::{CancelToken, Finish, Progress};
 use std::collections::BTreeMap;
 use std::fs;
 use tempfile::TempDir;
@@ -1567,7 +1568,7 @@ fn apply_safe_skips_when_canonical_is_symlink_after_plan() {
     let (paths, _checkout) = setup_paths_with_checkout(&dir);
     let state = State::default();
     let plan = compute_plan(&paths, &state).unwrap();
-    let (mut state, _) = apply_safe(&paths, state, plan).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
 
     // Replace the canonical scout.md with a symlink pointing at
     // some unrelated content. Plan said `UpToDate`; live is now a
@@ -1668,4 +1669,474 @@ fn apply_safe_skips_when_target_is_symlink_after_plan() {
     assert_eq!(fs::read(&real_target).unwrap(), b"target-backing-content\n");
     // Manifest is preserved.
     assert_eq!(state.installed.get("scout.md"), owned_hash_before.as_ref());
+}
+
+// ---------- load_agent_for_edit ----------
+//
+// These tests pin the fail-closed editor seam `load_agent_for_edit`.
+// The seam is the GUI editor's only path into the canonical
+// source; its guarantees (parse + hash in one read, name validation
+// up front, no symlinks, no non-regular files, fail closed on a
+// missing source) are the only thing standing between a naive
+// editor and a silent canonical write against a vanished or
+// symlinked checkout.
+
+/// Snapshot roundtrip via the editor seam. Loading a real
+/// canonical `.md` yields the parsed `Agent` plus the SHA-256 of
+/// the **bytes the parser just consumed**. The hash must match
+/// `hash_file` for the same file so the editor's stale-write
+/// check uses the same number the store would compute if asked
+/// again.
+#[test]
+fn load_agent_for_edit_hashes_same_bytes_as_hash_file() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let (agent, prior_hash) = load_agent_for_edit(&paths, "scout").unwrap();
+    assert_eq!(agent.name, "scout");
+    assert_eq!(agent.mode, Mode::subagent);
+    assert!(!agent.prompt.is_empty());
+    let file_hash = hash_file(&paths.canonical_dir.join("scout.md"))
+        .unwrap()
+        .expect("scout.md must exist");
+    assert_eq!(prior_hash, file_hash);
+}
+
+/// The seam rejects names that `Agent::validate_name` rejects
+/// (`..`, leading/trailing hyphen, mixed case, etc.) so the
+/// editor cannot reach `paths.canonical_dir/<name>.md` for a
+/// path that escapes the agents directory.
+#[test]
+fn load_agent_for_edit_rejects_invalid_name() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    for bad in ["", "../escape", "dot..name", "Mixed-Case"] {
+        let err = load_agent_for_edit(&paths, bad).unwrap_err().to_string();
+        assert!(
+            err.contains("invalid agent name") || err.contains("agent name"),
+            "expected name validation error for `{}`, got: {err}",
+            bad
+        );
+    }
+}
+
+/// The seam fail-closed when the configured checkout has been
+/// removed between two loads — the same contract `load_canonical`
+/// and `plan_for` already pin. Without this check, an editor
+/// could open a phantom agent (or worse, write one) against a
+/// checkout the user already dropped.
+#[test]
+fn load_agent_for_edit_rejects_missing_canonical_source() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_checkout(&dir);
+    fs::remove_dir_all(&checkout).unwrap();
+    let err = load_agent_for_edit(&paths, "scout")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("does not exist") || err.contains("`agents/`"),
+        "expected missing-source error, got: {err}"
+    );
+}
+
+/// The seam fail-closed on a symlinked canonical source. The
+/// editor must never parse bytes that live behind a symlink the
+/// runtime did not vet — even if the target is a valid file.
+#[test]
+fn load_agent_for_edit_rejects_symlinked_canonical() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let canonical = paths.canonical_dir.join("scout.md");
+    let original = fs::read(&canonical).unwrap();
+    fs::remove_file(&canonical).unwrap();
+    let real = dir.path().join("real-scout.md");
+    fs::write(&real, &original).unwrap();
+    #[cfg(unix)]
+    let made_link = std::os::unix::fs::symlink(&real, &canonical).is_ok();
+    #[cfg(windows)]
+    let made_link = std::os::windows::fs::symlink_file(&real, &canonical).is_ok();
+    if !made_link {
+        // Symlink creation can fail in sandboxed CI environments
+        // or on Windows without SeCreateSymbolicLinkPrivilege.
+        return;
+    }
+    let err = load_agent_for_edit(&paths, "scout")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("symlink"),
+        "expected symlink rejection, got: {err}"
+    );
+}
+
+/// The seam rejects bytes that fail `Agent::parse` (malformed
+/// frontmatter, unknown permission, etc.) so the editor cannot
+/// hand the user a half-parsed draft. The error must surface
+/// the canonical file path so the user can fix the source by
+/// hand.
+#[test]
+fn load_agent_for_edit_rejects_unparseable_canonical() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let canonical = paths.canonical_dir.join("scout.md");
+    fs::write(&canonical, b"not frontmatter").unwrap();
+    let err = load_agent_for_edit(&paths, "scout")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("scout.md") && err.contains("parse"),
+        "expected parse error mentioning scout.md, got: {err}"
+    );
+}
+
+/// The seam fails when the requested name does not exist on
+/// disk (after the source itself has been validated). This is
+/// the "open a high-fidelity edit on a deleted file" case: the
+/// editor must refuse, not silently create a new agent from
+/// what would have been an empty draft.
+#[test]
+fn load_agent_for_edit_rejects_missing_agent_file() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let err = load_agent_for_edit(&paths, "ghost")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("ghost.md") || err.contains("No such file"),
+        "expected missing-file error, got: {err}"
+    );
+}
+
+/// The hash returned by the seam is the lowercase hex of the
+/// same `Vec<u8>` the parser consumed. This is the strongest
+/// static guarantee we can make about the editor's stale-write
+/// contract: even if the editor hands the prior_hash back to
+/// `save_canonical`, the hash matches the canonical file as it
+/// was at open time. (The runtime still re-hashes before writing
+/// — see `save_canonical_rejects_stale_write`.)
+#[test]
+fn load_agent_for_edit_hash_is_lowercase_hex_of_bytes() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let (_agent, prior_hash) = load_agent_for_edit(&paths, "scout").unwrap();
+    assert_eq!(prior_hash.len(), 64);
+    assert!(prior_hash
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+}
+
+// ---------- D3 cooperative-cancellation tests (apply_safe_controlled) ----------
+//
+// These tests pin the contract for `apply_safe_controlled`:
+// - pre-cancel writes nothing for any row, returns Cancelled
+//   with the unchanged freshly-loaded state.
+// - mid-run cancel preserves the partial state for already-
+//   committed rows; the report's `partial` (State,
+//   Vec<ApplyOutcome>) is the snapshot the caller must keep.
+// - a full run matches the legacy `apply_safe` exactly: same
+//   outcomes, same final state, same cleanup behavior.
+// - cancellation OMITS the global target cleanup pass
+//   (the `retain` over `state.installed_mut(target)`),
+//   so a previously-owned target that the plan did not
+//   include is left untouched on a cancelled path.
+// - the manifest is persisted per row when a row actually
+//   changed the state, so a cancelled run still has every
+//   completed row on disk.
+// - `Finish::Completed` wins over a late cancel that arrives
+//   after the last row has already committed.
+
+fn record_progress() -> (
+    std::rc::Rc<std::cell::RefCell<Vec<Progress>>>,
+    impl FnMut(Progress),
+) {
+    let captured: std::rc::Rc<std::cell::RefCell<Vec<Progress>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink_captured = captured.clone();
+    let sink = move |p: Progress| sink_captured.borrow_mut().push(p);
+    (captured, sink)
+}
+
+#[test]
+fn apply_safe_controlled_pre_cancel_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    assert!(!plan.is_empty());
+    let token = CancelToken::default();
+    token.request();
+    let (_captured, mut sink) = record_progress();
+    let report = apply_safe_controlled(&paths, state, plan, &token, &mut sink);
+    assert_eq!(report.finish, Finish::Cancelled);
+    let (state_after, outcomes) = report.partial;
+    assert!(
+        outcomes.is_empty(),
+        "pre-cancel must produce no outcomes, got {}",
+        outcomes.len()
+    );
+    assert!(
+        state_after.installed.is_empty() && state_after.pi_installed.is_empty(),
+        "pre-cancel must not mutate the manifest"
+    );
+    // No target file should have been written.
+    for starter in STARTERS {
+        let opencode_path = paths.target_dir.join(format!("{}.md", starter.name));
+        let pi_path = paths.pi_target_dir.join(format!("{}.md", starter.name));
+        assert!(
+            !opencode_path.exists() && !pi_path.exists(),
+            "no target file should exist for {} after pre-cancel",
+            starter.name
+        );
+    }
+}
+
+#[test]
+fn apply_safe_controlled_mid_run_cancel_preserves_first_target() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let mut plan = compute_plan(&paths, &state).unwrap();
+    // Restrict to OpenCode to keep the test scoped; Pi rows
+    // would otherwise compete for the same cancel checkpoint.
+    plan.retain(|i| i.target == SyncTarget::OpenCode);
+    assert!(
+        plan.len() > 1,
+        "need more than one OpenCode row to test mid-run cancel"
+    );
+    let first_filename = plan[0].filename.clone();
+    let token = CancelToken::default();
+    let counter = std::cell::Cell::new(0usize);
+    let mut hooked_sink = |_p: Progress| {
+        counter.set(counter.get() + 1);
+        if counter.get() == 1 {
+            token.request();
+        }
+    };
+    let report = apply_safe_controlled(&paths, state, plan, &token, &mut hooked_sink);
+    assert_eq!(report.finish, Finish::Cancelled);
+    let (state_after, outcomes) = report.partial;
+    assert_eq!(outcomes.len(), 1, "exactly one row should have completed");
+    assert_eq!(outcomes[0].filename, first_filename);
+    // First row's manifest record must be there.
+    assert!(state_after.installed.contains_key(&first_filename));
+    // Other OpenCode rows that the plan listed but the cancel
+    // skipped must NOT appear in the manifest.
+    for (filename, _) in state_after.installed.iter() {
+        assert_eq!(filename, &first_filename);
+    }
+    // And the corresponding target file was written.
+    assert!(paths.target_dir.join(&first_filename).is_file());
+    // state.json was written.
+    assert!(paths.state_file.exists());
+}
+
+#[test]
+fn apply_safe_controlled_full_run_matches_legacy() {
+    fn run_controlled() -> (State, Vec<ApplyOutcome>) {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let state = State::default();
+        let plan = compute_plan(&paths, &state).unwrap();
+        let token = CancelToken::default();
+        let (_captured, mut sink) = record_progress();
+        let report = apply_safe_controlled(&paths, state, plan, &token, &mut sink);
+        assert_eq!(report.finish, Finish::Completed);
+        report.partial
+    }
+    fn run_legacy() -> (State, Vec<ApplyOutcome>) {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let state = State::default();
+        let plan = compute_plan(&paths, &state).unwrap();
+        apply_safe(&paths, state, plan).unwrap()
+    }
+    let (legacy_state, leg_outcomes) = run_legacy();
+    let (ctrl_state, ctrl_outcomes) = run_controlled();
+    assert_eq!(ctrl_state, legacy_state, "final state must match legacy");
+    assert_eq!(ctrl_outcomes.len(), leg_outcomes.len());
+    for (a, b) in ctrl_outcomes.iter().zip(leg_outcomes.iter()) {
+        assert_eq!(a.filename, b.filename);
+        assert_eq!(a.action, b.action);
+        assert_eq!(a.ok, b.ok);
+    }
+}
+
+#[test]
+fn apply_safe_controlled_does_not_sweep_unprocessed_targets() {
+    // Build the regular install plan, run it under the legacy
+    // path so the manifest is populated, then take that state
+    // into a controlled run with the plan listing only a
+    // single OpenCode row. Cancellation BEFORE that row must
+    // leave all OTHER previously-owned entries in the manifest
+    // (no `retain` cleanup pass runs on a controlled cancel).
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let (state, _) = apply_safe(&paths, state, plan).unwrap();
+    let original_installed: Vec<String> = state.installed.keys().cloned().collect();
+    assert!(original_installed.len() > 1);
+    // Take just the first row, request cancel before any work.
+    let one_row_plan: Vec<SyncItem> = compute_plan(&paths, &state)
+        .unwrap()
+        .into_iter()
+        .take(1)
+        .collect();
+    let token = CancelToken::default();
+    token.request();
+    let (_captured, mut sink) = record_progress();
+    let report = apply_safe_controlled(&paths, state, one_row_plan, &token, &mut sink);
+    assert_eq!(report.finish, Finish::Cancelled);
+    let (state_after, _) = report.partial;
+    // Every previously-owned entry must still be in the manifest.
+    for name in &original_installed {
+        assert!(
+            state_after.installed.contains_key(name),
+            "previously-owned entry {name} must be untouched on cancel"
+        );
+    }
+}
+
+/// Controlled Completed must run the legacy per-target `retain`
+/// cleanup pass for the targets the caller actually processed.
+/// A stale ownership entry whose canonical AND target files
+/// are both absent is dropped by the Completed cleanup; the
+/// OTHER harness's manifest is left untouched because its
+/// target was never in the processed set.
+#[test]
+fn apply_safe_controlled_completed_drops_stale_ownership_for_processed_target() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    // Seed the manifest with a stale OpenCode entry (no
+    // canonical, no target) and a stale Pi entry. The
+    // OpenCode entry must be cleaned up by the Completed
+    // pass; the Pi entry must be untouched because the
+    // caller only planned OpenCode.
+    let mut state = State::default();
+    state
+        .installed
+        .insert("ghost-opencode.md".to_string(), "deadbeef".repeat(8));
+    state
+        .pi_installed
+        .insert("ghost-pi.md".to_string(), "cafebabe".repeat(8));
+    // Run a controlled install of the bundled starters
+    // (OpenCode target only). The Completed cleanup pass
+    // must drop `ghost-opencode.md` (canonical AND target
+    // both absent) and must NOT touch `ghost-pi.md`.
+    let plan = plan_for(&paths, &state, SyncTarget::OpenCode).unwrap();
+    assert!(
+        plan.iter()
+            .any(|i| i.filename == "ghost-opencode.md" || i.filename == "ghost-pi.md"),
+        "seed must include the ghost entries in the plan"
+    );
+    let token = CancelToken::default();
+    let (_captured, mut sink) = record_progress();
+    let report = apply_safe_controlled(&paths, state, plan, &token, &mut sink);
+    assert_eq!(report.finish, Finish::Completed);
+    let (state_after, _) = report.partial;
+    assert!(
+        !state_after.installed.contains_key("ghost-opencode.md"),
+        "ghost-opencode.md must be cleaned up by Completed retain"
+    );
+    assert!(
+        state_after.pi_installed.contains_key("ghost-pi.md"),
+        "ghost-pi.md must NOT be touched — its harness was never processed"
+    );
+}
+
+/// Manifest persistence failure: when `state.json` cannot be
+/// written (because the state file path is a directory,
+/// simulating a read-only or otherwise unwritable target),
+/// the controlled apply surfaces `Finish::Failed` with the
+/// partial state, the partial outcomes, and the explicit
+/// "manifest may have changed" message. No rollback of
+/// already-committed rows.
+#[test]
+fn apply_safe_controlled_manifest_persistence_failure_reports_failed() {
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    // Make `state.json` an existing directory so the first
+    // `write_state` call fails (write_target cannot create a
+    // sibling temp file next to a path that is a directory).
+    let state_file = paths.state_file.clone();
+    if state_file.exists() {
+        std::fs::remove_file(&state_file).unwrap();
+    }
+    std::fs::create_dir_all(&state_file).unwrap();
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    assert!(!plan.is_empty());
+    let token = CancelToken::default();
+    let (_captured, mut sink) = record_progress();
+    let report = apply_safe_controlled(&paths, state, plan, &token, &mut sink);
+    assert_eq!(report.finish, Finish::Failed);
+    let (state_after, outcomes) = report.partial;
+    // The partial report must retain every per-row outcome
+    // observed before the persistence failure. The number
+    // is at least 1 (some row committed before the failing
+    // write); the rest were never attempted because the
+    // post-row write ran first.
+    assert!(
+        !outcomes.is_empty(),
+        "partial must retain outcomes from rows that ran before the failure"
+    );
+    let msg = report.error.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("manifest write failed") || msg.contains("manifest may have changed"),
+        "expected explicit persistence-failure message, got: {msg}"
+    );
+    // The in-memory state must reflect the row(s) that
+    // committed before the failure — the install/keep
+    // branch populated the manifest.
+    assert!(
+        !state_after.installed.is_empty() || !state_after.pi_installed.is_empty(),
+        "in-memory state must show the rows that committed"
+    );
+    // No row was lost: the per-target-row outcomes use the
+    // legacy action labels, so the report is internally
+    // consistent.
+}
+
+/// A cancel that arrives after the loop has already produced
+/// the final progress emission is honored as `Finish::Completed`
+/// (the work is done; we never claim a no-op run as cancelled).
+#[test]
+fn apply_safe_controlled_late_cancel_after_last_row_is_completed() {
+    // Contract: "Last row already completed => Completed beats
+    // late cancel." A cancel request that arrives after every
+    // row has committed is honored as `Completed` because the
+    // work is done — the runtime never reports a no-op run as
+    // cancelled. We flip the token inside the very last
+    // progress emission (after the last row's outcome is
+    // already pushed) and assert EXACT `Finish::Completed`.
+    let dir = TempDir::new().unwrap();
+    let (paths, _checkout) = setup_paths_with_checkout(&dir);
+    let state = State::default();
+    let plan = compute_plan(&paths, &state).unwrap();
+    let token = CancelToken::default();
+    let counter = std::cell::Cell::new(0usize);
+    let plan_len = plan.len();
+    let mut hooked_sink = |_p: Progress| {
+        counter.set(counter.get() + 1);
+        if counter.get() == plan_len {
+            // After the Nth sink emission the loop has
+            // emitted its per-row post-checkpoint for the
+            // last row. The cancel fires before the final
+            // wrap-up emission runs. The wrap-up must still
+            // observe every row's outcome as committed.
+            token.request();
+        }
+    };
+    let report = apply_safe_controlled(&paths, state, plan, &token, &mut hooked_sink);
+    assert_eq!(
+        report.finish,
+        Finish::Completed,
+        "late cancel after the last row must NOT beat Completed"
+    );
+    let (state_after, outcomes) = report.partial;
+    assert_eq!(
+        outcomes.len(),
+        plan_len,
+        "every row's outcome must already be in the report"
+    );
+    assert!(!state_after.installed.is_empty() || !state_after.pi_installed.is_empty());
 }

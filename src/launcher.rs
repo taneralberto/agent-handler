@@ -469,6 +469,61 @@ mod tests {
         );
     }
 
+    /// `--repo <absolute-but-invalid>` exercises the
+    /// `validate_checkout_path` branch inside
+    /// `resolve_checkout_path`: the path passes the parser
+    /// (absolute, no `..`) but `validate_checkout_path` rejects
+    /// it (the directory does not exist). The validator must
+    /// run BEFORE `save_settings` so `settings.json` bytes
+    /// stay byte-stable on the rejection path. Pin that
+    /// contract: seed compact bytes, capture raw, run, assert
+    /// the raw bytes are unchanged.
+    #[test]
+    fn resolve_repo_override_invalid_checkout_does_not_rewrite_settings() {
+        let dir = TempDir::new().unwrap();
+        let paths = paths_in(&dir);
+        // Seed a VALID prior settings.json so we can
+        // assert it stays byte-stable.
+        let prior = dir.path().join("prior-checkout");
+        std::fs::create_dir_all(prior.join("agents")).unwrap();
+        if let Some(parent) = paths.settings_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // Use compact (not pretty) JSON so the saved bytes
+        // differ from anything `save_settings` would write —
+        // a rewrite would fail the byte-equality assertion.
+        let seeded =
+            serde_json::to_vec(&Settings::new(prior.to_string_lossy().into_owned())).unwrap();
+        std::fs::write(&paths.settings_file, &seeded).unwrap();
+        let before_bytes = std::fs::read(&paths.settings_file).unwrap();
+
+        // Build an absolute path that does NOT exist on disk.
+        let missing = dir.path().join("does-not-exist");
+        let args = vec!["--repo".to_string(), missing.to_string_lossy().into_owned()];
+        let err = resolve_checkout_path(&paths, &args)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not exist") || err.contains("unusable"),
+            "expected validation failure, got: {err}"
+        );
+
+        // settings.json must be byte-identical to the seed
+        // — the validator ran before the save branch, so no
+        // partial rewrite happens on the failure path.
+        let after_bytes = std::fs::read(&paths.settings_file).unwrap();
+        assert_eq!(
+            before_bytes, after_bytes,
+            "failing validate_checkout_path must not rewrite settings.json"
+        );
+        let on_disk = load_settings(&paths.settings_file).unwrap().unwrap();
+        assert_eq!(
+            on_disk,
+            Settings::new(prior.to_string_lossy().into_owned()),
+            "persisted settings.json must still point at the prior checkout"
+        );
+    }
+
     /// `--repo` without a value is a user error: the parser surfaces
     /// the missing-argument condition so the user is told *now*
     /// rather than at a deeper layer.

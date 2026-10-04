@@ -21,6 +21,7 @@
 
 mod pi_psql;
 
+use crate::operation::{CancelToken, Finish, OperationReport, Progress};
 use crate::store::Paths;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
@@ -231,117 +232,442 @@ pub fn install_tool_at(
     spawn: SpawnRunner<'_>,
     rename: RenameRunner<'_>,
 ) -> Result<ToolOutcome> {
+    let report = install_tool_at_controlled(
+        staging,
+        paths,
+        entry,
+        spawn,
+        rename,
+        &CancelToken::new(),
+        &mut |_p| {},
+    );
+    let outcome = report.partial.0;
+    if matches!(report.finish, Finish::Cancelled) {
+        // The legacy entry point never sees cancel — a Cancelled
+        // finish from the controlled pipeline means the never-set
+        // token was flipped by the test harness, which is the
+        // legacy caller's bug. Surface as a generic failure.
+        bail!(
+            "install_tool_at: pipeline reported Cancelled without a token request: {}",
+            report.error.unwrap_or_default()
+        );
+    }
+    Ok(outcome)
+}
+
+/// Install `entry` with cooperative cancellation and progress
+/// reporting. The same stage sequence as [`install_tool_at`]
+/// (preflight → ls-remote → stage → verify_pinned_sha →
+/// identity_check → npm_ci → publish) runs strictly in order; the
+/// only addition is a token check **before** each stage begins,
+/// using `staging_owned` as the boundary that decides whether the
+/// installer is responsible for cleanup.
+///
+/// Cancellation rules:
+///
+/// - Cancellation is checked between stages, never inside a
+///   stage. `preflight` / `ls-remote` / `verify_pinned_sha` /
+///   `identity_check` / `npm_ci` each run as one unit because
+///   they spawn real subprocesses and interrupting them mid-spawn
+///   would leak zombies and orphans; tearing them down cleanly
+///   is the runner's responsibility and the spec says "Do NOT kill
+///   current writer command for cancel". The publish rename
+///   also runs as one unit: a successful `renameat2` /
+///   `MoveFileW` is honored as `Finish::Completed` regardless of
+///   any cancel request that may have arrived during the call.
+/// - A cancel observed **after** the installer took ownership of
+///   `staging` (the `create_dir` at stage 3 succeeded) cleans up
+///   ONLY the directory the installer itself created. A
+///   preexisting sibling at `staging` is never touched.
+/// - Cleanup failures report the residual path in
+///   `OperationReport::error` so the caller can decide whether to
+///   surface it. The report is still `Finish::Cancelled`.
+pub fn install_tool_at_controlled(
+    staging: &Path,
+    paths: &Paths,
+    entry: &ToolCatalogEntry,
+    spawn: SpawnRunner<'_>,
+    rename: RenameRunner<'_>,
+    token: &CancelToken,
+    sink: &mut dyn FnMut(Progress),
+) -> OperationReport<(ToolOutcome, Option<PathBuf>)> {
     let destination = destination_for(paths, entry);
 
-    // Step 1: Pre-flight. Fail closed and never touch the destination.
+    // Stage 1: Pre-flight. The cancel check happens before we
+    // touch the destination or staging. Pre-flight itself runs as
+    // one unit (it spawns git/node/npm) so the seam is before /
+    // after the call, never inside.
+    if token.is_requested() {
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::NotInstalled,
+                    detail: "cancelled before preflight".to_string(),
+                },
+                None,
+            ),
+            error: Some("cancelled before preflight".to_string()),
+        };
+    }
+    sink(Progress {
+        stage: "tools: preflight",
+        item: None,
+        processed: 0,
+        total: Some(7),
+    });
     if let Err(detail) = preflight(spawn, entry) {
-        return Ok(ToolOutcome {
-            status: ToolStatus::PrerequisitesMissing,
-            detail,
-        });
+        return OperationReport {
+            finish: Finish::Failed,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::PrerequisitesMissing,
+                    detail,
+                },
+                None,
+            ),
+            error: None,
+        };
     }
 
-    // Step 2: Resolve tag -> peeled SHA via `git ls-remote`.
+    // Stage 2: Resolve tag -> peeled SHA via `git ls-remote`.
+    if token.is_requested() {
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::NotInstalled,
+                    detail: "cancelled before ls-remote".to_string(),
+                },
+                None,
+            ),
+            error: Some("cancelled before ls-remote".to_string()),
+        };
+    }
+    sink(Progress {
+        stage: "tools: ls-remote",
+        item: None,
+        processed: 1,
+        total: Some(7),
+    });
     let peeled = match ls_remote_peeled(spawn, entry) {
         Ok(sha) => sha,
         Err(detail) => {
-            return Ok(ToolOutcome {
-                status: ToolStatus::InstallFailed,
-                detail,
-            })
+            return OperationReport {
+                finish: Finish::Failed,
+                partial: (
+                    ToolOutcome {
+                        status: ToolStatus::InstallFailed,
+                        detail,
+                    },
+                    None,
+                ),
+                error: None,
+            };
         }
     };
-
     // Sanity: the peeled SHA must match what we recorded in DEFAULT_CATALOG.
-    // This is a defense-in-depth check before staging; the authoritative
-    // pin check is step 4 (HEAD == expected_sha after checkout).
     if peeled != entry.expected_sha {
-        return Ok(ToolOutcome {
-            status: ToolStatus::InstallFailed,
-            detail: format!(
-                "tag {} peeled to {} does not match catalog pin {}; refusing to install",
-                entry.pin_tag, peeled, entry.expected_sha
+        return OperationReport {
+            finish: Finish::Failed,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::InstallFailed,
+                    detail: format!(
+                        "tag {} peeled to {} does not match catalog pin {}; refusing to install",
+                        entry.pin_tag, peeled, entry.expected_sha
+                    ),
+                },
+                None,
             ),
-        });
+            error: None,
+        };
     }
 
-    // Step 3: Stage on the same filesystem / volume as the destination,
-    // adjacent to the target.
-    //
-    // `stage` reserves the staging path via exclusive `create_dir`. If it
-    // bails (e.g. a preexisting sibling occupies that path), we never
-    // owned it, so the unconditional cleanup below would have clobbered
-    // unrelated data. `stage` is responsible for cleaning up its own
-    // internal failures (after it has taken ownership), so on Err we
-    // simply forward.
-    if let Err(detail) = stage(spawn, entry, staging) {
-        return Ok(ToolOutcome {
-            status: ToolStatus::InstallFailed,
-            detail,
-        });
+    // Stage 3: Stage. The `create_dir` call is the boundary that
+    // transfers ownership of `staging` to the installer; from
+    // this point onward a cancel must clean up the directory.
+    if token.is_requested() {
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::NotInstalled,
+                    detail: "cancelled before stage".to_string(),
+                },
+                None,
+            ),
+            error: Some("cancelled before stage".to_string()),
+        };
     }
-    // From this point on, the installer owns `staging`.
+    sink(Progress {
+        stage: "tools: stage",
+        item: None,
+        processed: 2,
+        total: Some(7),
+    });
+    let staged = match stage(spawn, entry, staging) {
+        Ok(()) => true,
+        Err(detail) => {
+            return OperationReport {
+                finish: Finish::Failed,
+                partial: (
+                    ToolOutcome {
+                        status: ToolStatus::InstallFailed,
+                        detail,
+                    },
+                    None,
+                ),
+                error: None,
+            };
+        }
+    };
+    // staged=true ⇒ the installer owns `staging`.
 
-    // Step 4: Verify pinned SHA at HEAD.
+    // Stage 4: Verify pinned SHA at HEAD.
+    if token.is_requested() {
+        let residual = cancel_owned_staging(staging, staged);
+        let err = residual_error_message(residual.as_ref(), "cancelled");
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::NotInstalled,
+                    detail: "cancelled before verify_pinned_sha".to_string(),
+                },
+                residual,
+            ),
+            error: err,
+        };
+    }
+    sink(Progress {
+        stage: "tools: verify_pinned_sha",
+        item: None,
+        processed: 3,
+        total: Some(7),
+    });
     if let Err(detail) = verify_pinned_sha(spawn, staging, entry) {
-        cleanup_staging(staging);
-        return Ok(ToolOutcome {
-            status: ToolStatus::InstallFailed,
-            detail,
-        });
+        let residual = cancel_owned_staging(staging, staged);
+        let err = residual_error_message(residual.as_ref(), "verify_pinned_sha failed");
+        return OperationReport {
+            finish: Finish::Failed,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::InstallFailed,
+                    detail,
+                },
+                residual,
+            ),
+            error: err,
+        };
     }
 
-    // Step 5: Identity check (default SKILL.md `name:` only).
+    // Stage 5: Identity check.
+    if token.is_requested() {
+        let residual = cancel_owned_staging(staging, staged);
+        let err = residual_error_message(residual.as_ref(), "cancelled");
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::NotInstalled,
+                    detail: "cancelled before identity_check".to_string(),
+                },
+                residual,
+            ),
+            error: err,
+        };
+    }
+    sink(Progress {
+        stage: "tools: identity_check",
+        item: None,
+        processed: 4,
+        total: Some(7),
+    });
     if let Err(detail) = identity_check(staging, entry) {
-        cleanup_staging(staging);
-        return Ok(ToolOutcome {
-            status: ToolStatus::IdentityMismatch,
-            detail,
-        });
+        let residual = cancel_owned_staging(staging, staged);
+        let err = residual_error_message(residual.as_ref(), "verify_pinned_sha failed");
+        return OperationReport {
+            finish: Finish::Failed,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::IdentityMismatch,
+                    detail,
+                },
+                residual,
+            ),
+            error: err,
+        };
     }
 
-    // Step 6: Install deps via `npm ci`.
+    // Stage 6: npm ci.
+    if token.is_requested() {
+        let residual = cancel_owned_staging(staging, staged);
+        let err = residual_error_message(residual.as_ref(), "cancelled");
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::NotInstalled,
+                    detail: "cancelled before npm_ci".to_string(),
+                },
+                residual,
+            ),
+            error: err,
+        };
+    }
+    sink(Progress {
+        stage: "tools: npm_ci",
+        item: None,
+        processed: 5,
+        total: Some(7),
+    });
     if let Err(detail) = npm_ci(spawn, staging) {
-        cleanup_staging(staging);
-        return Ok(ToolOutcome {
-            status: ToolStatus::InstallFailed,
-            detail,
-        });
+        let residual = cancel_owned_staging(staging, staged);
+        let err = residual_error_message(residual.as_ref(), "verify_pinned_sha failed");
+        return OperationReport {
+            finish: Finish::Failed,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::InstallFailed,
+                    detail,
+                },
+                residual,
+            ),
+            error: err,
+        };
     }
 
-    // Step 7: Publish via the OS no-replace primitive.
+    // Stage 7: Publish. The rename runs as one unit; a successful
+    // rename is reported as `Finish::Completed` regardless of any
+    // cancel request observed before this stage began (the cancel
+    // was honored at the pre-publish checkpoint above and would
+    // have returned Cancelled there — we never reach the rename
+    // in that case).
+    if token.is_requested() {
+        let residual = cancel_owned_staging(staging, staged);
+        // Late cancel after a clean staged tree: this is still
+        // a cooperative cancel — the user requested abort before
+        // the publish rename ran. Same semantics as every other
+        // cancel checkpoint above: `Finish::Cancelled` +
+        // `ToolStatus::NotInstalled` with the literal detail
+        // `cancelled before publish`. `Conflict` is reserved
+        // for actual existing-destination collisions (the EEXIST
+        // rename error path below). The staged tree is cleaned
+        // up; `partial.1` carries any residual cleanup path so a
+        // cleanup failure is visible in `error` and the path is
+        // not falsely reported as cleaned.
+        let err = residual_error_message(residual.as_ref(), "cancelled before publish");
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (
+                ToolOutcome {
+                    status: ToolStatus::NotInstalled,
+                    detail: "cancelled before publish".to_string(),
+                },
+                residual,
+            ),
+            error: err,
+        };
+    }
+    sink(Progress {
+        stage: "tools: publish",
+        item: None,
+        processed: 6,
+        total: Some(7),
+    });
     match rename(staging, &destination) {
         Ok(()) => {
+            sink(Progress {
+                stage: "tools: publish",
+                item: None,
+                processed: 7,
+                total: Some(7),
+            });
             // staging is consumed by the rename; nothing to clean up.
-            Ok(ToolOutcome {
-                status: ToolStatus::Installed,
-                detail: format!("published {}", destination.display()),
-            })
+            OperationReport {
+                finish: Finish::Completed,
+                partial: (
+                    ToolOutcome {
+                        status: ToolStatus::Installed,
+                        detail: format!("published {}", destination.display()),
+                    },
+                    None,
+                ),
+                error: None,
+            }
         }
         Err(code) => {
-            cleanup_staging(staging);
+            let residual = cancel_owned_staging(staging, staged);
             // EEXIST (17) on Linux and ERROR_ALREADY_EXISTS (183) on Windows.
-            if code == libc_const_eexist() || code == windows_const_already_exists() {
-                Ok(ToolOutcome {
+            let outcome = if code == libc_const_eexist() || code == windows_const_already_exists() {
+                ToolOutcome {
                     status: ToolStatus::Conflict,
                     detail: format!("{} already exists", destination.display()),
-                })
+                }
             } else if code == libc_const_exdev() || code == windows_const_not_same_device() {
-                Ok(ToolOutcome {
+                ToolOutcome {
                     status: ToolStatus::InstallFailed,
                     detail: format!(
                         "{} is on a different filesystem than staging; refusing to copy",
                         destination.display()
                     ),
-                })
+                }
             } else {
-                Ok(ToolOutcome {
+                ToolOutcome {
                     status: ToolStatus::InstallFailed,
                     detail: format!("publish failed with OS error code {}", code),
-                })
+                }
+            };
+            let err = residual_error_message(residual.as_ref(), "publish failed");
+            OperationReport {
+                finish: Finish::Failed,
+                partial: (outcome, residual),
+                error: err,
             }
         }
     }
+}
+
+/// Convenience entry point: install with cooperative cancellation
+/// using the default spawn/rename runners. Mirrors [`install_tool`]
+/// for the controlled path.
+pub fn install_tool_controlled(
+    paths: &Paths,
+    entry: &ToolCatalogEntry,
+    token: &CancelToken,
+    sink: &mut dyn FnMut(Progress),
+) -> OperationReport<(ToolOutcome, Option<PathBuf>)> {
+    install_tool_at_controlled(
+        &staging_for(paths, entry),
+        paths,
+        entry,
+        &mut |spec| spawn_command(spec),
+        &mut |src, dst| rename_no_replace(src, dst),
+        token,
+        sink,
+    )
+}
+
+/// Remove the staging directory only if `owned` is `true` (i.e.
+/// the installer's stage step succeeded). Returns the residual
+/// path if cleanup itself failed, otherwise `None`. Preexisting
+/// siblings at `staging` are never touched because `owned` stays
+/// `false` in that case.
+fn cancel_owned_staging(staging: &Path, owned: bool) -> Option<PathBuf> {
+    if !owned {
+        return None;
+    }
+    if fs::remove_dir_all(staging).is_ok() {
+        None
+    } else {
+        Some(staging.to_path_buf())
+    }
+}
+
+/// Build the standard `error` string for a residual staging path.
+fn residual_error_message(residual: Option<&PathBuf>, prefix: &str) -> Option<String> {
+    residual.map(|p| format!("{prefix}; staging residual at {}", p.display()))
 }
 
 // ---------- Pre-flight (Step 1) ----------

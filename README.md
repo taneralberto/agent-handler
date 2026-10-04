@@ -5,6 +5,59 @@ own control. The canonical sources live in a single user-configured checkout
 on disk, and `Install/Update` safely synchronizes them into the directories
 OpenCode and Pi read agents from.
 
+## Current GUI and packaging status (2026-10-04)
+
+Latest evidence supersedes preparation-only claims below: root **576 passed,
+1 ignored**; Tauri default/custom-protocol **95 passed each**, Node **84 passed**,
+Angular build passed; installer **29** + packaging **14** = **43 passed**.
+Approved source snapshot and real offline CachyOS paired package build succeeded;
+actual isolated CLI + GUI custom-protocol installer succeeded, without host
+installation or AUR publication. See the latest top note in `GUI_ROADMAP.md`
+and [`packaging/arch/README.md`](packaging/arch/README.md) for checksum, logs,
+`--nodeps` limitation and confirmed removal of the historical GUI `$srcdir` warning.
+Current source: `/tmp/opencode/agenthd-arch-remapped/agenthd-0.1.0.tar.gz`;
+paired CLI/GUI package: `agenthd-0.1.0-1-x86_64.pkg.tar.zst` in that directory.
+Checksums and current matrix: [`packaging/arch/VALIDATION.md`](packaging/arch/VALIDATION.md).
+Snapshot predates these doc updates and the root `npm run install:global`
+entrypoint; it does not include that entrypoint. Latest working-tree docs are
+not identical. Counts are last parent-verified, not rerun here.
+Historical arch-final GUI in `/tmp/opencode/agenthd-gui-smoke` was launched and
+terminated (log 0 bytes, no visual/IPC inspection); new remapped GUI **not launched**.
+Current visual gates remain pending; local stub Discovery does not
+certify real OpenCode. Older read-only Linux gate stays closed. The following
+status details are historical where they conflict with this latest note.
+
+`GUI_ROADMAP.md` (top status) is the authority; older slice descriptions
+below are historical and superseded where they say edit-only, TUI-only
+CRUD, or D3 implementation pending. The companion now implements Settings,
+agent editor + create/rename/delete, and D3 long jobs. Listener-first
+`agenthd-operation` events replace polling; Close requests cooperatively
+cancel active jobs through the real emitter. Backend-retained snapshots and
+monotonic sequence reconciliation support recovery; unresolved IPC recovery
+keeps mutations fail-closed. Cancellation preserves partial work, no rollback.
+
+Historical pre-Plans checks (superseded by the top counts): Tauri `cargo test --lib` **88 passed** in both
+default and `--features custom-protocol` variants; `npm run test:unit`
+**72 passed**; `npm run build` passed (unit/build evidence, not visual proof).
+Root `cargo test --all-targets`: **573 passed, 1 ignored**, last verified in
+the prior block, not rerun for packaging preparation. Installer tests were
+rerun here: **29 passed**, alongside **8 packaging tests** (37 total).
+Settings/editor/D3/CRUD visual acceptance remains **pending**; no GUI was
+installed or launched against this current tree. The earlier read-only
+paired GUI↔TUI gate remains **closed** by user report on Linux/CachyOS,
+not Windows; it does not certify these newer controls or current binaries.
+
+D4 Arch/CachyOS-first **local source package preparation** is available in
+[`packaging/arch/README.md`](packaging/arch/README.md): paired `/usr/bin`
+binaries, real snapshot checksum, no remote URL or AUR publication. List and
+approve working-tree sources before generating artifacts. Full isolated
+package build and inspection are complete for the approved remapped artifacts;
+full dependency checks/clean chroot remain pending externally. No further code
+changes needed for the agreed automated scope; next steps are manual acceptance
+and external validation. No host install or current GUI runtime claim; D5
+remains unresolved. Both CLI and GUI
+are MIT licensed; see [LICENSE](LICENSE).
+
 ## Source
 
 There is exactly one canonical source of truth: the `agents/` directory
@@ -57,7 +110,7 @@ agree with the user. The `--repo` value is rejected when it equals
 keyword — matters when the user types `agenthd --repo tui` by
 accident.
 
-### Modes (TUI today, GUI planned)
+### Modes (TUI + companion GUI)
 
 The binary accepts a single positional mode keyword:
 
@@ -160,7 +213,7 @@ copies it into the cargo root the CLI ships from — no manual
 The single-step `cargo install` of the root **does not** bundle
 the companion; both crates must be installed separately.
 
-**No platform packaging claim.** This slice installs both binaries
+**Historical source-installer boundary, not the current D4 status.** This slice installs both binaries
 into the same cargo root and stops there; Arch packages, `.deb` /
 `.rpm` / AppImage, winget / Scoop / MSI installers, and any
 per-platform packaging are explicitly **out of scope** for this
@@ -215,12 +268,14 @@ fetch, or bootstrap step.
 
 ## Install
 
-The recommended command installs / updates both the CLI and the
-companion GUI into the same cargo root, building the Angular
-frontend first:
+From the repository root, the recommended command installs / updates both
+the CLI and the companion GUI into the same cargo root, building the
+Angular frontend first:
 
 ```sh
-node scripts/install.mjs
+npm run install:global
+# After installation, launch explicitly (default per-user destination):
+~/.cargo/bin/agenthd gui --repo /absolute/path/to/checkout
 ```
 
 This is a thin orchestrator: it preflights `cargo` / `npm` / `node`,
@@ -228,11 +283,26 @@ runs `npm ci --include=dev` and `npm run build` in
 `spikes/tauri-angular/`, confirms `dist/.../browser/index.html`
 was produced, and then runs both `cargo install` invocations from
 the repo root with the same `--root`. By default the install
-root is `~/.cargo` (or `$CARGO_HOME`, or `$CARGO_INSTALL_ROOT`,
-in that order); pass `--root <dir>` to override. Pass `--force`
-to overwrite a preexisting `agenthd(.exe)` / `agenthd-gui(.exe)`
-at the destination. Use `node scripts/install.mjs --help` for
-the full flag reference.
+root is per-user, with precedence
+`--root > CARGO_INSTALL_ROOT > CARGO_HOME > $HOME/.cargo`;
+both binaries land in its `bin/` directory. This is not
+`npm install -g`, a system-wide install, or an npm publication; no sudo is
+needed. The root npm script delegates to `node scripts/install.mjs --force`,
+so rerunning it replaces both destination binaries. Production frontend assets
+are built and embedded through the companion's `custom-protocol` feature.
+Installation never launches the GUI or writes agenthd settings.
+
+For a portable or isolated destination, forward installer arguments through npm:
+
+```sh
+npm run install:global -- --root /absolute/path/to/install-root
+```
+
+Launch `/absolute/path/to/install-root/bin/agenthd` when using that override
+(or the corresponding Cargo environment destination). Use
+`npm run install:global -- --help` for the full installer flag reference.
+The direct `node scripts/install.mjs` entrypoint remains available without
+forced replacement unless you pass `--force`.
 
 ### Update
 
@@ -245,7 +315,7 @@ companion one keeps `--features custom-protocol`, both land in
 the same cargo root):
 
 ```sh
-node scripts/install.mjs --force
+npm run install:global
 ```
 
 After the orchestrator reports `completed`, launch the GUI via
@@ -262,7 +332,7 @@ reach for the manual CLI-only install only when the GUI
 companion is intentionally out of scope.
 
 Prerequisites: Node.js with `npm` on `PATH` (Angular 22 / npm
-lockfile-driven), Rust with `cargo` on `PATH`, and the Tauri
+lockfile-driven; **^22.22.3 || ^24.15.0 || >=26.0.0**), Rust with `cargo` on `PATH`, and the Tauri
 WebView2 runtime on Windows plus `webkit2gtk-4.1` (and friends)
 on Linux. The orchestrator reports a missing tool as a preflight
 abort and does not write anything. See
@@ -337,6 +407,116 @@ slice mutación síncrona pequeña **NO** invalida ese gate
 ni lo da por demostrado, requiere su propia confirmación
 visual no instrumentada con `apply_checkout` Save →
 refresh + commit/push fuera de alcance aquí.
+
+### GUI editor slice (mutación pequeña síncrona — edit ONLY)
+
+Segundo slice vertical aprobado: la GUI ahora puede editar
+**agentes existentes**. Rename / create / delete siguen
+siendo TUI-only en esta fase (D3 los desbloquea cuando
+aplique). El editor es **inline-por-agente**: cada fila de
+Agents expone un botón `Edit` que abre un panel con la fila
+seleccionada en modo edición y el resto de la lista como
+solo-lectura. Controles nativos `<input>`, `<select>` y
+`<textarea>` — sin framework de formularios, sin DOM
+adicional, sin CSS remota. Campos editables: `description`,
+`mode`, `model`, `prompt` y la tabla completa de permisos
+(los permisos desconocidos se preservan verbatim en el
+round-trip; el lib los rechaza al guardar con el error
+estándar `unknown permission key`).
+
+Backend: dos comandos Tauri adicionales
+(`load_agent_for_edit`, `save_agent_edit`) que delegan en
+helpers de composición puros sobre `&Paths`. El seam de
+apertura `agenthd::store::load_agent_for_edit` (nuevo en
+este bloque) hace una sola lectura del archivo, valida
+nombre / fuente canónica / symlink / no-regular / UTF-8,
+parsea y devuelve el `Agent` + el SHA-256 de los **mismos
+bytes** que consumió el parser. El seam de guardado
+`agenthd::workflows::save_agent` (pre-existente, ya
+extraído en Fase 2) hace la pasada rename-then-save; el
+helper `compose_save_agent_edit` añade las precondiciones
+GUI-only (contexto no vacío, checkout persistido `Ready`
+sigue coincidiendo con el de apertura, nombre inmutable,
+archivo sigue existiendo — no convierte una edit en alta)
+antes de invocar el workflow. Errores literales del lib
+alcanzan al frontend sin prefijo ni copia.
+
+Frontend: el editor se abre desde una fila específica con
+un click en `Edit`; `busy` lock se mantiene antes de cada
+`await` en TODAS las acciones públicas. El draft del editor
+vive en signals separados (`editDraft`, `editOriginal`,
+`editContext`) y nunca se sobreescribe por un refresh del
+listado. El refresh both (`refreshAll`) pide confirmación
+nativa (`confirm`) antes de descartar un draft sucio, y
+rechaza ejecutar si el editor está abierto en modo
+"intentando guardar el checkout". El save cierra el draft
+**antes** del refresh post-write para que un refresh
+fallido no pueda enmascarar el éxito del save; el error de
+refresh post-save se reporta aparte, sin reiniciar el
+draft. El discard pide `confirm` nativo solo cuando hay
+cambios sin guardar.
+
+Evidencia de tests focales del backend (en
+`spikes/tauri-angular/src-tauri/src/lib.rs`):
+
+- `cargo test --locked --lib`: 28/28 OK (16 previos del
+  slice Settings + 12 nuevos del slice editor: round-trip
+  load → edit → save de todos los campos, refresh
+  empty/stale/missing-file, rechazo name-change, rechazo
+  cuando el archivo canónico desaparece, propagación del
+  error `changed on disk`, rechazo cuando el checkout
+  configurado cambió entre open y save, rechazo de
+  contexto vacío, pin de no-escritura sobre `settings.json`
+  / `state.json` / `target_dir` / `pi_target_dir`, pin de
+  no-escritura en load, pin JSON de que el summary no se
+  ensancha con campos del editor, pin top-level keys
+  exactos de `AgentEditDto` y `AgentEditContext`).
+- `cargo test --locked --lib --features custom-protocol`:
+  28/28 OK.
+- `cargo clippy --locked --lib --no-deps [--features
+  custom-protocol]`: sin warnings nuevos vs baseline (3
+  warnings preexistentes en `src/tools/mod.rs` del crate
+  raíz, no tocados).
+
+Tests del seam en `src/store/tests.rs`:
+
+- `cargo test --locked --offline --all-targets` (root):
+  7 nuevos tests focales para
+  `load_agent_for_edit`: snapshot hash idéntico a
+  `hash_file`, rechazo de nombre inválido (incluye
+  traversal-style `../escape`), fail-closed ante fuente
+  canónica faltante, rechazo de symlink en la fuente,
+  rechazo de bytes no parseables, rechazo de archivo
+  inexistente, pin de que el hash es hex ASCII minúscula
+  de 64 chars.
+
+Tests de helpers frontend (sin DOM/IPC):
+
+- `node --experimental-strip-types --test
+  spikes/tauri-angular/editor-dto.test.mjs`: 18/18 OK
+  sobre las funciones puras `deepCopyDto` y `sameDto` que
+  el componente importa desde
+  `spikes/tauri-angular/src/app/editor-dto.ts`. Sin
+  Angular runtime, sin Tauri mock, sin DOM.
+
+`cargo fmt --check` y `npm run build` limpios.
+
+Gate visual pendiente (igual que el slice Settings): la
+mutación edit-only necesita su propia confirmación paired
+GUI↔TUI sobre el mismo HOME — Edit → cambiar description
+y un permiso → Guardar → ver el archivo canónico con esos
+cambios en la TUI (sin shadow copy, sin IPC instrumentado).
+**D3 APROBADO** por el usuario — cancelación cooperativa
+vía puntos seguros del workflow con cambios parciales sin
+rollback automático (NO es precondición de este slice
+síncrono pequeño; la implementación queda pendiente y se
+desbloqueará cuando el slice vertical incorpore operaciones
+largas); **D4 APROBADO** con prioridad Arch / CachyOS —
+PKGBUILD first, sin publicar en AUR, pruebas visuales y
+de build/install solo AISLADAS en `/tmp/opencode`, sin
+HOME real ni binarios reales del host (implementación
+pendiente); **D5 conserva schema/rutas sin migrar
+anunciado** (no se cierra cross-platform).
 
 ## Paths
 

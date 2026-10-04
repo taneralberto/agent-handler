@@ -2,6 +2,133 @@
 
 Handoff autónomo para otro agente en otra PC.
 
+## Última evidencia autoritativa — 2026-10-04 (paquete + install aislados)
+
+Matriz actual: `packaging/arch/VALIDATION.md`. Recipe remap aprobado por padre,
+**nuevo build offline CachyOS SUCCESS**, warning `$srcdir` ausente y strings
+de ambos binarios sin referencias al nuevo build-source. Artefactos anteriores
+conservados como históricos. Validación parent-verified: installer **29** + packaging **14** = **43 PASS**,
+`/tmp/opencode/arch-remap-fixture-tests.log`; Bash syntax y diff check PASS.
+Resto de conteos abajo: último verificado, sin rerun aquí.
+
+Esta actualización supera los límites de preparación de los bloques inferiores.
+Últimos checks reportados: root **576 PASS, 1 ignored**; Tauri default y
+custom-protocol **95 PASS cada uno**; Node **84 PASS**, Angular build PASS;
+installer **29** + packaging **10** = **39 PASS** histórico (superado por 43 arriba).
+Snapshot aprobado actual: `/tmp/opencode/agenthd-arch-remapped/agenthd-0.1.0.tar.gz`,
+SHA-256 `8188cc343e0b8da48210059521419ffe4d5fd1c87451fafce7ae2e77f66567b7`.
+Incluye recipe aprobado, pins GPT y Plans; `arch-final` y `.prepared` históricos.
+Son fuentes working-tree no committed, no prueba de git commit. El snapshot
+precede este append: código aprobado coincidente, docs posteriores **no**
+incluidos; no se regeneró ni es bit-idéntico al working tree actual.
+
+Build real offline CachyOS **SUCCESS**, `makepkg --nodeps --noconfirm`, log
+`/tmp/opencode/arch-remap-package-build.log`; paquete `agenthd-0.1.0-1-x86_64.pkg.tar.zst`
+en el mismo directorio, SHA-256
+`ef721fde48ed4f84ec221c5864af24606d6da4287b79264000768dc35c0fa380`.
+Source verification **Passed** desde cwd correcto.
+`pacman -T cargo` reporta paquete ausente aunque rustc 1.96 está disponible;
+otras dependencias satisfechas. **No** clean chroot ni dependency checks completos.
+Caches Cargo/npm copiados separados bajo `/tmp/opencode`, sin red. WARN `$srcdir`
+histórico de arch-final **ausente** en nuevo build; tres warnings root Tools
+dead-code baseline. GUI: cuatro rutas esperadas `/usr/src/debug/agenthd/agenthd-0.1.0/src/`.
+Sin binary patch/warning filters ni claim reproducible/native all-platform.
+Pair extraído `/tmp/opencode/arch-remap-extracted/usr/bin`: permisos **755**, LICENSE
+**644**, `cmp` licencia PASS, `ldd` sin missing. Installer real **SUCCESS**:
+dos cargo installs, GUI custom-protocol, root `/tmp/opencode/agenthd-paired-install`,
+log `/tmp/opencode/paired-install-final.log`. Sin host install/AUR publication.
+
+Fixture preparado `/tmp/opencode/agenthd-gui-smoke`: HOME/XDG nuevos, checkout
+copiado agents+skills del snapshot aprobado; stub local solo `models`, delay 10s,
+sin red/OpenCode real. Comandos paired y procedimiento en su `README.md`.
+Proceso GUI histórico arch-final launch + termination reportado por padre vía notificación shell
+SSH; log redirigido 0 bytes. Sin screens/DOM/IPC inspection ni aceptación UI.
+Gates visuales Settings Save/refresh/editor/new/rename-delete/stale draft/Plans/Skills/Discovery/
+Cancel/Close **PENDIENTES**; fixture Discovery no certifica registry real.
+Tools remoto pendiente de user/red. Gate read-only Linux previo sigue CERRADO
+(`Sí, todo coincide`), no reabierto. Estado real user cambió externamente:
+Settings `95b6…`, estado `e4e8…` (updates modelos autorizados), host bins
+`9f51…` / `e59d…` sin cambios por build checks; no claim de `978…` intacto.
+Nuevo GUI remapped **no lanzado**. CLI packaged negativo en
+`/tmp/opencode/arch-cli-negative-Nyfcgx`: `agenthd gui --repo missingcheckout`,
+exit 1, stderr `agenthd: resolve configured checkout`, sin children HOME/XDG.
+D5 abierto. Implementación DONE; sin más cambios de código necesarios para scope
+automatizable acordado. Próximo paso: aceptación manual + entorno externo.
+
+## Historial — 2026-10-04 (D3 + CRUD + preparación D4)
+
+Este bloque conserva el estado de preparación; la evidencia superior manda.
+Los relatos
+anteriores de D3 pendiente, Close solo bloqueado, emitter no-op, conteos
+61/36, editor edit-only y CRUD TUI-only son **históricos y superados**;
+se conserva su evidencia, no se reabren gates ya cerrados.
+
+- **D3 implementado + corregido:** listener-first y eventos
+  `agenthd-operation`, sin polling. Close solicita cancelación cooperativa
+  y emite por el emitter real; no rollback automático de cambios parciales.
+  Snapshots retenidos en backend, reconciliación de `seq` monotónico y
+  recovery vía current/status; IPC recovery no resuelto mantiene el gate
+  de mutaciones **fail-closed**. No prueba visual/runtime del árbol actual.
+- **CRUD implementado:** create/rename/delete además del editor de agentes
+  existentes, reutilizando seams del lib y reserva corta exclusiva.
+  Settings/editor/D3/CRUD: gates visuales **PENDIENTES**. No GUI instalada
+  ni lanzada contra el árbol actual en este bloque de preparación.
+- **Plans/inventory read-only implementados:** `operation_plan(request)`
+  usa `store::plan_for` (OpenCode/Pi separados) y `plan_skills`, releyendo
+  Ready + checkout persistido + ownership state. GUI muestra etiquetas,
+  paths, hashes y razones del root, sin catálogo de estados paralelo.
+  Snapshot advisory, no ejecutable ni atómico; cada `op_start` replantea.
+  Refresh manual/bootstrap/RefreshAll/terminal una vez por job, con guardas
+  generation/connection; error retiene filas con **STALE**. Skills sin
+  `skills/`, Ready ausente y state malformado dan error, no lista vacía falsa.
+  Mutaciones sin cambios; sin force/overwrite/rollback ni writes al checkout
+  por Sync/Skills. Avisos describen destinos y removals owned seguros;
+  Tools instala solo la entrada seleccionada. Gate visual **PENDIENTE**.
+  Validación nueva `/tmp/opencode/gui-plans-*.log`: fmt **PASS**, Rust lib
+  `--locked --offline` default y custom-protocol **95/95** cada uno,
+  Node unit **84/84**, Angular build **PASS** sin warnings. Sin GUI/HOME real.
+- **Evidencia reportada del writer CRUD, comprobada en sus logs**
+  `/tmp/opencode/crud-{cargo-default,cargo-custom,unit,angular-build}.log`:
+  `cargo test --lib` (manifest Tauri) **88/88**, también con
+  `--features custom-protocol` **88/88**. Frontend revalidado tras el fix
+  de confirmación CRUD ligada al snapshot DTO (`deepCopyDto`/`sameDto`):
+  `npm run test:unit` **75/75**; `npm run build` **PASS**, con
+  `TMPDIR=/tmp/opencode`, logs `crud-confirm-unit.log` y
+  `crud-confirm-angular-build.log` bajo `/tmp/opencode/`.
+  Son unit/build checks, sin DOM/IPC visual real.
+  Root `cargo test --all-targets` **576 ok, 1 ignored** es el último
+  resultado reportado del bloque anterior (cinco modelos GPT aprobados +
+  causalidad fixture); no rerun ni cambios root en este slice read-only.
+- **Gate read-only GUI↔TUI CERRADO**, por confirmación manual user-reported
+  en Linux/CachyOS, no Windows. No certifica nuevos controles ni equivalencia
+  de binarios instalados con este árbol; no se reabre por estas mutaciones.
+- **D4 preparación local implementada**, Arch/CachyOS-first, paquete paired
+  CLI + companion, sin publicación AUR/URL remota inventada. Ver
+  `packaging/arch/README.md`: MIT, PKGBUILD template, generator de snapshot
+  working-tree + SHA-256 real y tests de fixtures. Se ejecutó `node --check`
+  de ambos scripts nuevos y `TMPDIR=/tmp/opencode node --test
+  scripts/{install,package-arch}.test.mjs`: **39/39** (29 installer + 10
+  packaging). Sintaxis Bash del recipe generado en fixture y JSON manifests
+  comprobados. No snapshot final del WIP, makepkg completo, instalación ni
+  runtime. Primero revisión + aprobación del `--list` por el padre;
+  después generación. Build/test de paquete aislado ya autorizado por el
+  usuario para etapa separada bajo `/tmp/opencode`, sin host writes.
+- Host confirmado por `/etc/os-release`: **CachyOS**, no “Linux genérico”
+  para esta preparación. GNU tar/gzip/makepkg disponibles; Node seleccionado
+  **22.22.3**, rustc **1.96.0**. Angular requiere
+  **^22.22.3 || ^24.15.0 || >=26.0.0**. Snapshots reproducibles, no claim de
+  binarios reproducibles ni vendoring/offline. `yoke-derive` 0.8.3 yanked
+  permanece en lock: `--locked` respeta pins, yank no bloquea por sí solo;
+  caches/network pueden bloquear un build limpio. Rust <1.87 tiene problema
+  de compilación conocido. Sin upgrade de deps ni reescritura de locks.
+- **D5 abierto**, schema/rutas sin migración anunciada. MIT CLI + GUI:
+  `Copyright (c) 2026 taneralberto`. No restaurar `PLAN.md` ni
+  `TOOL_INSTALLER_PLAN.md`.
+
+El resto es historial de decisiones/slices: “estado actual”, “pendiente” y
+“fuente de verdad” en esos bloques se leen a su fecha y quedan subordinados
+a este estado superior, incluida la sección D3 de correcciones anterior.
+
 > **Nota:** `PLAN.md` y `TOOL_INSTALLER_PLAN.md` fueron retirados
 > del repositorio de forma deliberada (commit en `main`). No se
 > reponen ni se apuntan como referencia canónica. Si una tarea los
@@ -12,9 +139,14 @@ Handoff autónomo para otro agente en otra PC.
 Añadir GUI a `agenthd` sin reescribir la base ni duplicar lógica. D1
 cerrado por elección explícita del usuario: Tauri + Angular
 (familiaridad Angular + spike ya ejecutado); D2 está cerrado (seam
-CLI), D3–D5 se cierran en sus fases respectivas (ver gates). TUI y
-`--repo` siguen siendo el comportamiento observable hasta que llegue
-la GUI (fase 5).
+CLI); **D3 APROBADO** (cancelación cooperativa vía puntos seguros
+con cambios parciales sin rollback; implementación pendiente);
+**D4 APROBADO** con prioridad Arch / CachyOS-first PKGBUILD sin
+publicar AUR, pruebas visuales y de build/install solo AISLADAS en
+`/tmp/opencode` (implementación pendiente); **D5 conserva**
+schema/rutas sin migrar anunciado, no se cierra cross-platform.
+TUI y `--repo` siguen siendo el comportamiento observable hasta
+que llegue la GUI (fase 5).
 
 ## Estado actual (sesión Linux manual, breve y autoritativo)
 
@@ -52,10 +184,113 @@ la GUI (fase 5).
   TUI (el gate visual read-only previo sobre el mismo
   HOME sigue cerrado por reporte manual user-reported y
   **no** es invalidado). **D3 (progreso y cancelación)
-  sigue sin decidir** — no es precondición de este
-  slice síncrono pequeño; **D4 / D5 siguen abiertos**.
-  D3, D4, D5 siguen sin cerrar. Detalle en "Próxima tarea
-  estrecha → punto 5".
+  APROBADO por el usuario** — cancelación cooperativa
+  vía puntos seguros con cambios parciales sin rollback
+  — pero **NO** es precondición de este slice síncrono
+  pequeño; la implementación de D3 queda pendiente y se
+  desbloqueará cuando el slice vertical incorpore
+  operaciones largas. **D4 / D5 siguen abiertos**
+  (D4 aprobado en prioridad Arch / CachyOS-first
+  PKGBUILD sin AUR; implementación pendiente. D5
+  conserva schema/rutas sin migrar anunciado). Detalle
+  en "Próxima tarea estrecha → punto 5".
+- **Slice vertical de mutación pequeña síncrona —
+  editor GUI edit-only sobre agentes EXISTENTES —
+  implementado y aprobado.** Backend: seam nuevo
+  `agenthd::store::load_agent_for_edit` (single read +
+  parse + hash de los mismos bytes, fail-closed en
+  canonical/name/path/symlink/non-regular/UTF-8) +
+  comandos Tauri `load_agent_for_edit` /
+  `save_agent_edit`. El par reutiliza
+  `workflows::save_agent` (Fase 2) sin duplicar la
+  lógica rename-then-save; el helper GUI
+  `compose_save_agent_edit` añade las precondiciones
+  edit-only (contexto no vacío, checkout Ready sigue
+  coincidiendo, nombre inmutable, archivo canónico
+  sigue existiendo) antes de delegar al workflow, de
+  modo que los errores literales del lib llegan al
+  frontend verbatim. Frontend: editor inline-por-agente
+  (botón `Edit` por fila), `<input>` / `<select>` /
+  `<textarea>` nativos para `description` / `mode` /
+  `model` / `prompt` y tabla completa de permisos
+  (los permisos desconocidos se preservan verbatim);
+  `busy` lock antes de cada `await`; el draft vive en
+  signals separados que ningún refresh pisa; el save
+  cierra el draft **antes** del refresh post-write
+  para que un refresh fallido no enmascare el éxito
+  del save. `confirm` nativo solo cuando el usuario
+  intenta descartar un draft sucio. Rename / create /
+  delete siguen siendo TUI-only (D3 los desbloquea
+  cuando aplique). **Pendiente del slice:** gate
+  visual NUEVO — Edit → cambiar description y un
+  permiso → Guardar → ver el archivo canónico con esos
+  cambios en la TUI (paired GUI↔TUI sobre mismo HOME,
+  sin shadow copy, sin IPC instrumentado). **D3
+  APROBADO por el usuario** (cancelación cooperativa
+  vía puntos seguros con cambios parciales sin rollback),
+  pero **NO** es precondición de este slice síncrono
+  pequeño; **D4 / D5 siguen abiertos** (D4 aprobado
+  Arch / CachyOS-first PKGBUILD sin AUR, implementación
+  pendiente; D5 conserva schema/rutas sin migrar
+  anunciado).
+- **P1 runtime fix — corrección post-revisión.** El primer
+  pase del slice editor tenía un P1: los comandos
+  Tauri `load_agent_for_edit` / `save_agent_edit`
+  recibían un `Paths` (de `Paths::from_env()`) con
+  `canonical_dir` en el default histórico
+  `<agenthd_root>/agents`, y los composition helpers
+  leían el checkout Ready pero **no** re-puntaban
+  `canonical_dir` antes de delegar al lib — el
+  resultado era un read / write fantasma contra el
+  default. **Fix aplicado** (corrección de este
+  bloque): ambos helpers resuelven `Ready` desde
+  `settings.json`, derivan `paths.clone().with_settings(&Settings::new(ready))`
+  una sola vez, y usan ese `scoped` para TODO el
+  canon (lectura, hash, `save_agent`, existencia del
+  archivo). El `context.checkout_path` queda como
+  guard de cable (la save lo re-compara contra el
+  Ready actual para rechazar un cambio entre open y
+  save), nunca como director driver. **Tests
+  adicionales (5 nuevos):**
+  `p1_load_uses_configured_checkout_not_default`,
+  `p1_save_uses_configured_checkout_not_default`,
+  `p1_editor_does_not_recreate_default_canonical_dir`
+  (pin del contrato `<agenthd_root>/agents` no
+  recreada por el editor),
+  `p1_list_helper_uses_configured_checkout_pattern`
+  (mirror del patrón `compose_agents_list`),
+  `p1_save_rejects_settings_switch_with_raw_paths`
+  (settings switch entre load y save con `Paths`
+  raw, rechaza + no escribe en A ni B ni default).
+  Las fixtures usan `Paths::resolve(...)` raw (sin
+  `paths.with_settings(...)` previo) más un decoy
+  homónimo en el default canonical_dir; el helper
+  correctamente lee / escribe SOLO el checkout
+  configurado y deja el decoy byte-idéntico. **Este
+  fix NO** invalida las precondiciones del bloque
+  (no cambia schema/rutas, no toca capabilities, no
+  toca CSP, no instala nada). Detalle completo del
+  bug, del fix y de los tests en
+  `spikes/tauri-angular/src-tauri/src/lib.rs` y
+  este doc mantiene el "P1" como etiqueta histórica
+  del hallazgo — el bug está cerrado y verificado.
+- **Estado de decisiones aprobado por el usuario
+  (status authoritative de doc, no solo histórico):**
+  - **D3 APROBADO** — cancelación cooperativa vía
+    puntos seguros del workflow con cambios parciales
+    sin rollback automático; implementación pendiente,
+    no es precondición de los slices read-only ni de
+    la mutación pequeña síncrona ya ejecutados.
+  - **D4 APROBADO** con prioridad **Arch /
+    CachyOS-first PKGBUILD** sin publicar en AUR;
+    pruebas visuales y de build/install ejecutadas
+    **solo AISLADAS** en `/tmp/opencode`, sin HOME
+    real del host ni binarios reales; implementación
+    pendiente.
+  - **D5 conserva** el schema actual y las rutas
+    actuales **sin migrar anunciado**; **NO** se
+    afirma compatibilidad cross-platform hasta que
+    D4 valide la plataforma real.
 - **Estado previo a publicación.** El usuario ejecuta
   `commit` + `push` por su cuenta (autorizado por el
   padre); este doc no afirma SHA futuro ni push ya
@@ -77,6 +312,113 @@ la GUI (fase 5).
   Publicación: confirmar con `git log` + estado del
   remote tras `push`; no asumir worktree clean antes
   de ejecutar `commit`/`push`.
+
+- **Estado actual del bloque D3 (2026-10-04 — correcciones).**
+  Implementación de la decisión D3 aprobada por el
+  usuario: eventos cooperativos `agenthd-operation`
+  en lugar de polling. Backend: nuevo módulo
+  `spikes/tauri-angular/src-tauri/src/jobs.rs` con
+  el `OperationRegistry` (mutex de id / token /
+  latest / reservation), el `CurrentView` snapshot
+  (`seq: String` + `Option<JobSnapshot>`), el
+  `OperationRequest` enum (`serde(tag = "kind",
+  deny_unknown_fields)`), los workers
+  `std::thread` para los cuatro workflows largos
+  (`plan_then_apply_agents_safe_controlled` /
+  `plan_then_apply_skills_controlled` /
+  `install_tool_controlled` /
+  `discover_models_controlled`), la reserva
+  long/short exclusiva, la emisión del evento
+  `agenthd-operation` fuera del lock, y la retención
+  del terminal hasta un re-leer de
+  `op_current` / `op_status`. Sin auto-rollback.
+  Comandos Tauri añadidos: `op_start` / `op_current`
+  / `op_status` / `op_cancel`. Las versiones
+  mutantes cortas (`apply_checkout` / `save_agent_edit`)
+  se mantienen y se les añade una guarda de reserva
+  corta (`try_reserve_short`) integrada en el
+  comando; los aliases paralelos `op_apply_checkout` /
+  `op_save_agent_edit` del slice previo fueron
+  **eliminados** (single source of truth). Commands
+  backend-authoritativos `tool_catalog_status` /
+  `permission_keys` se añaden para reemplazar los
+  hardcodes del frontend. Capabilities sin cambios
+  (solo `core:default`; el `listen` / `unlisten`
+  del nuevo evento viene en `core:default`).
+  Frontend: `bootstrap()` invertido al LISTENER-first
+  (registra el listener **primero** y luego llama
+  `op_current`); un solo reducer `applyCurrentView`
+  con comparación `BigInt` + regex decimal estricta
+  de `seq`; generación incrementada en `OnDestroy`
+  más un `connectionGeneration` por subscribe;
+  `mutationsEnabled` arranca en `false` y solo se
+  activa cuando ambas subscripciones están sanas;
+  el `jobPending` se eliminó y la UI deriva
+  `activeJob()` / `activeJobId()` de
+  `currentView().job.phase` (nunca asigna ids
+  tardíos). P1 fix: el bloque del editor está
+  hoisted **fuera** del gate de membresía
+  `agentsError/agents().length`; el draft se
+  mantiene visible aunque la lista quede vacía
+  por un refresh que la limpie; `refreshAll` ya
+  no hace implicit discard del draft. Nueva UI:
+  botones Agent-Sync (OpenCode / Pi), Skills
+  (OpenCode only), Tools (picker sobre
+  `DEFAULT_CATALOG` servido por
+  `tool_catalog_status`), Discovery, panel derecho
+  de progress + report; permission-key dropdown
+  servido por `permission_keys`.
+  **Esta sección es la fuente de verdad actual del
+  estado D3**; las menciones previas en este doc
+  ("D3 implementación pendiente", "no es
+  precondición de los slices read-only") se
+  conservan como historical notes y son
+  **superadas** por esta sección.
+
+  Conteos observados del bloque:
+
+  - Backend Rust (`cd src-tauri && cargo test --lib`):
+    **61/61 OK** (33 tests previos del slice editor +
+    28 tests en `jobs::tests` que cubren el registry
+    del D3 corregido).
+  - Frontend (`npm run test:unit` = `node --test
+    editor-dto.test.mjs app-component.test.mjs`):
+    **36/36 OK** (21 DTO tests + 15 component
+    tests).
+  - `cargo fmt --check`: limpio.
+  - Root crate (`cargo test --all-targets`):
+    **573 ok, 1 ignored** (no ediciones en el root).
+  - `cargo clippy --lib --tests --offline`: 0
+    warnings nuevos del spike (los 3 warnings
+    pre-existentes del lib `agenthd` siguen).
+  - `npm run build`: bundle 153.18 kB raw / 42.93
+    kB transfer; CSS 1.54 kB / 498 B; ~1.0s.
+
+  **Lo que el bloque NO demuestra:**
+
+  - Gate visual D3 (Save → sync → ver el mismo
+    archivo en TUI paired sobre mismo HOME) sigue
+    PENDIENTE, mismo status que los slices previos:
+    user-reported contra la config real compartida,
+    sin shadow copy, sin instrumentación
+    automatizada, sin captura de payloads IPC, sin
+    screenshots, sin equivalencia binarios↔código
+    por timestamps.
+  - D4 (PKGBUILD Arch/CachyOS-first) sigue
+    pendiente; este bloque implementa la lógica
+    del registry, no el empaquetado.
+  - D5 (compatibilidad cross-platform) sigue
+    pendiente; schema y rutas sin migrar
+    anunciado, pruebas en CachyOS / otros Linux /
+    Windows pendientes. Solo se valida que el
+    código compila + tests pasan en este host
+    (Linux genérico con `target-dir` aislado en
+    `/tmp/opencode/cargo-target/`).
+  - **CRUD pequeño (rename / create / delete)** y
+    **PKG block** están explícitamente fuera de
+    scope de este bloque; el scope del bloque es
+    D3 GUI jobs + panels + correcciones del
+    contracto.
 
 ## Antes de empezar y estado observable hoy
 
@@ -197,14 +539,35 @@ confirmación explícita; skills sin force-overwrite.
   > al ejecutable y reenvía argv + exit code (abort con exit `2`
   > si falta, sin escrituras). El parser CLI y el contrato D2 no
   > cambiaron.
-- **D3 — Operaciones largas.** Canal de progreso y cancelación para
-  `install_tool`, `Discovery` y futuros sync/plan.
-- **D4 — Empaquetado.** Arch vía PKGBUILD/AUR; otros Linux vía
-  `cargo install`/`.deb`/`.rpm`/AppImage; Windows vía
-  `cargo install`/winget/Scoop/MSI, o ninguno.
-- **D5 — Compatibilidad `settings.json` y rutas.** Política y
-  migración probadas antes de cualquier cambio; `#[serde(default)]`
-  no es regla universal.
+- **D3 — Operaciones largas. APROBADO por el usuario.**
+  Cancelación **cooperativa** vía puntos seguros del workflow
+  con cambios parciales sin rollback automático: si el
+  usuario aborta en un punto seguro, el lib persiste lo que
+  ya estaba escrito y devuelve el control con el estado
+  observable; si aborta fuera de un punto seguro, el lib
+  termina la unidad de trabajo actual antes de chequear el
+  flag (sin rollback). Implementación pendiente; **D3 NO** es
+  precondición de los slices read-only ni de la mutación
+  pequeña síncrona (Settings, editor edit-only) ya
+  ejecutados.
+- **D4 — Empaquetado. APROBADO por el usuario con
+  prioridad Arch / CachyOS.** PKGBUILD first, sin publicar
+  en AUR (la receta vive solo en el repo). Otros Linux vía
+  `cargo install` / `.deb` / `.rpm` / AppImage;
+  Windows vía `cargo install` / winget / Scoop / MSI, o
+  ninguno. Implementación pendiente; las pruebas visuales
+  y de build/install de D4 se ejecutan **solo AISLADAS** en
+  `/tmp/opencode`, sin HOME real ni binarios reales del
+  host. El instalador `scripts/install.mjs` ya está
+  aprobado y construye un helper que respeta `--root`
+  preaprobado; **D4** NO se cierra con ese instalador —
+  D4 es el gate cross-platform.
+- **D5 — Compatibilidad `settings.json` y rutas.**
+  **Conservar** el schema y las rutas actuales sin migrar
+  anunciado. No se anuncia compatibilidad cross-platform
+  hasta que D4 valide la plataforma real. `#[serde(default)]`
+  no es regla universal; cada campo nuevo se evalúa caso
+  por caso. Implementación pendiente.
 
 ## Gates de fase
 
@@ -212,10 +575,10 @@ Fases 1–3 no dependen de D1–D5. Fase 4 cerrada por elección
 explícita del usuario (Tauri + Angular); ver "Decisiones
 pendientes → D1". Fase 5 requiere D2; las **operaciones
 largas** del slice vertical (no el read-only ni la
-mutación pequeña síncrona) requieren además D3. Fase
-6 requiere D4 y validación previa por plataforma. Cada
-fase deja la TUI funcionando; la GUI entra como
-segundo cliente.
+mutación pequeña síncrona) requieren además D3 (D3
+aprobado pero implementación pendiente). Fase 6 requiere
+D4 y validación previa por plataforma. Cada fase deja la
+TUI funcionando; la GUI entra como segundo cliente.
 
 ## Checkboxes — entregado vs. pendiente
 
@@ -588,13 +951,19 @@ usuario — ver "Decisiones pendientes → D1" y "Fase 4".
       host Linux x86_64 con binarios `agenthd` y
       `agenthd-gui` presentes en `~/.cargo/bin/`; HOME
       `/home/lukateric` y checkout
-      `/home/lukateric/dev/agent-handler`. D3 previo al
-      cierre de las **operaciones largas** del slice
-      vertical (no afecta a esta confirmación read-only);
-      D4 y D5 siguen pendientes como gates separados.
-      Empaquetado Arch / otros Linux / Windows sigue
-      siendo gate de Fase 6 (D4 pendiente), no cubierto
-      por esta confirmación.
+      `/home/lukateric/dev/agent-handler`. D3 APROBADO
+      por el usuario (cancelación cooperativa vía puntos
+      seguros con cambios parciales sin rollback;
+      implementación pendiente para las **operaciones
+      largas** del slice vertical, no afecta a esta
+      confirmación read-only); D4 APROBADO en prioridad
+      Arch / CachyOS-first PKGBUILD sin AUR (pruebas
+      visuales y de build/install solo AISLADAS en
+      `/tmp/opencode`); D5 conserva schema/rutas sin
+      migrar anunciado (no se cierra cross-platform con
+      esta confirmación). Empaquetado cross-platform sigue
+      siendo gate de Fase 6 (D4 implementación
+      pendiente).
 - [x] **Slice vertical — primer slice de mutación pequeña
       síncrona (GUI Settings: campo ruta absoluta + Guardar,
       validación/persistencia, refresco Settings + Agents).**
@@ -651,28 +1020,111 @@ usuario — ver "Decisiones pendientes → D1" y "Fase 4".
       TUI. Gate read-only previo (Fase 5 [x] "Comparación
       paired GUI↔TUI sobre mismo HOME") sigue cerrado por
       reporte manual user-reported y no es invalidado por
-      este slice. **D3 sigue sin decidir** (no precondición
-      de este slice); **D4 / D5 siguen abiertos**. Sin
-      `commit` / `push`, sin mutación de `HOME`, sin instalar
-      dependencias del host. Logs en `/tmp/opencode/`.
-- [ ] Slice vertical (operaciones largas requieren D3;
-      mutación pequeña síncrona no): `sync` masivo,
-      `install_tool`, `agent editor`, `skills`. D3 SOLO
-      es precondición de las **operaciones largas**
-      (`install_tool`, `Discovery`, `sync` / `plan`
-      masivos); un editor síncrono pequeño vía wrapper
-      Angular **no** requiere D3 — el camino concreto
-      ya está ejecutado y aprobado por el usuario en el
-      slice "Settings (ruta + Guardar)" (Fase 5 [x]
-      "Slice vertical"). Próximo paso (si procede): un
-      nuevo slice de mutación — el que sea, **no** se
-      decide en este handoff.
+      este slice. **D3 APROBADO** (cancelación
+      cooperativa, no precondición de este slice);
+      **D4 / D5 siguen abiertos** (D4 aprobado Arch /
+      CachyOS-first PKGBUILD sin AUR, implementación
+      pendiente; D5 conserva schema/rutas sin migrar
+      anunciado). Sin `commit` / `push`, sin mutación de
+      `HOME`, sin instalar dependencias del host. Logs en
+      `/tmp/opencode/`.
+- [x] **Slice vertical — editor GUI síncrono edit-only
+      (mutación pequeña síncrona).** Backend: seam nuevo
+      `agenthd::store::load_agent_for_edit(paths, name)
+      -> Result<(Agent, String)>` que valida
+      canonical/name/path en fail-closed y hace una sola
+      lectura del archivo: parsea `Agent` y hashea los
+      mismos bytes con SHA-256. Rechaza symlink, archivo
+      no regular, path inválido, fuente canónica
+      faltante (el mismo gate que `load_canonical` /
+      `plan_for` ya pin). Dos comandos Tauri adicionales:
+      `load_agent_for_edit` y `save_agent_edit`. El par
+      reutiliza `workflows::save_agent` (Fase 2) sin
+      duplicar la lógica rename-then-save; el helper de
+      composición `compose_save_agent_edit` añade las
+      precondiciones GUI-only (contexto no vacío,
+      checkout persistido `Ready` sigue coincidiendo
+      con el de apertura, nombre inmutable, archivo
+      canónico sigue existiendo) **antes** de delegar al
+      workflow, de modo que los errores literales del
+      lib (`changed on disk since this edit started`,
+      `refusing to overwrite existing`, `rename: ...`,
+      `save: ...`) alcanzan al frontend verbatim.
+      Frontend: editor inline-por-agente (botón `Edit`
+      por fila), controles nativos `<input>` /
+      `<select>` / `<textarea>` para `description`,
+      `mode`, `model`, `prompt` y tabla completa de
+      permisos (los permisos desconocidos se preservan
+      verbatim; el lib los rechaza al guardar con el
+      error estándar `unknown permission key`). El draft
+      vive en signals separados (`editDraft`,
+      `editOriginal`, `editContext`); ningún refresh
+      pisa el draft. `busy` lock antes de cada `await`
+      en TODAS las acciones públicas; el save cierra el
+      draft **antes** del refresh post-write para que un
+      refresh fallido no pueda enmascarar el éxito del
+      save. `confirm` nativo solo cuando el usuario
+      intenta descartar un draft sucio. Rename / create
+      / delete **NO** entran en este slice (D3 los
+      desbloquea cuando aplique). **Validación:**
+      `cargo fmt --check` limpio; `cargo test --locked
+      --offline --all-targets` root 495 ok + 1 ignored
+      (7 nuevos tests focales del seam en
+      `src/store/tests.rs`); `cargo test --locked --lib`
+      Tauri 28 ok (12 nuevos); `cargo test --locked
+      --lib --features custom-protocol` Tauri 28 ok;
+      `cargo clippy --locked --lib --no-deps` Tauri sin
+      warnings nuevos vs baseline (3 preexistentes en
+      `src/tools/mod.rs` del crate raíz, no tocados);
+      `npm run build` limpio; `node
+      --experimental-strip-types --test
+      spikes/tauri-angular/editor-dto.test.mjs` 18/18
+      ok sobre las funciones puras `deepCopyDto` y
+      `sameDto` extraídas a
+      `spikes/tauri-angular/src/app/editor-dto.ts` (sin
+      Angular runtime, sin Tauri mock, sin DOM).
+      **Documentación honesta:** este slice cierra la
+      implementación y los tests focales del backend +
+      los helpers frontend, y deja el gate visual
+      pendiente (paired GUI↔TUI: Edit → cambiar
+      description y un permiso → Guardar → ver el
+      archivo canónico con esos cambios en la TUI sin
+      shadow copy, sin IPC instrumentado). **D3
+      APROBADO** (cancelación cooperativa, no
+      precondición de este slice); **D4 / D5 siguen
+      abiertos** (D4 aprobado Arch / CachyOS-first
+      PKGBUILD sin AUR, implementación pendiente;
+      D5 conserva schema/rutas sin migrar anunciado).
+      Sin `commit` / `push`, sin mutación de `HOME`,
+      sin instalar dependencias del host. Logs en
+      `/tmp/opencode/`.
+- [x] Slice vertical — **IMPLEMENTACIÓN COMPLETADA**:
+      D3 para operaciones largas de Sync / Skills / Tools /
+      Discovery, editor CRUD y Plans read-only entregados.
+      Última evidencia automatizada: Rust Tauri default y
+      custom-protocol **95 PASS cada uno**, Node **84 PASS**,
+      root **576 PASS, 1 ignored**. La exigencia histórica
+      «D3 pendiente» ya no es la próxima tarea de implementación;
+      lo pendiente actual es aceptación manual y entorno externo.
+- [ ] Validación visual manual del árbol actual: Settings Save /
+      refresh, editor, create / rename / delete, Plans y Cancel /
+      Close. **Sin confirmación humana**; «Continúa» no constituye
+      aceptación. El proceso del paquete anterior se lanzó y terminó
+      con log de 0 bytes, sin inspección DOM / IPC; no certifica estos
+      controles ni el nuevo paquete remapped, que no se ha lanzado.
 
 ### Fase 6 — Verificar empaquetado
 
-- [ ] Validación Arch / otros Linux / Windows en tiempo de
-      ejecución (ejecución real, no solo `cargo build --target`).
-- [ ] Artefactos y checklist firmado por plataforma; requiere D4.
+- [x] Arch / CachyOS — **ARTEFACTO PAIRED Y VALIDACIÓN AUTOMATIZADA
+      COMPLETADOS**: fuente + SHA, recipe, build offline con remap
+      sin warning `$srcdir`, permisos / `ldd` e installer aislado.
+      Alcance: `makepkg --nodeps`, no clean chroot; no aceptación
+      completa de runtime ni pase manual del nuevo paquete.
+- [x] Matriz **AUTOMATIZADA** de empaquetado publicada en
+      `packaging/arch/VALIDATION.md`; no checklist humano firmado.
+- [ ] Aceptación visual GUI y checklist humano del paquete actual.
+- [ ] Dependency checks completos / clean chroot y validación nativa
+      actual en otros Linux / Windows (no solo `cargo build --target`).
 
 ## Próxima tarea estrecha
 

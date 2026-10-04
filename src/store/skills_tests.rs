@@ -5,8 +5,10 @@
 //! `app::skills_list` and is exercised through the app-level tests
 //! instead.
 
+use crate::operation::{CancelToken, Finish, Progress};
 use crate::store::{
-    apply_skills, plan_skills, OwnedSkill, Paths, SkillAction, SkillOutcome, SkillPlanItem, State,
+    apply_skills, apply_skills_controlled, plan_skills, OwnedSkill, Paths, SkillAction,
+    SkillOutcome, SkillPlanItem, State,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -1886,5 +1888,259 @@ fn install_fails_closed_when_scratch_root_cannot_be_derived() {
         err.contains("grandparent") || err.contains("no parent"),
         "expected fail-closed error mentioning missing grandparent, got: {}",
         err
+    );
+}
+
+// ---------- D3 cooperative-cancellation tests ----------
+//
+// These tests pin the contract for
+// `apply_skills_controlled` and the per-row cancel seam:
+// - pre-cancel writes nothing for the row
+// - cancel after a successful row persists that row's state
+// - a full run matches the legacy apply exactly (observable as the
+//   same outcomes + the same final state)
+// - manifest failure on a controlled run returns Failed with the
+//   partial state and an explicit "manifest not saved" message
+// - cancellation never sweeps manifest entries for unprocessed
+//   rows (so the sync cleanup the legacy apply does is intentionally
+//   absent on a cancelled path).
+
+/// Capture-only sink. Lets tests assert on the progress stream a
+/// controlled run produced without coupling to any UI type. The
+/// `Rc<RefCell<_>>` indirection lets the closure outlive the
+/// `RefCell` value while still mutating the captured vector.
+fn record_progress() -> (
+    std::rc::Rc<std::cell::RefCell<Vec<Progress>>>,
+    impl FnMut(Progress),
+) {
+    let captured: std::rc::Rc<std::cell::RefCell<Vec<Progress>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink_captured = captured.clone();
+    let sink = move |p: Progress| sink_captured.borrow_mut().push(p);
+    (captured, sink)
+}
+
+/// Pre-cancel: a token requested before any row runs writes
+/// nothing and returns the freshly-loaded state. The legacy
+/// `apply_skills` of the same plan writes two rows; the
+/// controlled run must not.
+#[test]
+fn apply_controlled_pre_cancel_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_skills(&dir);
+    let skills_src = checkout.join("skills");
+    for name in ["clarify-before-coding", "kiss-for-you"] {
+        write_skill(&skills_src, name, "body");
+    }
+    let state = State::default();
+    let plan = plan_skills(&paths, &state).unwrap();
+    assert_eq!(plan.len(), 2);
+    let token = CancelToken::default();
+    token.request();
+    let (_captured, mut sink) = record_progress();
+    let report = apply_skills_controlled(&paths, state, plan, &token, &mut sink);
+    assert_eq!(report.finish, Finish::Cancelled);
+    let (state_after, outcomes) = report.partial;
+    assert!(outcomes.is_empty(), "pre-cancel must produce no outcomes");
+    assert!(
+        state_after.installed_skills.is_empty(),
+        "pre-cancel must not mutate the manifest"
+    );
+    for name in ["clarify-before-coding", "kiss-for-you"] {
+        assert!(
+            !paths.skills_dir.join(name).exists(),
+            "destination must not be written for {name}"
+        );
+    }
+}
+
+/// Cancel after the first row commits: that row's state is
+/// persisted on disk, the second row never starts, the report
+/// carries the partial state with only the first row's
+/// ownership entry, and the manifest is NOT swept for the
+/// pending row (no sync-style cleanup).
+#[test]
+fn apply_controlled_mid_run_cancel_preserves_first_row_state() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_skills(&dir);
+    let skills_src = checkout.join("skills");
+    for name in ["clarify-before-coding", "kiss-for-you"] {
+        write_skill(&skills_src, name, "body");
+    }
+    let state = State::default();
+    let plan = plan_skills(&paths, &state).unwrap();
+    assert_eq!(plan.len(), 2);
+
+    // Reverse the plan so the cancel flips the order — the
+    // first item we hand the controlled run will be
+    // `kiss-for-you`; we then cancel so `clarify-before-coding`
+    // never runs.
+    let mut plan = plan;
+    plan.reverse();
+    let token = CancelToken::default();
+    let (_captured, _sink) = record_progress();
+    // Hook a closure-shaped cancel: request the token after
+    // the first row's pre-checkpoint emission so the cancel
+    // is observed before the second row's checkpoint.
+    let counter = std::cell::Cell::new(0usize);
+    let mut hooked_sink = |_p: Progress| {
+        counter.set(counter.get() + 1);
+        if counter.get() == 1 {
+            token.request();
+        }
+    };
+    let report = apply_skills_controlled(&paths, state, plan, &token, &mut hooked_sink);
+    assert_eq!(report.finish, Finish::Cancelled);
+    let (state_after, outcomes) = report.partial;
+    assert_eq!(outcomes.len(), 1, "exactly one row should have completed");
+    ok_or(&outcomes[0]);
+    assert!(
+        outcomes[0].action == "installed" || outcomes[0].action == "adopted",
+        "first row must be installed/adopted, got: {}",
+        outcomes[0].action
+    );
+    let first_name = &outcomes[0].name;
+    // State must record only the completed row.
+    assert_eq!(state_after.installed_skills.len(), 1);
+    assert!(state_after.installed_skills.contains_key(first_name));
+    let other = if first_name == "kiss-for-you" {
+        "clarify-before-coding"
+    } else {
+        "kiss-for-you"
+    };
+    assert!(
+        !state_after.installed_skills.contains_key(other),
+        "pending row must NOT appear in the manifest after a mid-run cancel"
+    );
+    // Destination: only the completed row has been published.
+    assert!(paths.skills_dir.join(first_name).is_dir());
+    assert!(!paths.skills_dir.join(other).exists());
+    // State.json must exist on disk (per-row write).
+    assert!(paths.state_file.exists());
+}
+
+/// Full run matches the legacy apply outcomes + final state
+/// exactly. The controlled wrapper is the same observable
+/// behavior when no cancel is requested. Each run gets its
+/// own fresh tempdir so the second run's destination state
+/// starts empty (matching the plan snapshot).
+#[test]
+fn apply_controlled_full_run_matches_legacy_apply() {
+    fn run_once() -> (State, Vec<SkillOutcome>) {
+        let dir = TempDir::new().unwrap();
+        let (paths, checkout) = setup_paths_with_skills(&dir);
+        let skills_src = checkout.join("skills");
+        for name in ["clarify-before-coding", "kiss-for-you", "consistency-code"] {
+            write_skill(&skills_src, name, "body");
+        }
+        let state = State::default();
+        let plan = plan_skills(&paths, &state).unwrap();
+        assert_eq!(plan.len(), 3);
+        let token = CancelToken::default();
+        let (_captured, mut sink) = record_progress();
+        let report = apply_skills_controlled(&paths, state, plan, &token, &mut sink);
+        assert_eq!(report.finish, Finish::Completed);
+        report.partial
+    }
+    fn run_legacy() -> (State, Vec<SkillOutcome>) {
+        let dir = TempDir::new().unwrap();
+        let (paths, checkout) = setup_paths_with_skills(&dir);
+        let skills_src = checkout.join("skills");
+        for name in ["clarify-before-coding", "kiss-for-you", "consistency-code"] {
+            write_skill(&skills_src, name, "body");
+        }
+        let state = State::default();
+        let plan = plan_skills(&paths, &state).unwrap();
+        assert_eq!(plan.len(), 3);
+        apply_skills(&paths, state, plan).unwrap()
+    }
+    let (legacy_state, leg_outcomes) = run_legacy();
+    let (ctrl_state, ctrl_outcomes) = run_once();
+    assert_eq!(ctrl_state, legacy_state, "final state must match legacy");
+    assert_eq!(
+        ctrl_outcomes.len(),
+        leg_outcomes.len(),
+        "outcome count must match legacy"
+    );
+    for (a, b) in ctrl_outcomes.iter().zip(leg_outcomes.iter()) {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.action, b.action);
+        assert_eq!(a.ok, b.ok);
+    }
+}
+
+/// Cancellation never touches a row that has no plan entry —
+/// the pre-existing manifest row "alpha" remains because the
+/// plan skipped it (it is not in source). The controlled run
+/// sees an empty plan mid-flight (cancel before row) and
+/// reports Cancelled without removing `alpha` from the
+/// manifest.
+#[test]
+fn apply_controlled_does_not_sweep_unprocessed_manifest_rows() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_skills(&dir);
+    let skills_src = checkout.join("skills");
+    write_skill(&skills_src, "clarify-before-coding", "body");
+    // Pre-populate the manifest with a row the plan will not
+    // visit (no source, no destination). The cleanup pass
+    // `apply_skills` does would drop this; the controlled
+    // cancel path must not.
+    let mut state = State::default();
+    state.installed_skills.insert(
+        "alpha".to_string(),
+        OwnedSkill {
+            tree_hash: "deadbeef".repeat(8),
+            skill_name: "alpha".to_string(),
+        },
+    );
+    let plan = plan_skills(&paths, &state).unwrap();
+    let token = CancelToken::default();
+    token.request();
+    let (_captured, mut sink) = record_progress();
+    let report = apply_skills_controlled(&paths, state, plan, &token, &mut sink);
+    assert_eq!(report.finish, Finish::Cancelled);
+    let (state_after, _) = report.partial;
+    assert!(
+        state_after.installed_skills.contains_key("alpha"),
+        "manifest entry not in plan must be untouched on cancel"
+    );
+}
+
+/// Manifest persistence failure for the skills controlled apply:
+/// when `state.json` cannot be written, the function surfaces
+/// `Finish::Failed` with the partial state + outcomes and an
+/// explicit "manifest may have changed" message. No rollback
+/// of already-committed rows.
+#[test]
+fn apply_controlled_manifest_persistence_failure_reports_failed() {
+    let dir = TempDir::new().unwrap();
+    let (paths, checkout) = setup_paths_with_skills(&dir);
+    let skills_src = checkout.join("skills");
+    for name in ["clarify-before-coding", "kiss-for-you"] {
+        write_skill(&skills_src, name, "body");
+    }
+    // Make `state.json` an existing directory so the first
+    // `write_state` call fails.
+    let state_file = paths.state_file.clone();
+    if state_file.exists() {
+        std::fs::remove_file(&state_file).unwrap();
+    }
+    std::fs::create_dir_all(&state_file).unwrap();
+    let state = State::default();
+    let plan = plan_skills(&paths, &state).unwrap();
+    assert!(!plan.is_empty());
+    let token = CancelToken::default();
+    let (_captured, mut sink) = record_progress();
+    let report = apply_skills_controlled(&paths, state, plan, &token, &mut sink);
+    assert_eq!(report.finish, Finish::Failed);
+    let (_, outcomes) = report.partial;
+    assert!(
+        !outcomes.is_empty(),
+        "partial must retain outcomes from rows that ran before the failure"
+    );
+    let msg = report.error.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("manifest write failed") || msg.contains("manifest may have changed"),
+        "expected explicit persistence-failure message, got: {msg}"
     );
 }

@@ -1,42 +1,538 @@
-/* Component-local styles. The spike keeps the CSS minimal
-   and additive: only the bits the Settings path editor
-   needs that the global stylesheet does not already
-   provide. `.error`, `.empty`, button and section rules
-   all live in `src/styles.css` and are reused as-is. */
+/* Component-local styles. The dark slate / blue-accent
+   primitives live in `src/styles.css`; this file only adds
+   the per-card layouts the AppComponent needs and which
+   global primitives do not cover. */
+
+/* ---- Path editor (Settings checkout) ---- */
 
 .path-editor {
   display: grid;
   grid-template-columns: max-content 1fr max-content;
   gap: 0.5rem 0.75rem;
   align-items: center;
-  margin-top: 0.75rem;
+  margin-top: 0.5rem;
+}
+
+@media (max-width: 760px) {
+  .path-editor {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
 }
 
 .path-editor label {
-  font-size: 0.875rem;
-  color: color-mix(in srgb, CanvasText 75%, transparent);
+  font-size: 0.78rem;
+  color: var(--slate-text-muted);
 }
 
-.path-editor input {
-  font: inherit;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.875rem;
-  padding: 0.25rem 0.5rem;
-  border: 1px solid color-mix(in srgb, CanvasText 30%, transparent);
-  border-radius: 0.375rem;
-  background: Field;
-  color: FieldText;
-}
-
-.path-editor input:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.path-editor .error {
+.path-editor .save-error {
   grid-column: 1 / -1;
   margin: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.85rem;
+  font-size: 0.82rem;
   white-space: pre-wrap;
+  color: var(--danger);
+}
+
+/* ---- Agent list rows ---- */
+
+.agent-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  padding: 0.75rem;
+  border: 1px solid var(--slate-border);
+  border-radius: 0.375rem;
+  background: var(--slate-bg);
+}
+
+.agent-row.editing {
+  border-color: var(--accent);
+  background: var(--accent-softer);
+}
+
+.agent-row .agent-description {
+  font-size: 0.85rem;
+  color: var(--slate-text);
+  line-height: 1.45;
+}
+
+/* ---- Inline editor (rendered when the user clicks "Edit") ---- */
+
+.agent-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 0.625rem;
+}
+
+.agent-editor header {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.agent-editor header h4 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--slate-text);
+}
+
+.agent-editor header .meta {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  color: var(--slate-text-muted);
+}
+
+.agent-editor header .dirty {
+  font-size: 0.78rem;
+  color: var(--warning);
+  margin-left: auto;
+}
+
+.agent-editor .row {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.5rem 0.875rem;
+  align-items: start;
+}
+
+@media (max-width: 760px) {
+  .agent-editor .row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.agent-editor .row label {
+  font-size: 0.78rem;
+  color: var(--slate-text-muted);
+  padding-top: 0.375rem;
+}
+
+.agent-editor footer {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.agent-editor .error {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  color: var(--danger);
+}
+
+.agent-editor .warning {
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  color: var(--warning);
+}
+
+/* ---- Plans read-only inventory ---- */
+
+ul.plan-rows li {
+  margin-block: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--slate-border);
+  border-radius: 0.375rem;
+  background: var(--slate-bg);
+  overflow-wrap: anywhere;
+}
+
+.plan-rows h4 {
+  margin: 0 0 0.25rem 0;
+  font-size: 0.85rem;
+  color: var(--slate-text);
+}
+
+.plan-rows .plan-row-reason {
+  margin: 0.125rem 0 0.375rem 0;
+  color: var(--slate-text-muted);
+  font-size: 0.82rem;
+}
+
+/* ---- Tool picker table ---- */
+
+.tool-picker-row {
+  display: grid;
+  grid-template-columns: max-content 1fr max-content;
+  gap: 0.5rem 0.75rem;
+  align-items: center;
+}
+
+@media (max-width: 760px) {
+  .tool-picker-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ---- Job panel (long-job progress + report) ---- */
+
+.job-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0.625rem;
+}
+
+.job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem 0.75rem;
+  font-size: 0.82rem;
+}
+
+.job-meta .label {
+  color: var(--slate-text-muted);
+  margin-right: 0.25rem;
+}
+
+.job-meta .value {
+  color: var(--slate-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.progress {
+  height: 0.375rem;
+  background: var(--slate-bg-elev-2);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: var(--accent);
+  transition: width 120ms ease;
+}
+
+.progress-label {
+  font-size: 0.75rem;
+  color: var(--slate-text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  margin-top: 0.125rem;
+}
+
+/* ---- Discovery (model list) ---- */
+
+.discovery-note {
+  font-size: 0.8rem;
+  color: var(--slate-text-muted);
+  margin: 0.5rem 0 0.75rem 0;
+  line-height: 1.45;
+}
+
+/* ---- Workspace footer note ---- */
+
+.workspace-footer {
+  padding: 0.75rem 1.25rem;
+  font-size: 0.7rem;
+  color: var(--slate-text-dim);
+  text-align: center;
+}
+
+/* ------------------------------------------------------------
+   Agent card head — name + badge + actions flex layout
+   The full agent name (`a.name`) and the mode badge live
+   as siblings inside `.agent-head-text` so the layout
+   never visually glues them together. The badge has its
+   own padding/border so the rendered text reads as
+   `advisor mode` rather than `advisormode`, even on a
+   host that ignores `gap`.
+   ------------------------------------------------------------ */
+
+.agent-row .agent-head {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  flex-wrap: wrap;
+}
+
+.agent-row .agent-head-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+@media (min-width: 760px) {
+  .agent-row .agent-head-text {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.5rem;
+  }
+}
+
+.agent-row .agent-name {
+  display: block;
+  font-weight: 600;
+  color: var(--slate-text);
+  overflow-wrap: anywhere;
+}
+
+.agent-row .agent-badge {
+  display: inline-block;
+  /* Explicit margin-inline-start keeps it visually
+     separated from the name even if a host ignores
+     `gap`. */
+  margin-inline-start: 0;
+  padding: 0.05rem 0.45rem;
+  border-radius: 999px;
+  background: var(--slate-bg-elev-2);
+  border: 1px solid var(--slate-border);
+  color: var(--slate-text-muted);
+  font-size: 0.7rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.agent-row .agent-meta {
+  font-size: 0.78rem;
+  color: var(--slate-text-muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-row .agent-actions {
+  display: flex;
+  gap: 0.375rem;
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+
+/* ------------------------------------------------------------
+   Native <dialog> editor modal
+   ------------------------------------------------------------
+   The dialog is a top-layer element; `showModal()`
+   puts it on the inert backdrop. The body scrolls
+   inside the dialog; the footer is `position:
+   sticky` so it stays visible at the bottom while
+   the body scrolls behind it. The X close button is
+   a 42×42 square with a hover red tint; the literal
+   `×` glyph is block-sized so it never reads as faint
+   text. The backdrop uses BOTH `backdrop-filter:`
+   blur (modern hosts) AND an explicit
+   `background-color` (older WebView hosts without
+   `backdrop-filter`).
+   ------------------------------------------------------------ */
+
+.editor-dialog {
+  border: 1px solid var(--slate-border-strong);
+  border-radius: 0.5rem;
+  background: var(--slate-bg-elev);
+  color: var(--slate-text);
+  padding: 0;
+  /* A definite height lets the card fit INSIDE the dialog's border. */
+  width: min(680px, calc(100vw - 2rem));
+  height: 430px;
+  max-height: min(430px, calc(100vh - 3rem));
+  max-height: min(430px, calc(100dvh - 3rem));
+  overflow: hidden;
+  margin: auto;
+}
+
+.editor-dialog::backdrop {
+  background-color: rgba(15, 20, 25, 0.78);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.editor-card {
+  margin-bottom: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  /* The card is the dialog body; it must
+     scroll independently of the page and stay
+     anchored to the dialog. The flex column
+     gives the header / body / footer
+     independent overflow behaviour. */
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+}
+
+.editor-card .card-header {
+  flex: 0 0 auto;
+}
+
+.editor-card .card-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.editor-card .editor-footer {
+  flex: 0 0 auto;
+  justify-content: space-between;
+  /* Sticky footer: always visible at the bottom of
+     the dialog while the body scrolls. Opaque fill
+     + border-top + shadow keep it readable. */
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  background: var(--slate-bg-elev-2);
+  border-top: 1px solid var(--slate-border-strong);
+  box-shadow: 0 -6px 12px -6px rgba(0, 0, 0, 0.45);
+}
+
+.editor-footer-right {
+  display: flex;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.editor-dirty {
+  color: var(--warning);
+}
+
+.editor-close {
+  /* Prominent X close: 42×42 square with strong
+     contrast + hover red tint + accessible name
+     "Close editor". Block-sized glyph so it never
+     reads faint. */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  min-width: 42px;
+  min-height: 42px;
+  font-size: 1.6rem;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0;
+  color: var(--slate-text);
+  background: var(--slate-bg-elev-2);
+  border: 1px solid var(--slate-border-strong);
+  border-radius: 0.375rem;
+  cursor: pointer;
+}
+
+.editor-close:hover:not(:disabled) {
+  background: var(--danger-soft);
+  border-color: rgba(244, 112, 103, 0.6);
+  color: var(--danger);
+}
+
+.editor-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.editor-close:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* ---- Searchable model select ----
+   Native `<input type="search">` + `<select size="6">`
+   pair. The search input filters the option list;
+   `modelOptionKey()` maps the select value to a
+   real model id or the Inherit / Custom sentinel.
+   The Custom <input> is revealed on "Custom..."
+   pick and writes through `onEditModel` on every
+   keystroke. */
+
+.model-row .model-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.model-row .model-row-top {
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  min-width: 0;
+}
+
+.model-row .model-search {
+  width: 100%;
+}
+
+.model-row .model-select {
+  width: 100%;
+  min-height: 9rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.model-row .model-custom {
+  width: 100%;
+}
+
+.model-row .model-empty {
+  margin: 0;
+  color: var(--slate-text-muted);
+  font-size: 0.78rem;
+}
+
+.model-row .model-note {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--slate-text-dim);
+}
+
+.model-row .model-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* ---- In-modal ACTIVE activity (compact) ----
+   The native <dialog> backdrop is `inert` so the
+   persistent bottom panel is not interactive while
+   the editor is open. The dialog carries its own
+   compact ACTIVE section that wires the same
+   public methods (`cancelActiveJob`,
+   `refreshJobStatus`, `retryConnection`). The
+   in-method gates (busy / startPending / activeJob)
+   are unchanged. */
+
+.editor-activity {
+  margin-top: 0.75rem;
+  padding: 0.625rem 0.75rem;
+  border: 1px solid var(--slate-border);
+  border-radius: 0.375rem;
+  background: var(--slate-bg);
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.editor-activity h4 {
+  margin: 0;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--slate-text-muted);
+  font-weight: 600;
+}
+
+.editor-activity-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+}
+
+.editor-activity-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+}
+
+.editor-activity-actions button {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.75rem;
 }

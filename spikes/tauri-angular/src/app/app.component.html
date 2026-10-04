@@ -1,109 +1,1202 @@
-<main>
-  <h1>agenthd GUI</h1>
-  <p>
-    Settings + Agents view backed by the agenthd library.
-    Two read-only commands (<code>settings_status</code>,
-    <code>list_agents</code>) and one mutating command
-    (<code>apply_checkout</code>) — all routed through the
-    lib's pure composition helpers. Refresh is manual; the
-    Save button persists the typed checkout path through the
-    same workflow the TUI Settings screen uses.
-  </p>
-
-  <section>
-    <header>
-      <h2>Settings</h2>
-      <button
-        type="button"
-        (click)="refreshSettings()"
-        [disabled]="busy()"
-      >
-        Refresh settings
-      </button>
-    </header>
-
-    @if (settingsError(); as err) {
-      <p class="error">{{ err }}</p>
-    } @else if (settings(); as s) {
-      <p><strong>{{ settingsLabel() }}</strong></p>
-      <dl class="kv">
-        @for (row of settingsDetails(); track row[0]) {
-          <dt>{{ row[0] }}</dt>
-          <dd>{{ row[1] }}</dd>
-        }
-      </dl>
-    } @else {
-      <p class="empty">No settings loaded yet.</p>
-    }
-
-    <div class="path-editor">
-      <label for="checkout-path">Checkout path (absolute)</label>
-      <input
-        id="checkout-path"
-        type="text"
-        [value]="checkoutPath()"
-        (input)="onCheckoutPathInput($any($event.target).value)"
-        [disabled]="saving()"
-        autocomplete="off"
-        spellcheck="false"
-        aria-label="Configured checkout path (absolute)"
-      />
-      <button
-        type="button"
-        (click)="saveCheckout()"
-        [disabled]="busy()"
-      >
-        @if (saving()) { Saving… } @else { Guardar }
-      </button>
-      @if (saveError(); as err) {
-        <p class="error" role="alert">{{ err }}</p>
-      }
+<div class="app-shell" [class.editor-modal-open]="editorModalOpen()">
+  <!-- ======================================================
+       Sidebar navigation. The sidebar is the single source
+       of truth for which view is active. `setView` is the
+       only mutator; navigation does not trigger IPC, does
+       not prompt for a dirty draft, does not auto-discard
+       the open editor.
+       ====================================================== -->
+  <aside class="sidebar" aria-label="Main navigation">
+    <div class="sidebar-brand">
+      <h1>agenthd GUI</h1>
+      <p>Companion for the agenthd library</p>
     </div>
-  </section>
+    <ul class="sidebar-nav" role="list">
+      @for (view of views; track view.id) {
+        <li>
+          <button
+            type="button"
+            (click)="setView(view.id)"
+            [attr.aria-current]="activeView() === view.id ? 'page' : null"
+          >
+            <svg
+              class="nav-icon"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.75"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              aria-hidden="true"
+            >
+              <path [attr.d]="view.iconPath" />
+            </svg>
+            <span class="nav-label">{{ view.label }}</span>
+            @if (viewBadgeCount(view.id) !== null) {
+              <span class="nav-count">{{ viewBadgeCount(view.id) }}</span>
+            }
+            @if (viewBadgeWarning(view.id)) {
+              <span class="nav-count" aria-label="warning" style="background: var(--danger-soft); color: var(--danger);">!</span>
+            }
+          </button>
+        </li>
+      }
+    </ul>
+    <div class="sidebar-footer">
+      Companion · reads-only without a listener.
+    </div>
+  </aside>
 
-  <section>
-    <header>
-      <h2>Agents</h2>
-      <button
-        type="button"
-        (click)="refreshAgents()"
-        [disabled]="busy()"
-      >
-        Refresh agents
-      </button>
+  <!-- ======================================================
+       Main workspace: header (titles + status) + global
+       operation/connection status (visible every view) +
+       per-view containers. Hidden views stay mounted so a
+       draft, open editor or in-flight job panel survives
+       navigation.
+       ====================================================== -->
+  <section class="workspace">
+    <header class="workspace-header">
+      <div class="workspace-titles">
+        <p class="workspace-crumbs">
+          <span class="crumb">agenthd</span>
+          <span class="crumb-sep">/</span>
+          <span class="crumb crumb-current">{{ activeViewTitle() }}</span>
+        </p>
+        <h2>{{ activeViewTitle() }}</h2>
+        <p>{{ activeViewDescription() }}</p>
+      </div>
+      <div class="workspace-meta">
+        @if (activeViewCount() !== null) {
+          <span class="badge badge-accent">{{ activeViewCount() }} item(s)</span>
+        }
+        @if (activeViewBadge(); as badge) {
+          <span class="badge badge-{{ badge.tone }}">{{ badge.label }}</span>
+        }
+        @if (!mutationsEnabled()) {
+          <span class="badge badge-warning" title="Listener failed — retry to recover">
+            read-only mode
+          </span>
+        }
+      </div>
     </header>
 
-    @if (agentsError(); as err) {
-      <p class="error">{{ err }}</p>
-    } @else if (agents().length > 0) {
-      <ul class="agents">
-        @for (a of agents(); track a.name) {
-          <li>
-            <div>
-              <span class="name">{{ a.name }}</span>
-              <span class="meta">{{ a.mode }}</span>
-              @if (a.model) {
-                <span class="meta"> · {{ a.model }}</span>
+    <!-- Global compact operation + connection panel. Visible
+         on every view (including readiness=false / startPending).
+         The Cancel and Refresh-status buttons stay reachable
+         outside the per-view Actividad section so they never get
+         lost on navigation. Rendered below `.workspace-content`
+         (which owns the scroll) so the panel itself never
+         scrolls with the page and stays anchored to the bottom
+         of the workspace. -->
+    <div class="workspace-content">
+      <!-- ================================================
+           AGENTS view
+           ================================================ -->
+      <div class="view" [hidden]="activeView() !== 'agents'">
+        <div class="card">
+          <header class="card-header">
+            <h3>
+              Agents
+              <span class="meta">{{ agents().length }} loaded</span>
+            </h3>
+            <div class="card-actions">
+              <button
+                type="button"
+                class="primary"
+                (click)="captureOpener($event); beginNewAgent()"
+                [disabled]="busy() || !mutationsEnabled() || activeJob() || startPending() || editing() !== null"
+              >New agent</button>
+              <button
+                type="button"
+                class="secondary"
+                (click)="refreshAgents()"
+                [disabled]="busy() || !mutationsEnabled()"
+              >Refresh</button>
+            </div>
+          </header>
+          <div class="card-body">
+            @if (agentsError(); as err) {
+              <p class="error" role="alert">{{ err }}</p>
+              <p class="empty">Could not load agents. Use Refresh to retry.</p>
+            } @else if (agentsLoading()) {
+              <p class="empty">Loading agents…</p>
+            } @else if (agents().length > 0) {
+              <ul class="agents">
+                @for (a of agents(); track a.name) {
+                  <li
+                    class="agent-row"
+                    [class.editing]="isEditing(a.name)"
+                  >
+                    <div class="agent-head">
+                      <div class="agent-head-text">
+                        <span
+                          class="agent-name"
+                          [title]="a.name"
+                        >{{ a.name }}</span>
+                        <span
+                          class="agent-badge"
+                          [title]="a.mode + ' agent'"
+                          aria-label="mode: {{ a.mode }}"
+                        >{{ a.mode }}</span>
+                      </div>
+                      <span
+                        class="agent-meta"
+                        [title]="a.model ?? 'inherits the configured default'"
+                      >{{ a.model ?? "inherits the configured default" }}</span>
+                      <div class="agent-actions">
+                        <button
+                          type="button"
+                          class="secondary"
+                          (click)="captureOpener($event); openEditor(a.name)"
+                          [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending() || (editing() !== null && editing() !== a.name)"
+                          [attr.aria-label]="'Edit agent ' + a.name"
+                          [title]="'Edit ' + a.name"
+                        >Edit</button>
+                      </div>
+                    </div>
+                    @if (a.description) {
+                      <div class="agent-description">{{ a.description }}</div>
+                    }
+                  </li>
+                }
+              </ul>
+            } @else {
+              <p class="empty">No agents loaded yet. Refresh or configure a checkout.</p>
+            }
+          </div>
+        </div>
+
+        <!-- Editor error surface (no editor mounted) so a
+             failed `load_*_for_edit` call still surfaces
+             the backend's literal text. The actual editor
+             is rendered as a top-level <dialog> below
+             the .workspace-content; this is the same
+             no-implicit-discard contract the inline
+             editor had, just without the lost-on-nav
+             failure mode. -->
+        @if (editError(); as err) {
+          @if (editing() === null) {
+            <p class="error" role="alert">{{ err }}</p>
+          }
+        }
+      </div>
+
+      <!-- ================================================
+           SYNC view (Sync + Skills + Plans grouped)
+           ================================================ -->
+      <div class="view" [hidden]="activeView() !== 'sync'">
+        <div class="card">
+          <header class="card-header">
+            <h3>Sync agents</h3>
+          </header>
+          <div class="card-body">
+            <p class="meta-text">
+              Run <code>plan_then_apply_agents_safe_controlled</code>
+              against the configured checkout. Writes to the
+              selected harness's destination paths, not the
+              source checkout. Safe sync can remove unchanged
+              owned targets whose source was removed. Refuses
+              while the editor is open. Cancel is cooperative
+              — no force-kill.
+            </p>
+            <div class="card-actions">
+              <button
+                type="button"
+                class="primary"
+                (click)="startSyncAgents('opencode')"
+                [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending() || editing() !== null || (syncConfirmArmed() !== null && syncConfirmArmed() !== 'opencode')"
+              >
+                @if (syncConfirmArmed() === 'opencode') { Confirm: Sync to OpenCode } @else { Sync to OpenCode }
+              </button>
+              <button
+                type="button"
+                class="primary"
+                (click)="startSyncAgents('pi')"
+                [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending() || editing() !== null || (syncConfirmArmed() !== null && syncConfirmArmed() !== 'pi')"
+              >
+                @if (syncConfirmArmed() === 'pi') { Confirm: Sync to Pi } @else { Sync to Pi }
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <header class="card-header">
+            <h3>Install skills</h3>
+          </header>
+          <div class="card-body">
+            <p class="meta-text">
+              Run <code>plan_then_apply_skills_controlled</code>
+              against the configured checkout's
+              <code>skills/</code> sibling. OpenCode-only;
+              refuses while the editor is open. Installation
+              can remove unchanged owned skills whose source
+              was removed. Cancel is cooperative.
+            </p>
+            <div class="card-actions">
+              <button
+                type="button"
+                class="primary"
+                (click)="startInstallSkills()"
+                [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending() || editing() !== null"
+              >
+                @if (skillsConfirmArmed()) { Confirm: Install skills } @else { Install skills }
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <header class="card-header">
+            <h3>Read-only plans / inventory</h3>
+            <div class="card-actions">
+              <label for="plan-target" style="margin: 0;">Agent destination</label>
+              <select
+                id="plan-target"
+                style="width: auto;"
+                [value]="selectedPlanTarget()"
+                (change)="selectedPlanTarget.set($any($event.target).value)"
+              >
+                @for (entry of planRequests; track entry.id) {
+                  @if (entry.request.kind === 'sync_agents') {
+                    <option [value]="entry.id">{{ entry.label }}</option>
+                  }
+                }
+              </select>
+              <button
+                type="button"
+                class="secondary"
+                (click)="refreshPlans()"
+                [disabled]="!mutationsEnabled() || busy()"
+              >Refresh plans</button>
+            </div>
+          </header>
+          <div class="card-body">
+            <p class="meta-text">
+              Advisory snapshot only, not an executable plan.
+              Every Sync / Install replans against current
+              files and ownership state. Reads during an
+              active job may observe partial changes; this is
+              not an atomic snapshot.
+            </p>
+            @for (entry of planRequests; track entry.id) {
+              @if (entry.id === 'skills' || entry.id === selectedPlanTarget()) {
+                @let view = plans()[entry.id];
+                <div class="card" style="margin-bottom: 0.75rem;">
+                  <header class="card-header">
+                    <h3>{{ entry.label }}</h3>
+                  </header>
+                  <div class="card-body">
+                    @if (view.loading) {
+                      <p class="empty">Reading current plan…</p>
+                    }
+                    @if (view.error) {
+                      <p class="error" role="alert">{{ view.error }}</p>
+                    }
+                    @if (view.plan; as plan) {
+                      @if (view.error || view.loading) {
+                        <p class="warning">STALE — retained previous snapshot</p>
+                      }
+                      <p class="meta-text">
+                        Source checkout: <code>{{ plan.checkout_path }}</code>
+                      </p>
+                      <ul class="plan-rows">
+                        @for (row of plan.rows; track row.name) {
+                          <li>
+                            <h4>{{ row.name }} — {{ row.status }}</h4>
+                            @if (row.reason) {
+                              <p class="plan-row-reason">{{ row.reason }}</p>
+                            }
+                            <dl class="kv">
+                              <dt>Source</dt><dd><code>{{ row.source_path }}</code></dd>
+                              <dt>Destination</dt><dd><code>{{ row.target_path }}</code></dd>
+                              <dt>Source hash</dt><dd><code>{{ row.source_hash ?? '—' }}</code></dd>
+                              <dt>Destination hash</dt><dd><code>{{ row.target_hash ?? '—' }}</code></dd>
+                              <dt>Owned hash</dt><dd><code>{{ row.owned_hash ?? '—' }}</code></dd>
+                            </dl>
+                          </li>
+                        } @empty {
+                          <li>No plan rows in this snapshot.</li>
+                        }
+                      </ul>
+                    } @else if (!view.loading && !view.error) {
+                      <p class="meta-text">Not loaded.</p>
+                    }
+                  </div>
+                </div>
+              }
+            }
+          </div>
+        </div>
+      </div>
+
+      <!-- ================================================
+           TOOLS view
+           ================================================ -->
+      <div class="view" [hidden]="activeView() !== 'tools'">
+        <div class="card">
+          <header class="card-header">
+            <h3>Install tool</h3>
+          </header>
+          <div class="card-body">
+            <p class="meta-text">
+              Run <code>install_tool_controlled</code> for a
+              single catalog entry. The catalog is the lib's
+              <code>DEFAULT_CATALOG</code>; the picker mirrors
+              the same list the backend resolves, with
+              status / detail / destination per row. Only the
+              selected catalog entry is installed; cancel is
+              cooperative.
+            </p>
+            <div class="tool-picker-row">
+              <label for="tool-picker">Tool</label>
+              <select
+                id="tool-picker"
+                [value]="selectedToolId()"
+                (change)="onToolSelected($any($event.target).value)"
+                [disabled]="!mutationsEnabled() || startPending()"
+              >
+                @for (t of toolCatalog(); track t.tool_id) {
+                  <option [value]="t.tool_id">{{ t.display }} — {{ t.status }}</option>
+                }
+              </select>
+              <button
+                type="button"
+                class="primary"
+                (click)="startInstallTool()"
+                [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending() || editing() !== null || !selectedToolId()"
+              >
+                @if (toolConfirmArmed() === selectedToolId() && selectedToolId()) { Confirm: Install } @else { Install }
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <header class="card-header">
+            <h3>Tool catalog inventory</h3>
+          </header>
+          <div class="card-body">
+            @if (toolCatalog().length > 0) {
+              <div class="table-wrap">
+                <table aria-label="Tool catalog inventory">
+                  <thead>
+                    <tr>
+                      <th>id</th>
+                      <th>name</th>
+                      <th>status</th>
+                      <th>detail</th>
+                      <th>destination</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (t of toolCatalog(); track t.tool_id) {
+                      <tr [class.selected]="t.tool_id === selectedToolId()">
+                        <td><code>{{ t.tool_id }}</code></td>
+                        <td>{{ t.display }}</td>
+                        <td>{{ t.status }}</td>
+                        <td>{{ t.detail }}</td>
+                        <td><code>{{ t.destination }}</code></td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            } @else {
+              <p class="empty">No tool catalog loaded yet.</p>
+            }
+            @if (toolCatalogError(); as err) {
+              <p class="warning" role="alert">
+                tool catalog refresh failed (showing previous inventory): {{ err }}
+              </p>
+            }
+          </div>
+        </div>
+      </div>
+
+      <!-- ================================================
+           MODELS view
+           ================================================ -->
+      <div class="view" [hidden]="activeView() !== 'models'">
+        <div class="card">
+          <header class="card-header">
+            <h3>Discover models</h3>
+            <div class="card-actions">
+              <button
+                type="button"
+                class="primary"
+                (click)="startDiscoverModels()"
+                [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending()"
+              >Discover</button>
+            </div>
+          </header>
+          <div class="card-body">
+            <p class="meta-text">
+              Run <code>discover_models_controlled</code>.
+              The result is advisory only; the editor's typed
+              <code>model</code> is never overwritten. Apply
+              an entry by clicking it from the list.
+            </p>
+            @if (discoveredModelList().length > 0) {
+              <p class="meta-text">
+                {{ discoveredModelList().length }} model(s) discovered.
+                Click to apply to the open editor.
+              </p>
+              <ul class="discovered">
+                @for (m of discoveredModelList(); track m) {
+                  <li>
+                    <button
+                      type="button"
+                      class="discovered-item secondary"
+                      (click)="applyDiscoveredModel(m)"
+                      [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending() || editing() === null"
+                      [title]="editing() === null ? 'Open an agent to apply' : 'Apply to the editor draft'"
+                    >{{ m }}</button>
+                  </li>
+                }
+              </ul>
+            } @else if (discoveryError(); as err) {
+              <p class="error" role="alert">{{ err }}</p>
+            } @else {
+              <p class="empty">No models discovered yet.</p>
+            }
+            <p class="discovery-note">
+              Discovery is advisory: an unknown provider or
+              model can still be typed into the editor's
+              <code>model</code> field. The
+              <code>permission_keys</code> catalogue is
+              backend-authoritative, but the editor's
+              <code>model</code> accepts any free-text value.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================================================
+           SETTINGS view
+           ================================================ -->
+      <div class="view" [hidden]="activeView() !== 'settings'">
+        <div class="card">
+          <header class="card-header">
+            <h3>Library status</h3>
+            <div class="card-actions">
+              <button
+                type="button"
+                class="secondary"
+                (click)="refreshSettings()"
+                [disabled]="busy() || !mutationsEnabled()"
+              >Refresh</button>
+            </div>
+          </header>
+          <div class="card-body">
+            @if (settingsError(); as err) {
+              <p class="error" role="alert">{{ err }}</p>
+            } @else if (settings(); as s) {
+              <p class="meta-text">
+                <strong>{{ settingsLabel() }}</strong>
+              </p>
+              <dl class="kv">
+                @for (row of settingsDetails(); track row[0]) {
+                  <dt>{{ row[0] }}</dt>
+                  <dd>{{ row[1] }}</dd>
+                }
+              </dl>
+            } @else {
+              <p class="empty">No settings loaded yet.</p>
+            }
+          </div>
+        </div>
+
+        <div class="card">
+          <header class="card-header">
+            <h3>Checkout path</h3>
+          </header>
+          <div class="card-body">
+            <p class="meta-text">
+              Path is forwarded verbatim to
+              <code>apply_checkout</code>; trim, empty
+              rejection, absolute check and validator
+              messages live in the lib.
+            </p>
+            <div class="path-editor">
+              <label for="checkout-path">Checkout path (absolute)</label>
+              <input
+                id="checkout-path"
+                type="text"
+                [value]="checkoutPath()"
+                (input)="onCheckoutPathInput($any($event.target).value)"
+                [disabled]="saving() || !mutationsEnabled()"
+                autocomplete="off"
+                spellcheck="false"
+                aria-label="Configured checkout path (absolute)"
+              />
+              <button
+                type="button"
+                class="primary"
+                (click)="saveCheckout()"
+                [disabled]="!mutationsEnabled() || busy() || startPending() || editing() !== null"
+              >
+                @if (saving()) { Saving… } @else { Save }
+              </button>
+              @if (saveError(); as err) {
+                <p class="save-error" role="alert">{{ err }}</p>
               }
             </div>
-            @if (a.description) {
-              <div>{{ a.description }}</div>
-            }
-          </li>
-        }
-      </ul>
-    } @else {
-      <p class="empty">No agents loaded yet.</p>
-    }
-  </section>
+          </div>
+        </div>
+      </div>
 
-  <section>
-    <button
-      type="button"
-      (click)="refreshAll()"
-      [disabled]="busy()"
+      <!-- ================================================
+           Actividad view (long-running operation, cancel,
+           status). Reached via the sidebar "Actividad" entry
+           or the bottom panel's "Ver detalles" button. The
+           view id remains `'job'` so existing navigation,
+           hidden-view survival and IPC guards are unchanged;
+           only the visible labels are translated.
+           ================================================ -->
+      <div class="view" [hidden]="activeView() !== 'job'">
+        <div class="card">
+          <header class="card-header">
+            <h3>
+              Actividad
+              <span class="meta">{{ jobLabel() }}</span>
+            </h3>
+          </header>
+          <div class="card-body">
+            @if (jobError(); as err) {
+              <p class="error" role="alert">{{ err }}</p>
+            }
+            @if (currentJob(); as job) {
+              <dl class="kv">
+                <dt>id</dt>
+                <dd>{{ job.id }}</dd>
+                <dt>tipo</dt>
+                <dd>{{ activityOperationLabel(job.request.kind) }}</dd>
+                <dt>fase</dt>
+                <dd>{{ job.phase }}</dd>
+                @if (job.cancel_requested) {
+                  <dt>cancelar</dt>
+                  <dd>solicitado</dd>
+                }
+                @if (job.progress; as p) {
+                  <dt>etapa</dt>
+                  <dd>{{ p.stage }} ({{ p.processed }} / {{ p.total ?? "?" }})</dd>
+                  @if (p.item) {
+                    <dt>elemento</dt>
+                    <dd>{{ p.item }}</dd>
+                  }
+                }
+                @if (job.finish; as f) {
+                  <dt>resultado</dt>
+                  <dd>{{ activityFinishLabel(f) }}</dd>
+                }
+                @if (job.error; as err) {
+                  <dt>error</dt>
+                  <dd>{{ err }}</dd>
+                }
+              </dl>
+              @if (jobToolTerminal(); as t) {
+                <p class="meta-text">
+                  herramienta: {{ t.status }} — {{ t.detail }}
+                  @if (t.residual) {
+                    <br />directorio de staging residual: <code>{{ t.residual }}</code>
+                  }
+                </p>
+              }
+              @if (jobDiscoveryTerminal(); as t) {
+                @if (t.kind === "found") {
+                  <p class="meta-text">se descubrieron {{ t.models.length }} modelo(s)</p>
+                } @else if (t.kind === "empty") {
+                  <p class="meta-text">sin modelos: {{ t.message }}</p>
+                } @else {
+                  <p class="meta-text">descubrimiento falló: {{ t.message }}</p>
+                }
+              }
+              @if (jobObservedStatePartial() && job.phase === "finished") {
+                <p class="meta-text">
+                  estado observado: {{ jobObservedStatePartial() }} vista parcial (persistencia no garantizada)
+                </p>
+              }
+              @if (jobOutcomeRows().length > 0) {
+                <ul class="outcomes">
+                  @for (row of jobOutcomeRows(); track row.name + row.action) {
+                    <li class="row" [class.ok]="row.ok" [class.bad]="!row.ok">
+                      <span class="name">{{ row.name }}</span>
+                      <span class="meta">{{ row.action }}</span>
+                      <span class="meta">{{ row.detail }}</span>
+                    </li>
+                  }
+                </ul>
+              }
+            } @else {
+              <p class="empty">Aún no se ha ejecutado ninguna operación en este proceso del backend.</p>
+            }
+          </div>
+        </div>
+
+        <div class="card">
+          <header class="card-header">
+            <h3>Conexión</h3>
+          </header>
+          <div class="card-body">
+            <p class="meta-text">
+              El listener de eventos del registro es la fuente
+              de verdad del canal. Si el listener falla, el
+              componente desactiva las mutaciones; pulsa
+              Reintentar para recuperar.
+            </p>
+            <div class="card-actions">
+              <button
+                type="button"
+                class="secondary"
+                (click)="refreshAll()"
+                [disabled]="!mutationsEnabled() || busy()"
+              >Refrescar todo</button>
+              <button
+                type="button"
+                class="secondary"
+                (click)="retryConnection()"
+                [disabled]="busy() || (subscribed() && !connectionError())"
+              >Reintentar</button>
+            </div>
+            <dl class="kv" style="margin-top: 0.75rem;">
+              <dt>listener</dt>
+              <dd>{{ subscribed() ? "registrado" : "no registrado" }}</dd>
+              <dt>mutaciones</dt>
+              <dd>{{ mutationsEnabled() ? "activadas" : "desactivadas (reintentar para recuperar)" }}</dd>
+            </dl>
+            @if (connectionError(); as err) {
+              <p class="error" role="alert">{{ err }}</p>
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ================================================
+         Actividad panel — persistent bottom footer.
+
+         Rendered OUTSIDE `.workspace-content` (which owns
+         the vertical scroll) and OUTSIDE every per-view
+         block (so it stays visible even when the active
+         view is hidden). The panel is the single global
+         source of truth for:
+           * current activity (running / finished / idle)
+           * connection health (listener + mutations)
+           * failures that must NOT be hidden behind a
+             disclosure
+           * the actions that must be reachable on every
+             view: Cancel (when something is running),
+             Refresh status, Retry connection, and the
+             "Ver detalles" link to the dedicated Actividad
+             view (kept under the existing `'job'` view id
+             to avoid rewiring navigation).
+         The detailed job snapshot (id, kind, progress,
+         outcomes, partials) is intentionally NOT repeated
+         here — the existing Actividad view remains the
+         authoritative per-job detail view. A native
+         `<details>` provides a compact in-place expansion
+         for connection diagnostics and a per-job summary
+         without auto-hide / auto-discard / timers.
+         ================================================ -->
+    <footer
+      class="activity-panel"
+      role="contentinfo"
+      aria-label="Actividad"
+      data-testid="activity-panel"
     >
-      Refresh both
-    </button>
+      <div class="activity-summary">
+        <span
+          class="pill"
+          [class.pill-running]="activeJob()"
+          [class.pill-failed]="currentJob()?.finish === 'failed'"
+        >
+          <span class="pill-dot" aria-hidden="true"></span>
+          <span class="activity-state-label">Actividad</span>
+          <span class="activity-state-value">
+            @if (activeJob()) {
+              en curso · {{ jobLabel() }}
+            } @else if (currentJob(); as j) {
+              {{ j.id }} · {{ activityFinishLabel(j.finish ?? j.phase) }}
+            } @else if (startPending()) {
+              iniciando…
+            } @else {
+              Sin operaciones en curso
+            }
+          </span>
+        </span>
+        <span
+          class="pill"
+          [class.pill-running]="subscribed()"
+          [class.pill-failed]="!subscribed()"
+        >
+          <span class="pill-dot" aria-hidden="true"></span>
+          listener {{ subscribed() ? "registrado" : "no registrado" }}
+        </span>
+        <span class="pill">
+          mutaciones {{ mutationsEnabled() ? "activadas" : "desactivadas" }}
+        </span>
+        @if (jobError(); as err) {
+          <span class="pill pill-warn" [title]="err">operación: {{ err }}</span>
+        }
+        @if (connectionError(); as err) {
+          <span class="pill pill-error" [title]="err">conexión: {{ err }}</span>
+        }
+        <div class="activity-actions">
+          <button
+            type="button"
+            class="secondary"
+            (click)="refreshJobStatus()"
+            [disabled]="statusInflight()"
+          >Refrescar estado</button>
+          <button
+            type="button"
+            class="danger"
+            (click)="cancelActiveJob()"
+            [disabled]="cancelInflight() || !activeJob() || !isJobRunning()"
+          >Cancelar</button>
+          <button
+            type="button"
+            class="secondary"
+            (click)="setView('job')"
+            data-testid="activity-ver-detalles"
+          >Ver detalles</button>
+        </div>
+      </div>
+
+      <details class="activity-disclosure" data-testid="activity-disclosure-connection">
+        <summary>Diagnóstico de conexión</summary>
+        <div class="activity-disclosure-body">
+          <dl class="kv">
+            <dt>listener</dt>
+            <dd>{{ subscribed() ? "registrado" : "no registrado" }}</dd>
+            <dt>mutaciones</dt>
+            <dd>{{ mutationsEnabled() ? "activadas" : "desactivadas (usar Reintentar para recuperar)" }}</dd>
+          </dl>
+          @if (connectionError(); as err) {
+            <p class="error" role="alert">{{ err }}</p>
+          } @else {
+            <p class="meta-text">Sin errores de conexión activos.</p>
+          }
+          <div class="activity-actions">
+            <button
+              type="button"
+              class="secondary"
+              (click)="retryConnection()"
+              [disabled]="busy() || (subscribed() && !connectionError())"
+            >Reintentar conexión</button>
+          </div>
+        </div>
+      </details>
+
+      @if (currentJob(); as job) {
+        <details class="activity-disclosure" data-testid="activity-disclosure-job">
+          <summary>Resumen de la última operación</summary>
+          <div class="activity-disclosure-body">
+            <dl class="kv">
+              <dt>id</dt>
+              <dd>{{ job.id }}</dd>
+              <dt>tipo</dt>
+              <dd>{{ activityOperationLabel(job.request.kind) }}</dd>
+              <dt>fase</dt>
+              <dd>{{ job.phase }}</dd>
+              @if (job.finish) {
+                <dt>resultado</dt>
+                <dd>{{ activityFinishLabel(job.finish) }}</dd>
+              }
+              @if (job.error) {
+                <dt>error</dt>
+                <dd>{{ job.error }}</dd>
+              }
+            </dl>
+            @if (jobError(); as err) {
+              <p class="error" role="alert">{{ err }}</p>
+            }
+          </div>
+        </details>
+      }
+    </footer>
+
+    <!-- ================================================
+         Agent editor modal. A native <dialog> rendered
+         OUTSIDE .workspace-content and OUTSIDE every
+         per-view block. The dialog is opened via
+         showModal() in `syncEditorDialog()` whenever
+         `editing()` / `editDraft()` are non-null, and
+         closed when both are null. The dialog uses the
+         same `card` / `card-header` / `card-body` /
+         `card-footer` chrome as the rest of the app
+         for visual consistency; CSS overrides in
+         `app.component.css` keep it on the top layer
+         and make the body scrollable.
+
+         The `(cancel)` handler is the dirty-draft
+         guard for the Escape key: the native dialog
+         would otherwise close on Escape and silently
+         drop the draft. We `preventDefault()` and
+         route through `discardEditor()` which
+         enforces the same confirm flow as the
+         explicit Discard button.
+
+         The `(click)` on the dialog itself is the
+         backdrop-click handler. The directive says
+         "ignore backdrop" (do NOT discard on stray
+         outside-click), so the handler is a no-op.
+         A real backdrop click event still bubbles;
+         we discard it intentionally.
+
+         Inside the modal: a compact ACTIVE activity
+         section (Cancel + Refresh status + the
+         existing retry/error pills) reuses the same
+         public methods (`cancelActiveJob`,
+         `refreshJobStatus`, `retryConnection`) so
+         the user has full control from inside the
+         dialog. The bottom panel is still visible
+         behind the modal (a native <dialog>
+         backdrop is `inert` for everything except
+         the dialog itself, so the bottom panel is
+         NOT interactive while the dialog is open —
+         the in-modal ACTIVE section is the
+         single source of truth for those actions
+         while the dialog is open). The editor's
+         own in-method gates (busy / startPending /
+         activeJob) still apply, so a partial cancel
+         that leaves the registry running does NOT
+         get clobbered by an unrelated click.
+         ================================================ -->
+    <dialog
+      #editorDialog
+      class="editor-dialog"
+      [attr.aria-labelledby]="'editor-dialog-title'"
+      (cancel)="onDialogCancel($event)"
+      (close)="onDialogClose()"
+      (click)="onDialogBackdropClick($event)"
+    >
+      @if (editing() && editDraft(); as d) {
+        <article class="card editor-card">
+          <header class="card-header">
+            <h3 id="editor-dialog-title">
+              {{ editorTitle() }}
+              <span class="meta">{{ d.name }}</span>
+              @if (isEditDirty()) {
+                <span class="meta editor-dirty">● unsaved</span>
+              }
+            </h3>
+            <div class="card-actions">
+              <button
+                type="button"
+                class="editor-close"
+                (click)="discardEditor()"
+                [disabled]="!mutationsEnabled() || busy() || editSaving() || startPending() || activeJob()"
+                aria-label="Close editor"
+                title="Close editor"
+              >×</button>
+            </div>
+          </header>
+          <div class="card-body agent-editor">
+            <div class="row">
+              <label for="edit-agent-name">name</label>
+              <input
+                id="edit-agent-name"
+                [value]="d.name"
+                (input)="onEditName($any($event.target).value)"
+                [disabled]="busy() || !mutationsEnabled() || activeJob() || startPending()"
+                autocomplete="off"
+                spellcheck="false"
+              />
+            </div>
+
+            <div class="row">
+              <label for="edit-agent-description">description</label>
+              <input
+                id="edit-agent-description"
+                type="text"
+                [value]="d.description"
+                (input)="onEditDescription($any($event.target).value)"
+                [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending()"
+                autocomplete="off"
+              />
+            </div>
+
+            <div class="row">
+              <label for="edit-agent-mode">mode</label>
+              <select
+                id="edit-agent-mode"
+                [value]="d.mode"
+                (change)="onEditMode($any($event.target).value)"
+                [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending()"
+              >
+                <option value="subagent">subagent</option>
+                <option value="primary">primary</option>
+                <option value="all">all</option>
+              </select>
+            </div>
+
+            <!-- Model — searchable select. The "Inherit"
+                 and "Custom..." options are sentinel
+                 keys; real wire model ids are
+                 `discoveredModels()` ∪ the agents'
+                 models ∪ the current draft model,
+                 dedup-sorted. The search term is pure
+                 UI state; the draft is only written
+                 when the user picks an option from
+                 the select. The Custom input is only
+                 revealed when the user picks the
+                 "Custom..." option (so a manual
+                 unknown model is preserved verbatim). -->
+            <div class="row model-row">
+              <label for="edit-agent-model-select">model</label>
+              <div class="model-controls">
+                <div class="model-row-top">
+                  <input
+                    id="edit-agent-model-search"
+                    class="model-search"
+                    type="text"
+                    [value]="modelSearchTerm()"
+                    (input)="onModelSearchInput($any($event.target).value)"
+                    (blur)="onModelSearchBlur()"
+                    placeholder="filter (provider / model)"
+                    aria-label="Filter model list"
+                    aria-controls="edit-agent-model-select"
+                    [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending()"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                  <select
+                    id="edit-agent-model-select"
+                    class="model-select"
+                    size="6"
+                    [value]="modelOptionKey()"
+                    (change)="onModelSelectChange($any($event.target).value)"
+                    aria-label="Select a model"
+                    [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending()"
+                  >
+                    <option value="__inherit__">Inherit (use the configured default)</option>
+                    <option value="__custom__">Custom model…</option>
+                    @for (m of filteredModelOptions(); track m) {
+                      <option [value]="m">{{ modelOptionLabel(m) }}</option>
+                    }
+                  </select>
+                </div>
+                @if (modelOptionsEmpty()) {
+                  <p class="meta-text model-empty" role="status">
+                    No models match the filter. Use Custom model… to enter a manual id.
+                  </p>
+                }
+                @if (isModelCustomActive()) {
+                  <input
+                    id="edit-agent-model"
+                    class="model-custom"
+                    type="text"
+                    [value]="modelCustomInput()"
+                    (input)="onModelCustomInput($any($event.target).value)"
+                    placeholder="provider/model"
+                    aria-label="Custom model id"
+                    [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending()"
+                    autocomplete="off"
+                    spellcheck="false"
+                  />
+                }
+                <p class="meta-text model-note">
+                  The list combines the latest discovery cache with the models used by
+                  loaded canonical agents. Discovery runs only on Load models — it does
+                  not run automatically when the editor opens. Unknown ids you type
+                  here are preserved verbatim and submitted as-is.
+                </p>
+                <div class="model-actions">
+                  <button
+                    type="button"
+                    class="secondary"
+                    (click)="startDiscoverModels()"
+                    [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending() || editSaving()"
+                  >Load models</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="row">
+              <label for="edit-agent-prompt">prompt</label>
+              <textarea
+                id="edit-agent-prompt"
+                rows="6"
+                [value]="d.prompt"
+                (input)="onEditPrompt($any($event.target).value)"
+                [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending()"
+                spellcheck="false"
+              ></textarea>
+            </div>
+
+            <div class="permissions">
+              <h4>permissions</h4>
+              @for (key of editPermissionKeys(); track key) {
+                <div class="perm-row">
+                  <span class="perm-key">
+                    {{ key }}
+                    @if (!isKnownPermission(key)) {
+                      <em>(unknown)</em>
+                    }
+                  </span>
+                  <select
+                    [value]="d.permissions[key] || 'ask'"
+                    (change)="onEditPermissionChange(key, $any($event.target).value)"
+                    [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending()"
+                    [attr.aria-label]="'Permission mode for ' + key"
+                  >
+                    <option value="allow">allow</option>
+                    <option value="ask">ask</option>
+                    <option value="deny">deny</option>
+                    <option value="(unset)">(unset)</option>
+                  </select>
+                  <button
+                    type="button"
+                    class="ghost icon"
+                    (click)="removePermissionKey(key)"
+                    [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending()"
+                    [attr.aria-label]="'Remove permission ' + key"
+                    title="Remove permission key"
+                  >×</button>
+                </div>
+              }
+              <div class="perm-add">
+                <label for="edit-agent-add-key">add key:</label>
+                <select
+                  id="edit-agent-add-key"
+                  [disabled]="editSaving() || busy() || !mutationsEnabled() || activeJob() || startPending() || availableKnownPermissionKeys().length === 0"
+                  (change)="addPermissionKey($any($event.target).value); $any($event.target).value = ''"
+                >
+                  <option value="">—</option>
+                  @for (k of availableKnownPermissionKeys(); track k) {
+                    <option [value]="k">{{ k }}</option>
+                  }
+                </select>
+              </div>
+            </div>
+
+            @if (editError(); as err) {
+              <p class="error" role="alert">{{ err }}</p>
+            }
+            @if (knownPermissionKeysError(); as err) {
+              <p class="warning" role="alert">
+                permission keys refresh failed (showing previous vocabulary): {{ err }}
+              </p>
+            }
+            @if (editActionConfirm(); as confirmation) {
+              <p class="warning" role="alert">{{ confirmation.message }}</p>
+              <button type="button" class="secondary" (click)="cancelEditorAction()"
+                [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending()">Cancel action</button>
+            }
+
+            <!-- Compact ACTIVE activity section inside
+                 the dialog. The bottom panel is
+                 inaccessible while the dialog is open
+                 (a native <dialog> is on the top
+                 layer, the backdrop is inert), so the
+                 user gets Cancel / Refresh status /
+                 retry from inside the dialog. The same
+                 public methods are wired so the gates
+                 (busy / startPending / activeJob) and
+                 the in-method error paths are
+                 identical. A partial cancel that
+                 leaves the registry running does NOT
+                 get clobbered: the in-method
+                 `cancelActiveJob` checks
+                 `isJobRunning()` and refuses if the
+                 job is not actually running. -->
+            <section
+              class="editor-activity"
+              aria-label="Active operation"
+              data-testid="editor-activity"
+            >
+              <h4>activity</h4>
+              <div class="editor-activity-pills">
+                <span
+                  class="pill"
+                  [class.pill-running]="activeJob()"
+                  [class.pill-failed]="currentJob()?.finish === 'failed'"
+                >
+                  <span class="pill-dot" aria-hidden="true"></span>
+                  <span>
+                    @if (activeJob()) {
+                      en curso · {{ jobLabel() }}
+                    } @else if (currentJob(); as j) {
+                      {{ j.id }} · {{ activityFinishLabel(j.finish ?? j.phase) }}
+                    } @else if (startPending()) {
+                      iniciando…
+                    } @else {
+                      Sin operaciones en curso
+                    }
+                  </span>
+                </span>
+                <span
+                  class="pill"
+                  [class.pill-running]="subscribed()"
+                  [class.pill-failed]="!subscribed()"
+                >
+                  <span class="pill-dot" aria-hidden="true"></span>
+                  listener {{ subscribed() ? "registrado" : "no registrado" }}
+                </span>
+                <span class="pill">
+                  mutaciones {{ mutationsEnabled() ? "activadas" : "desactivadas" }}
+                </span>
+                @if (jobError(); as err) {
+                  <span class="pill pill-warn" [title]="err">operación: {{ err }}</span>
+                }
+                @if (connectionError(); as err) {
+                  <span class="pill pill-error" [title]="err">conexión: {{ err }}</span>
+                }
+              </div>
+              <div class="editor-activity-actions">
+                <button
+                  type="button"
+                  class="secondary"
+                  (click)="refreshJobStatus()"
+                  [disabled]="statusInflight()"
+                >Refrescar estado</button>
+                <button
+                  type="button"
+                  class="danger"
+                  (click)="cancelActiveJob()"
+                  [disabled]="cancelInflight() || !activeJob() || !isJobRunning()"
+                >Cancelar</button>
+                <button
+                  type="button"
+                  class="secondary"
+                  (click)="retryConnection()"
+                  [disabled]="busy() || (subscribed() && !connectionError())"
+                >Reintentar</button>
+              </div>
+            </section>
+          </div>
+          <footer class="card-footer editor-footer">
+            @if (editContext()?.original_name !== null) {
+              <button
+                type="button"
+                class="danger"
+                (click)="deleteEditor()"
+                [disabled]="!mutationsEnabled() || busy() || editSaving() || startPending() || activeJob()"
+              >Delete canonical</button>
+            }
+            <div class="editor-footer-right">
+              <button
+                type="button"
+                class="secondary"
+                (click)="discardEditor()"
+                [disabled]="!mutationsEnabled() || busy() || editSaving() || startPending() || activeJob()"
+              >
+                @if (dirtyConfirmArmed()) { Discard (confirm) } @else { Discard }
+              </button>
+              <button
+                type="button"
+                class="primary"
+                (click)="saveEditor()"
+                [disabled]="!mutationsEnabled() || busy() || editSaving() || startPending() || activeJob()"
+              >
+                @if (editSaving()) { Saving… } @else { Save }
+              </button>
+            </div>
+          </footer>
+        </article>
+      }
+    </dialog>
   </section>
-</main>
+</div>

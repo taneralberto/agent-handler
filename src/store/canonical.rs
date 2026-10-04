@@ -1,5 +1,7 @@
 //! Canonical storage: load the canonical set, save / rename / delete
-//! individual agent files.
+//! individual agent files, and open a single canonical agent for
+//! editing (with its on-disk SHA-256 captured for the editor's
+//! stale-write check).
 //!
 //! Everything here operates on `Paths.canonical_dir`. The path is
 //! always the user-configured checkout's `agents/` directory; the
@@ -7,7 +9,7 @@
 //! bundled starter seed step are gone. Sync of the canonical bytes
 //! to the OpenCode / Pi target directories lives in `super::sync`.
 
-use super::{hash_file, require_canonical_source, write_target, Paths};
+use super::{hash_file, require_canonical_source, sha256_hex, write_target, Paths};
 use crate::agent::{canonical_path, Agent};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::BTreeMap;
@@ -65,6 +67,56 @@ pub fn load_canonical(paths: &Paths) -> Result<BTreeMap<String, (Agent, PathBuf)
         );
     }
     Ok(agents)
+}
+
+/// Load one existing canonical agent for the editor, capturing the
+/// on-disk SHA-256 of the bytes the editor is going to edit.
+///
+/// The workflow is a fail-closed three-step gate:
+///
+/// 1. `require_canonical_source` rejects a missing / moved /
+///    symlinked checkout before any read so the editor cannot
+///    land bytes against a checkout that vanished out-of-band.
+/// 2. `Agent::validate_name` rejects traversal-style names
+///    (consecutive hyphens, `..`, non-ASCII, leading/trailing
+///    hyphens, …) so `name.md` stays inside
+///    `paths.canonical_dir`.
+/// 3. `symlink_metadata` rejects symlinks and non-regular files
+///    so the editor cannot be tricked into editing bytes that
+///    live behind indirection the canonical contract forbids.
+///
+/// The bytes are read **once** into a `Vec<u8>`, then parsed and
+/// hashed from that buffer. Hashing from the same bytes the
+/// parser consumes pins the editor's stale-write contract to
+/// exactly the source the parser saw — a re-read between parse
+/// and hash would create a window where an external writer
+/// could swap bytes under the editor.
+///
+/// `Ok((agent, prior_hash))` carries the lowercase hex SHA-256
+/// the caller should pass back to `save_canonical` /
+/// `workflows::save_agent`. The hash matches `hash_file(path)`
+/// for the same on-disk bytes (verified by
+/// `load_agent_for_edit_hashes_same_bytes_as_hash_file`).
+pub fn load_agent_for_edit(paths: &Paths, name: &str) -> Result<(Agent, String)> {
+    require_canonical_source(paths)?;
+    Agent::validate_name(name).with_context(|| format!("invalid agent name `{}`", name))?;
+    let path = canonical_path(&paths.canonical_dir, name)?;
+    let meta = fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "agent file {} is a symlink; refusing to edit",
+            path.display()
+        );
+    }
+    if !meta.file_type().is_file() {
+        bail!("agent file {} is not a regular file", path.display());
+    }
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    let source = std::str::from_utf8(&bytes)
+        .map_err(|e| anyhow!("agent file {} is not valid UTF-8: {}", path.display(), e))?;
+    let agent = Agent::parse(name, source).with_context(|| format!("parse {}", path.display()))?;
+    let prior_hash = sha256_hex(&bytes);
+    Ok((agent, prior_hash))
 }
 
 /// Save an agent's current canonical bytes.

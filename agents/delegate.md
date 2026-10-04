@@ -1,7 +1,7 @@
 ---
 description: "Concise general executor; narrow edits, focused validation, focused report."
 mode: subagent
-model: "minimax/MiniMax-M3"
+model: "openai/gpt-6.1-sol"
 permission:
   bash: allow
   edit: allow
