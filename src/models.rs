@@ -1,4 +1,10 @@
 use anyhow::{anyhow, bail, Result};
+#[cfg(windows)]
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::io::ErrorKind;
+#[cfg(windows)]
+use std::path::PathBuf;
 use std::process::Command;
 
 /// Result of attempting to discover models.
@@ -50,10 +56,11 @@ pub fn discover_models() -> Discovery {
 }
 
 fn run_opencode_models() -> Result<String> {
-    let output = Command::new("opencode")
-        .arg("models")
-        .env("NO_COLOR", "1")
-        .output()
+    // `spawn_opencode_models` runs the original
+    // `Command::new("opencode")` and only on Windows falls back to
+    // the npm `opencode.cmd` shim if the bare-name attempt returns
+    // `NotFound` — see that helper for the why and how.
+    let output = spawn_opencode_models()
         .map_err(|e| anyhow!("could not execute `opencode models`: {}", e))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -73,6 +80,52 @@ fn run_opencode_models() -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Spawn `opencode models`. Windows-only fallback: Rust's bare
+/// executable lookup doesn't append `.cmd`, so when only the npm
+/// `opencode.cmd` shim is on PATH, `Command::new("opencode")` fails
+/// with `NotFound`. We locate the shim and re-spawn via its full path;
+/// Rust's std handles explicitly named batch shims internally, so we
+/// never assemble a `cmd.exe /C` command line ourselves (avoids
+/// cmd.exe quoting pitfalls around `&` in paths). Non-Windows and
+/// non-`NotFound` errors propagate as-is.
+fn spawn_opencode_models() -> std::io::Result<std::process::Output> {
+    match Command::new("opencode")
+        .arg("models")
+        .env("NO_COLOR", "1")
+        .output()
+    {
+        Ok(out) => Ok(out),
+        #[cfg(windows)]
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            match locate_opencode_cmd_in(&path) {
+                Some(shim) => Command::new(&shim)
+                    .arg("models")
+                    .env("NO_COLOR", "1")
+                    .output(),
+                None => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Locate the npm-shipped `opencode.cmd` shim by walking `PATH`.
+/// Needed because Rust's Windows bare executable lookup doesn't
+/// append `.cmd`. Pure so they don't have to touch process state in
+/// tests. Real `opencode.exe` installs are resolved by the bare-name
+/// spawn and never hit this path.
+#[cfg(windows)]
+fn locate_opencode_cmd_in(path: &OsStr) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path) {
+        let candidate = dir.join("opencode.cmd");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Parse line-oriented output into sorted, deduplicated `provider/model`
@@ -189,5 +242,82 @@ mod tests {
         );
         assert!(Discovery::Empty("x".into()).models().is_empty());
         assert!(Discovery::Failed("x".into()).models().is_empty());
+    }
+
+    // Windows-only: walks PATH for `opencode.cmd`. Synthesized
+    // shims in isolated TempDirs keep the host PATH untouched.
+    #[cfg(windows)]
+    #[test]
+    fn locate_opencode_cmd_in_finds_shim_even_when_dir_has_amper() {
+        // Directory name intentionally contains `&` (e.g.
+        // `C:\R&D\bin\opencode.cmd`). The resolved path goes to
+        // `Command::new`, never to a shell.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weird = dir.path().join("with&here");
+        std::fs::create_dir_all(&weird).expect("create weird dir");
+        let shim = weird.join("opencode.cmd");
+        std::fs::write(&shim, b"").expect("write shim");
+        let path_env = std::env::join_paths([&weird]).expect("PATH env");
+
+        assert_eq!(
+            locate_opencode_cmd_in(path_env.as_os_str()),
+            Some(shim),
+            "locator must return the shim even when its parent dir contains `&`"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locate_opencode_cmd_in_returns_none_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path_env = std::env::join_paths([dir.path()]).expect("PATH env");
+        assert!(
+            locate_opencode_cmd_in(path_env.as_os_str()).is_none(),
+            "no opencode.cmd in PATH -> locator must return None"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locate_opencode_cmd_in_honours_path_order() {
+        let first = tempfile::tempdir().expect("first tempdir");
+        let second = tempfile::tempdir().expect("second tempdir");
+        std::fs::write(first.path().join("opencode.cmd"), b"").expect("write first");
+        std::fs::write(second.path().join("opencode.cmd"), b"").expect("write second");
+        let path_env = std::env::join_paths([first.path(), second.path()]).expect("PATH env");
+
+        let found = locate_opencode_cmd_in(path_env.as_os_str()).expect("located");
+        assert!(
+            found.starts_with(first.path()),
+            "earlier PATH directory must win, got: {}",
+            found.display()
+        );
+    }
+
+    // End-to-end: a `.cmd` shim at a path containing `&` runs to
+    // completion via `Command::new(<full .cmd path>)` — proving
+    // the fallback shape does not regress on real cmd.exe quoting
+    // traps. No host PATH mutation; the shim lives in an isolated
+    // TempDir and we pass it to `Command::new` ourselves.
+    #[cfg(windows)]
+    #[test]
+    fn command_new_full_cmd_path_handles_amper_in_dirname() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let weird = dir.path().join("with&here");
+        std::fs::create_dir_all(&weird).expect("create weird dir");
+        let shim = weird.join("opencode.cmd");
+        std::fs::write(&shim, b"@echo openai/gpt-5.4\r\n").expect("write shim");
+
+        let out = Command::new(&shim)
+            .arg("models")
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("Command::new(<full .cmd path>) must run the shim");
+        assert!(out.status.success(), "shim exited non-zero: {:?}", out);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "openai/gpt-5.4",
+            "shim stdout should reach us verbatim, even from a path containing `&`"
+        );
     }
 }

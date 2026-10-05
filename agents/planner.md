@@ -1,7 +1,7 @@
 ---
 description: "Read-only implementation planner; concrete, ordered plans with validation and risk discipline."
 mode: subagent
-model: "openai/gpt-6-sol"
+model: "openai/gpt-6.1-sol"
 permission:
   bash: allow
   edit: deny
