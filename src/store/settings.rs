@@ -400,4 +400,103 @@ mod tests {
         fs::create_dir_all(&deep).unwrap();
         assert!(find_checkout_root_from(&deep).is_none());
     }
+
+    // ---------- D5 settings.json compatibility pins ----------
+    //
+    // These tests pin the schema / route / migration-free
+    // compatibility contract:
+    // - unknown fields are accepted on load and dropped on
+    //   save (no migration; future fields are invisible to
+    //   older binaries);
+    // - whitespace-only `checkout_path` is rejected as
+    //   empty (the runtime never silently falls back);
+    // - JSON type-invalid files (e.g. an array at the root,
+    //   a number instead of an object) fail with an
+    //   explicit parse error;
+    // - a stale `save_settings` over an unmodified bytes
+    //   payload round-trips byte-for-byte.
+
+    /// Unknown fields on load are accepted (forward compat)
+    /// and dropped on save. The round-tripped file must not
+    /// carry the unknown key.
+    #[test]
+    fn unknown_fields_accepted_on_load_and_dropped_on_save() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let path = settings_file_path(root);
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            &path,
+            br#"{
+                "checkout_path": "/some/abs/path",
+                "future_field": {"nested": true},
+                "another_unknown": 42
+            }"#,
+        )
+        .unwrap();
+        let loaded = load_settings(&path).unwrap().expect("file exists");
+        assert_eq!(loaded.checkout_path, "/some/abs/path");
+        // Resave — the unknown fields must not appear in the
+        // serialized output.
+        save_settings(&path, &loaded).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !written.contains("future_field") && !written.contains("another_unknown"),
+            "unknown fields must not appear in the reserialized settings, got: {written}"
+        );
+        // Round-trip is stable.
+        let reloaded = load_settings(&path).unwrap().unwrap();
+        assert_eq!(reloaded, loaded);
+    }
+
+    /// Whitespace-only `checkout_path` is rejected by
+    /// `canonical_dir_from` (it already rejects the empty
+    /// string); this test pins the same behavior for any
+    /// other all-whitespace payload so a future schema
+    /// relaxation cannot quietly accept it.
+    #[test]
+    fn whitespace_only_checkout_path_is_rejected() {
+        let settings = Settings::new("   \t  \n  ");
+        let err = canonical_dir_from(&PathBuf::from("/tmp/agenthd-test"), &settings)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no checkout_path") || err.contains("empty"),
+            "expected empty-checkout rejection, got: {err}"
+        );
+    }
+
+    /// Type-invalid JSON (root is an array, not an object)
+    /// fails with an explicit parse error.
+    #[test]
+    fn type_invalid_json_fails_with_explicit_error() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let path = settings_file_path(root);
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(&path, b"[1, 2, 3]").unwrap();
+        let err = load_settings(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("malformed"),
+            "expected malformed-JSON error, got: {err}"
+        );
+    }
+
+    /// `save_settings` over an unchanged `Settings` value
+    /// round-trips byte-stable: the on-disk bytes are not
+    /// rewritten in a way that diffs against the seed.
+    #[test]
+    fn save_round_trip_byte_stable_on_unchanged_settings() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let settings = Settings::new("/some/abs/path");
+        save_settings(&settings_file_path(root), &settings).unwrap();
+        let before = std::fs::read(&settings_file_path(root)).unwrap();
+        save_settings(&settings_file_path(root), &settings).unwrap();
+        let after = std::fs::read(&settings_file_path(root)).unwrap();
+        assert_eq!(
+            before, after,
+            "save_settings over unchanged payload must not rewrite bytes"
+        );
+    }
 }

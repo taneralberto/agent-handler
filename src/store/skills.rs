@@ -148,6 +148,7 @@
 //! surface is `plan` + `apply` plus the type re-exports.
 
 use super::{sha256_hex, write_state, Paths, State};
+use crate::operation::{run_cancel_checked, CancelToken, Finish, OperationReport, Progress};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -651,6 +652,91 @@ pub fn apply(
         write_state(&paths.state_file, &state)?;
     }
     Ok((state, outcomes))
+}
+
+/// Apply all skill actions from the plan with cooperative
+/// cancellation and progress reporting.
+///
+/// Cancel checkpoints are at the row boundary only: before each
+/// row's `apply_one` (so a pre-cancel pass writes nothing for the
+/// row) and after each row commits (so a successful row is
+/// persisted before reporting the safe checkpoint). The row
+/// itself is **non-cancellable**: the Skills `Update` path runs
+/// the staged-tree backup/rename/recovery as one unit, and
+/// tearing it down mid-row would leave the install in a state
+/// the recovery path cannot roll back. The contract is the same
+/// as the spec: "No cancel inside skills two rename
+/// backup/publication/recovery".
+///
+/// Persistence: the row path persists exactly once per row (when
+/// a row actually changed `state`). The final legacy-style
+/// `write_state` is replaced by a per-row write that fires when
+/// `state != last_persisted`, so a cancelled run still has every
+/// completed row on disk. Manifest persistence failure is
+/// surfaced as `Finish::Failed` with the partial state and the
+/// explicit "manifest may have changed" message; no rollback
+/// and no further rows are run.
+pub fn apply_controlled(
+    paths: &Paths,
+    mut state: State,
+    items: Vec<SkillPlanItem>,
+    token: &CancelToken,
+    sink: &mut dyn FnMut(Progress),
+) -> OperationReport<(State, Vec<SkillOutcome>)> {
+    if let Err(e) = require_skills_source(paths) {
+        return OperationReport {
+            finish: Finish::Failed,
+            partial: (state, Vec::new()),
+            error: Some(e.to_string()),
+        };
+    }
+    let total = items.len();
+    let mut outcomes = Vec::new();
+    let mut last_persisted = state.clone();
+    for (idx, item) in items.into_iter().enumerate() {
+        if run_cancel_checked(
+            token,
+            sink,
+            Progress {
+                stage: "skills: row",
+                item: Some(item.name.clone()),
+                processed: idx,
+                total: Some(total),
+            },
+        ) {
+            return OperationReport {
+                finish: Finish::Cancelled,
+                partial: (state, outcomes),
+                error: Some("cancelled before row".to_string()),
+            };
+        }
+        let outcome = apply_one(paths, &mut state, item);
+        outcomes.push(outcome);
+        if state != last_persisted {
+            if let Err(e) = write_state(&paths.state_file, &state) {
+                return OperationReport {
+                    finish: Finish::Failed,
+                    partial: (state, outcomes),
+                    error: Some(format!(
+                        "skills manifest write failed after row; manifest may have changed and was not saved: {}",
+                        e
+                    )),
+                };
+            }
+            last_persisted = state.clone();
+        }
+    }
+    sink(Progress {
+        stage: "skills: row",
+        item: None,
+        processed: total,
+        total: Some(total),
+    });
+    OperationReport {
+        finish: Finish::Completed,
+        partial: (state, outcomes),
+        error: None,
+    }
 }
 
 /// Result of per-item source-side revalidation. `Present` carries

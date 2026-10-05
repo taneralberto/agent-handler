@@ -112,12 +112,19 @@ impl SettingsState {
         // user actively confirms or replaces the suggestion. The
         // hint is buffer text only; it is NOT auto-applied.
         let path_editing = initial.is_none() || recovery_error.is_some() || gated;
+        // `recovery_error` is the single source of truth for the
+        // stale-checkout banner: the constructor must NOT mirror it
+        // into `path_input.error`. Doing so would cause the renderer
+        // to emit the same banner twice (once as the recovery banner,
+        // once as a validation error). `path_input.error` is reserved
+        // for messages that arrive AFTER the screen opens — i.e. a
+        // validation error from a subsequent `apply_settings_path_input`.
         Self {
             gated,
             path_input: PathInputState {
                 initial: initial_snapshot,
                 buffer,
-                error: recovery_error.clone(),
+                error: None,
             },
             path_editing,
             status: None,

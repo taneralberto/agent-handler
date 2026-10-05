@@ -22,6 +22,7 @@ use super::{
     hash_file, require_canonical_source, sha256_hex, write_state, write_target, Paths, State,
 };
 use crate::agent::Agent;
+use crate::operation::{run_cancel_checked, CancelToken, Finish, OperationReport, Progress};
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -379,456 +380,7 @@ pub fn apply_safe(
     let mut targets_touched: HashSet<SyncTarget> = HashSet::new();
     for item in items {
         targets_touched.insert(item.target);
-        // The State's owned hash for this filename is the
-        // ground truth for who (if anyone) currently owns the
-        // target. The plan's `last_installed_hash` is a snapshot
-        // and may have drifted; every safe action compares them.
-        let manifest_hash = state.installed(item.target).get(&item.filename).cloned();
-        let snapshot = match revalidate_item(item.target, &item) {
-            Ok(s) => s,
-            Err(detail) => {
-                outcomes.push(ApplyOutcome {
-                    filename: item.filename.clone(),
-                    action: "error".to_string(),
-                    detail,
-                    ok: false,
-                });
-                continue;
-            }
-        };
-        // Conflict / Unowned rows never mutate state — they
-        // either need user review (Conflict / Unowned-with-file)
-        // or are stash markers the next plan will resolve
-        // (Unowned). PreserveModified is handled below because
-        // its only safe action is releasing ownership when the
-        // canonical is genuinely absent.
-        if !item.status.is_safe_action() {
-            if matches!(item.status, SyncStatus::PreserveModified) {
-                // `PreserveModified` releases ownership of a
-                // target the user has modified externally while
-                // canonical was absent. The only preconditions
-                // are that the canonical is still absent on
-                // disk (so the plan's `last_installed_hash`
-                // refers to genuine ownership the user
-                // invalidated by editing) AND the manifest has
-                // not drifted (so we are not silently dropping
-                // ownership the user just re-acquired through a
-                // concurrent adopt). The target file is never
-                // touched; the existing modification is
-                // preserved regardless of its current hash.
-                if matches!(snapshot.canonical_state, CanonicalState::Absent)
-                    && item.last_installed_hash.as_ref() == manifest_hash.as_ref()
-                {
-                    state.installed_mut(item.target).remove(&item.filename);
-                    outcomes.push(ApplyOutcome {
-                        filename: item.filename.clone(),
-                        action: "released".to_string(),
-                        detail: "removed stale ownership entry".to_string(),
-                        ok: true,
-                    });
-                } else {
-                    outcomes.push(ApplyOutcome {
-                        filename: item.filename.clone(),
-                        action: "skipped".to_string(),
-                        detail: format!(
-                            "{} changed since plan; refresh to re-plan",
-                            item.canonical_path.display()
-                        ),
-                        ok: true,
-                    });
-                }
-            } else {
-                outcomes.push(ApplyOutcome {
-                    filename: item.filename.clone(),
-                    action: "skipped".to_string(),
-                    detail: format!("status: {}", item.status.label()),
-                    ok: true,
-                });
-            }
-            continue;
-        }
-        // Manifest drift: the State's owned hash for this row
-        // and the plan's `last_installed_hash` must agree. If
-        // they disagree, the action's ownership precondition no
-        // longer holds and we refuse to proceed. This is the
-        // per-item snapshot-vs-State check the spec calls out:
-        // mismatch → retain ownership and surface a
-        // refresh/retry error.
-        if item.last_installed_hash.as_ref() != manifest_hash.as_ref() {
-            outcomes.push(ApplyOutcome {
-                filename: item.filename.clone(),
-                action: "error".to_string(),
-                detail: format!(
-                    "{} manifest drifted between plan and apply; refresh to re-plan",
-                    item.target_path.display()
-                ),
-                ok: false,
-            });
-            continue;
-        }
-        match item.status {
-            SyncStatus::NotInstalled => {
-                // `NotInstalled` requires (a) verified canonical
-                // bytes whose hash matches the snapshot and
-                // (b) the target absent on disk. If anything
-                // changed since plan we never overwrite.
-                let Some((bytes, hash)) = snapshot.canonical_bytes else {
-                    let detail = match snapshot.canonical_state {
-                        CanonicalState::PresentNotRegular => format!(
-                            "{} is not a regular file; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                        CanonicalState::Absent | CanonicalState::PresentRegular => format!(
-                            "{} disappeared after plan; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                    };
-                    outcomes.push(ApplyOutcome {
-                        filename: item.filename.clone(),
-                        action: "error".to_string(),
-                        detail,
-                        ok: false,
-                    });
-                    continue;
-                };
-                if Some(&hash) != item.canonical_hash.as_ref() {
-                    outcomes.push(ApplyOutcome {
-                        filename: item.filename.clone(),
-                        action: "error".to_string(),
-                        detail: format!(
-                            "{} changed since plan; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                        ok: false,
-                    });
-                    continue;
-                }
-                match &snapshot.target_state {
-                    TargetState::Absent => {}
-                    TargetState::NotRegular => {
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} is not a regular file; refusing to overwrite",
-                                item.target_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                    TargetState::Regular { .. } => {
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} appeared after plan; refresh to re-plan",
-                                item.target_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                }
-                write_or_record(&mut state, &item, &bytes, &hash, "installed", &mut outcomes);
-            }
-            SyncStatus::UpdateAvailable => {
-                // `UpdateAvailable` requires verified source
-                // bytes whose hash matches the snapshot, AND
-                // the live target must equal the snapshot's
-                // `target_hash` (== `last_installed_hash`) so
-                // we know we are not overwriting an externally
-                // edited file.
-                let Some((bytes, hash)) = snapshot.canonical_bytes else {
-                    let detail = match snapshot.canonical_state {
-                        CanonicalState::PresentNotRegular => format!(
-                            "{} is not a regular file; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                        CanonicalState::Absent | CanonicalState::PresentRegular => format!(
-                            "{} disappeared after plan; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                    };
-                    outcomes.push(ApplyOutcome {
-                        filename: item.filename.clone(),
-                        action: "error".to_string(),
-                        detail,
-                        ok: false,
-                    });
-                    continue;
-                };
-                if Some(&hash) != item.canonical_hash.as_ref() {
-                    outcomes.push(ApplyOutcome {
-                        filename: item.filename.clone(),
-                        action: "error".to_string(),
-                        detail: format!(
-                            "{} changed since plan; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                        ok: false,
-                    });
-                    continue;
-                }
-                match &snapshot.target_state {
-                    TargetState::Regular { hash: current } => {
-                        if Some(current) != item.target_hash.as_ref() {
-                            outcomes.push(ApplyOutcome {
-                                filename: item.filename.clone(),
-                                action: "error".to_string(),
-                                detail: format!(
-                                    "{} changed since plan; refresh to re-plan",
-                                    item.target_path.display()
-                                ),
-                                ok: false,
-                            });
-                            continue;
-                        }
-                        if Some(current) != item.last_installed_hash.as_ref() {
-                            outcomes.push(ApplyOutcome {
-                                filename: item.filename.clone(),
-                                action: "error".to_string(),
-                                detail: format!(
-                                    "{} was modified externally; refusing to overwrite",
-                                    item.target_path.display()
-                                ),
-                                ok: false,
-                            });
-                            continue;
-                        }
-                    }
-                    TargetState::NotRegular => {
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} is not a regular file; refusing to overwrite",
-                                item.target_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                    TargetState::Absent => {
-                        // Target vanished between plan and apply;
-                        // the snapshot said `UpdateAvailable`
-                        // but the live filesystem is
-                        // `NotInstalled`. Refuse: a stale
-                        // `UpdateAvailable` row must never
-                        // silently become an install, because
-                        // the user's last-installed hash is
-                        // gone with the target and any owner
-                        // check now overwrites something the
-                        // user did not consent to install.
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} vanished after plan; refresh to re-plan",
-                                item.target_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                }
-                write_or_record(&mut state, &item, &bytes, &hash, "updated", &mut outcomes);
-            }
-            SyncStatus::UpToDate => {
-                // `UpToDate` adopts ownership on disk evidence:
-                // the source still matches the snapshot and the
-                // target is still the regular file whose hash
-                // matches the plan's `target_hash`.
-                let Some((_bytes, hash)) = snapshot.canonical_bytes else {
-                    let detail = match snapshot.canonical_state {
-                        CanonicalState::PresentNotRegular => format!(
-                            "{} is not a regular file; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                        CanonicalState::Absent | CanonicalState::PresentRegular => format!(
-                            "{} disappeared after plan; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                    };
-                    outcomes.push(ApplyOutcome {
-                        filename: item.filename.clone(),
-                        action: "error".to_string(),
-                        detail,
-                        ok: false,
-                    });
-                    continue;
-                };
-                if Some(&hash) != item.canonical_hash.as_ref() {
-                    outcomes.push(ApplyOutcome {
-                        filename: item.filename.clone(),
-                        action: "error".to_string(),
-                        detail: format!(
-                            "{} changed since plan; refresh and retry",
-                            item.canonical_path.display()
-                        ),
-                        ok: false,
-                    });
-                    continue;
-                }
-                match &snapshot.target_state {
-                    TargetState::Regular { hash: current } => {
-                        if Some(current) != item.target_hash.as_ref() {
-                            outcomes.push(ApplyOutcome {
-                                filename: item.filename.clone(),
-                                action: "error".to_string(),
-                                detail: format!(
-                                    "{} changed since plan; refresh to re-plan",
-                                    item.target_path.display()
-                                ),
-                                ok: false,
-                            });
-                            continue;
-                        }
-                    }
-                    TargetState::NotRegular => {
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} is not a regular file; refresh to re-plan",
-                                item.target_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                    TargetState::Absent => {
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} vanished after plan; refresh to re-plan",
-                                item.target_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                }
-                // Manifest already agrees with the snapshot
-                // (drift check above). Re-insert the verified
-                // source hash so a tampered manifest snapshot
-                // gets corrected to the live canonical.
-                state
-                    .installed_mut(item.target)
-                    .insert(item.filename.clone(), hash);
-                outcomes.push(ApplyOutcome {
-                    filename: item.filename.clone(),
-                    action: "kept".to_string(),
-                    detail: "already in sync".to_string(),
-                    ok: true,
-                });
-            }
-            SyncStatus::Remove => {
-                // `Remove` requires (a) verified canonical
-                // absence (or non-regular source we refuse to
-                // trust), AND (b) a live target whose hash
-                // matches the snapshot's `target_hash` AND the
-                // manifest's owned hash. A stale Remove must
-                // never overwrite or delete a target that has
-                // since been externally modified or vanished.
-                match snapshot.canonical_state {
-                    CanonicalState::Absent => {}
-                    CanonicalState::PresentNotRegular => {
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} is not a regular file; refresh to re-plan",
-                                item.canonical_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                    CanonicalState::PresentRegular => {
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} reappeared after plan; refresh to re-plan",
-                                item.canonical_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                }
-                match &snapshot.target_state {
-                    TargetState::Absent => {
-                        state.installed_mut(item.target).remove(&item.filename);
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "removed".to_string(),
-                            detail: format!("already absent: {}", item.target_path.display()),
-                            ok: true,
-                        });
-                        continue;
-                    }
-                    TargetState::NotRegular => {
-                        outcomes.push(ApplyOutcome {
-                            filename: item.filename.clone(),
-                            action: "error".to_string(),
-                            detail: format!(
-                                "{} is not a regular file; refresh to re-plan",
-                                item.target_path.display()
-                            ),
-                            ok: false,
-                        });
-                        continue;
-                    }
-                    TargetState::Regular { hash: current } => {
-                        if Some(current) != item.target_hash.as_ref() {
-                            outcomes.push(ApplyOutcome {
-                                filename: item.filename.clone(),
-                                action: "error".to_string(),
-                                detail: format!(
-                                    "{} changed since plan; refresh to re-plan",
-                                    item.target_path.display()
-                                ),
-                                ok: false,
-                            });
-                            continue;
-                        }
-                        if Some(current) != item.last_installed_hash.as_ref() {
-                            outcomes.push(ApplyOutcome {
-                                filename: item.filename.clone(),
-                                action: "error".to_string(),
-                                detail: format!(
-                                    "{} was modified externally; refusing to remove",
-                                    item.target_path.display()
-                                ),
-                                ok: false,
-                            });
-                            continue;
-                        }
-                        match fs::remove_file(&item.target_path) {
-                            Ok(()) => {
-                                state.installed_mut(item.target).remove(&item.filename);
-                                outcomes.push(ApplyOutcome {
-                                    filename: item.filename.clone(),
-                                    action: "removed".to_string(),
-                                    detail: format!("removed {}", item.target_path.display()),
-                                    ok: true,
-                                });
-                            }
-                            Err(e) => outcomes.push(ApplyOutcome {
-                                filename: item.filename.clone(),
-                                action: "error".to_string(),
-                                detail: format!("remove {}: {}", item.target_path.display(), e),
-                                ok: false,
-                            }),
-                        }
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
+        apply_one_row(&item, &mut state, &mut outcomes);
     }
     // Manifest cleanup is scoped to the targets the caller
     // actually planned (per-target isolation) and to rows
@@ -846,6 +398,600 @@ pub fn apply_safe(
         write_state(&paths.state_file, &state)?;
     }
     Ok((state, outcomes))
+}
+
+/// Apply all safe actions from the plan with cooperative
+/// cancellation and progress reporting.
+///
+/// Cancel checkpoints are at the row boundary only: before each
+/// row's `revalidate_item` (so a pre-cancel pass writes nothing
+/// for the row), and after each row's `apply_one_row` (so a
+/// successful row is persisted before reporting the safe
+/// checkpoint). Cancellation is **not** observed inside an in-flight
+/// row — `apply_one_row` mutates `state` and writes files, and
+/// tearing it down mid-row would violate the row's atomic
+/// guarantees. A late cancel that arrives after the last row
+/// already committed is honored as `Completed` (the work is
+/// already done; we never report a no-op run as cancelled).
+///
+/// On cancellation the global target-cleanup pass (the `retain`
+/// over `state.installed_mut(target)` in [`apply_safe`]) is
+/// **omitted** — a concurrent cancel between rows must not sweep
+/// pending rows whose canonical/target might still resolve on a
+/// re-plan. Only the per-row state mutations done so far are
+/// persisted, and the report returns `Finish::Cancelled` with the
+/// full partial state and outcomes so the caller can present
+/// them. On a full run the cleanup + single-write state pass
+/// matches [`apply_safe`] exactly so the observable behavior is
+/// preserved.
+///
+/// Persistence: the row path persists exactly once per row (when
+/// a row actually changed `state`). The final legacy-style
+/// `write_state` is replaced by a per-row write that fires when
+/// `state != original_state` immediately after the row commits,
+/// so a cancelled run still has every completed row on disk.
+/// Manifest persistence failure is surfaced as `Finish::Failed`
+/// with the partial state and the explicit "manifest may have
+/// changed" message; no rollback and no further rows are run.
+pub fn apply_safe_controlled(
+    paths: &Paths,
+    mut state: State,
+    items: Vec<SyncItem>,
+    token: &CancelToken,
+    sink: &mut dyn FnMut(Progress),
+) -> OperationReport<(State, Vec<ApplyOutcome>)> {
+    let total = items.len();
+    if let Err(detail) = require_canonical_source(paths) {
+        return OperationReport {
+            finish: Finish::Failed,
+            partial: (state, Vec::new()),
+            error: Some(detail.to_string()),
+        };
+    }
+    let mut outcomes = Vec::new();
+    let mut last_persisted = state.clone();
+    // Track the targets the caller planned so the
+    // Completed path can run the per-target `retain`
+    // cleanup pass the legacy `apply_safe` performs.
+    // Cancellation skips this cleanup — a stale snapshot
+    // row that errored keeps its entry, and the next plan
+    // will reclassify it on its own.
+    let mut targets_touched: HashSet<SyncTarget> = HashSet::new();
+    for (idx, item) in items.into_iter().enumerate() {
+        targets_touched.insert(item.target);
+        // Pre-row checkpoint: honor cancel, emit progress,
+        // only then enter `apply_one_row`. A pre-cancel
+        // pass writes nothing for the row.
+        if run_cancel_checked(
+            token,
+            sink,
+            Progress {
+                stage: "agents: row",
+                item: Some(item.filename.clone()),
+                processed: idx,
+                total: Some(total),
+            },
+        ) {
+            return OperationReport {
+                finish: Finish::Cancelled,
+                partial: (state, outcomes),
+                error: Some("cancelled before row".to_string()),
+            };
+        }
+        apply_one_row(&item, &mut state, &mut outcomes);
+        // Post-row checkpoint: persist if state actually
+        // changed. The Completed cleanup below adds the
+        // legacy per-target retain pass.
+        if state != last_persisted {
+            if let Err(e) = write_state(&paths.state_file, &state) {
+                return OperationReport {
+                    finish: Finish::Failed,
+                    partial: (state, outcomes),
+                    error: Some(format!(
+                        "{} manifest write failed after row {}; manifest may have changed and was not saved: {}",
+                        item.target_path.display(),
+                        item.filename,
+                        e
+                    )),
+                };
+            }
+            last_persisted = state.clone();
+        }
+    }
+    // Final progress tick so UIs that key off
+    // `processed == total` can settle before the Completed
+    // report.
+    sink(Progress {
+        stage: "agents: row",
+        item: None,
+        processed: total,
+        total: Some(total),
+    });
+    // Completed-only cleanup pass: drop owned manifest
+    // entries whose canonical AND target files are both
+    // absent on disk — matches the legacy `apply_safe`
+    // exactly for the rows the caller actually processed.
+    // Skipped on cancellation.
+    for target in &targets_touched {
+        let target_dir = target.dir(paths);
+        state.installed_mut(*target).retain(|name, _| {
+            target_dir.join(name).exists() || paths.canonical_dir.join(name).exists()
+        });
+    }
+    if state != last_persisted {
+        if let Err(e) = write_state(&paths.state_file, &state) {
+            return OperationReport {
+                finish: Finish::Failed,
+                partial: (state, outcomes),
+                error: Some(format!(
+                    "{} final manifest write failed; manifest may have changed and was not saved: {}",
+                    paths.state_file.display(),
+                    e
+                )),
+            };
+        }
+    }
+    OperationReport {
+        finish: Finish::Completed,
+        partial: (state, outcomes),
+        error: None,
+    }
+}
+
+/// Apply one `SyncItem` to `state`, appending the resulting
+/// `ApplyOutcome` to `outcomes`. Shared by [`apply_safe`] (legacy)
+/// and [`apply_safe_controlled`] (cooperative cancel) so the row
+/// logic lives in one place; the wrappers only differ in how
+/// they wrap the loop and persist the result.
+fn apply_one_row(item: &SyncItem, state: &mut State, outcomes: &mut Vec<ApplyOutcome>) {
+    // The State's owned hash for this filename is the
+    // ground truth for who (if anyone) currently owns the
+    // target. The plan's `last_installed_hash` is a snapshot
+    // and may have drifted; every safe action compares them.
+    let manifest_hash = state.installed(item.target).get(&item.filename).cloned();
+    let snapshot = match revalidate_item(item.target, item) {
+        Ok(s) => s,
+        Err(detail) => {
+            outcomes.push(ApplyOutcome {
+                filename: item.filename.clone(),
+                action: "error".to_string(),
+                detail,
+                ok: false,
+            });
+            return;
+        }
+    };
+    // Conflict / Unowned rows never mutate state — they
+    // either need user review (Conflict / Unowned-with-file)
+    // or are stash markers the next plan will resolve
+    // (Unowned). PreserveModified is handled below because
+    // its only safe action is releasing ownership when the
+    // canonical is genuinely absent.
+    if !item.status.is_safe_action() {
+        if matches!(item.status, SyncStatus::PreserveModified) {
+            // `PreserveModified` releases ownership of a
+            // target the user has modified externally while
+            // canonical was absent. The only preconditions
+            // are that the canonical is still absent on
+            // disk (so the plan's `last_installed_hash`
+            // refers to genuine ownership the user
+            // invalidated by editing) AND the manifest has
+            // not drifted (so we are not silently dropping
+            // ownership the user just re-acquired through a
+            // concurrent adopt). The target file is never
+            // touched; the existing modification is
+            // preserved regardless of its current hash.
+            if matches!(snapshot.canonical_state, CanonicalState::Absent)
+                && item.last_installed_hash.as_ref() == manifest_hash.as_ref()
+            {
+                state.installed_mut(item.target).remove(&item.filename);
+                outcomes.push(ApplyOutcome {
+                    filename: item.filename.clone(),
+                    action: "released".to_string(),
+                    detail: "removed stale ownership entry".to_string(),
+                    ok: true,
+                });
+            } else {
+                outcomes.push(ApplyOutcome {
+                    filename: item.filename.clone(),
+                    action: "skipped".to_string(),
+                    detail: format!(
+                        "{} changed since plan; refresh to re-plan",
+                        item.canonical_path.display()
+                    ),
+                    ok: true,
+                });
+            }
+        } else {
+            outcomes.push(ApplyOutcome {
+                filename: item.filename.clone(),
+                action: "skipped".to_string(),
+                detail: format!("status: {}", item.status.label()),
+                ok: true,
+            });
+        }
+        return;
+    }
+    // Manifest drift: the State's owned hash for this row
+    // and the plan's `last_installed_hash` must agree. If
+    // they disagree, the action's ownership precondition no
+    // longer holds and we refuse to proceed. This is the
+    // per-item snapshot-vs-State check the spec calls out:
+    // mismatch → retain ownership and surface a
+    // refresh/retry error.
+    if item.last_installed_hash.as_ref() != manifest_hash.as_ref() {
+        outcomes.push(ApplyOutcome {
+            filename: item.filename.clone(),
+            action: "error".to_string(),
+            detail: format!(
+                "{} manifest drifted between plan and apply; refresh to re-plan",
+                item.target_path.display()
+            ),
+            ok: false,
+        });
+        return;
+    }
+    match item.status {
+        SyncStatus::NotInstalled => {
+            // `NotInstalled` requires (a) verified canonical
+            // bytes whose hash matches the snapshot and
+            // (b) the target absent on disk. If anything
+            // changed since plan we never overwrite.
+            let Some((bytes, hash)) = snapshot.canonical_bytes else {
+                let detail = match snapshot.canonical_state {
+                    CanonicalState::PresentNotRegular => format!(
+                        "{} is not a regular file; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                    CanonicalState::Absent | CanonicalState::PresentRegular => format!(
+                        "{} disappeared after plan; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                };
+                outcomes.push(ApplyOutcome {
+                    filename: item.filename.clone(),
+                    action: "error".to_string(),
+                    detail,
+                    ok: false,
+                });
+                return;
+            };
+            if Some(&hash) != item.canonical_hash.as_ref() {
+                outcomes.push(ApplyOutcome {
+                    filename: item.filename.clone(),
+                    action: "error".to_string(),
+                    detail: format!(
+                        "{} changed since plan; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                    ok: false,
+                });
+                return;
+            }
+            match &snapshot.target_state {
+                TargetState::Absent => {}
+                TargetState::NotRegular => {
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} is not a regular file; refusing to overwrite",
+                            item.target_path.display()
+                        ),
+                        ok: false,
+                    });
+                    return;
+                }
+                TargetState::Regular { .. } => {
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} appeared after plan; refresh to re-plan",
+                            item.target_path.display()
+                        ),
+                        ok: false,
+                    });
+                    return;
+                }
+            }
+            write_or_record(state, item, &bytes, &hash, "installed", outcomes);
+        }
+        SyncStatus::UpdateAvailable => {
+            // `UpdateAvailable` requires verified source
+            // bytes whose hash matches the snapshot, AND
+            // the live target must equal the snapshot's
+            // `target_hash` (== `last_installed_hash`) so
+            // we know we are not overwriting an externally
+            // edited file.
+            let Some((bytes, hash)) = snapshot.canonical_bytes else {
+                let detail = match snapshot.canonical_state {
+                    CanonicalState::PresentNotRegular => format!(
+                        "{} is not a regular file; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                    CanonicalState::Absent | CanonicalState::PresentRegular => format!(
+                        "{} disappeared after plan; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                };
+                outcomes.push(ApplyOutcome {
+                    filename: item.filename.clone(),
+                    action: "error".to_string(),
+                    detail,
+                    ok: false,
+                });
+                return;
+            };
+            if Some(&hash) != item.canonical_hash.as_ref() {
+                outcomes.push(ApplyOutcome {
+                    filename: item.filename.clone(),
+                    action: "error".to_string(),
+                    detail: format!(
+                        "{} changed since plan; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                    ok: false,
+                });
+                return;
+            }
+            match &snapshot.target_state {
+                TargetState::Regular { hash: current } => {
+                    if Some(current) != item.target_hash.as_ref() {
+                        outcomes.push(ApplyOutcome {
+                            filename: item.filename.clone(),
+                            action: "error".to_string(),
+                            detail: format!(
+                                "{} changed since plan; refresh to re-plan",
+                                item.target_path.display()
+                            ),
+                            ok: false,
+                        });
+                        return;
+                    }
+                    if Some(current) != item.last_installed_hash.as_ref() {
+                        outcomes.push(ApplyOutcome {
+                            filename: item.filename.clone(),
+                            action: "error".to_string(),
+                            detail: format!(
+                                "{} was modified externally; refusing to overwrite",
+                                item.target_path.display()
+                            ),
+                            ok: false,
+                        });
+                        return;
+                    }
+                }
+                TargetState::NotRegular => {
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} is not a regular file; refusing to overwrite",
+                            item.target_path.display()
+                        ),
+                        ok: false,
+                    });
+                    return;
+                }
+                TargetState::Absent => {
+                    // Target vanished between plan and apply;
+                    // the snapshot said `UpdateAvailable`
+                    // but the live filesystem is
+                    // `NotInstalled`. Refuse: a stale
+                    // `UpdateAvailable` row must never
+                    // silently become an install, because
+                    // the user's last-installed hash is
+                    // gone with the target and any owner
+                    // check now overwrites something the
+                    // user did not consent to install.
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} vanished after plan; refresh to re-plan",
+                            item.target_path.display()
+                        ),
+                        ok: false,
+                    });
+                    return;
+                }
+            }
+            write_or_record(state, item, &bytes, &hash, "updated", outcomes);
+        }
+        SyncStatus::UpToDate => {
+            // `UpToDate` adopts ownership on disk evidence:
+            // the source still matches the snapshot and the
+            // target is still the regular file whose hash
+            // matches the plan's `target_hash`.
+            let Some((_bytes, hash)) = snapshot.canonical_bytes else {
+                let detail = match snapshot.canonical_state {
+                    CanonicalState::PresentNotRegular => format!(
+                        "{} is not a regular file; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                    CanonicalState::Absent | CanonicalState::PresentRegular => format!(
+                        "{} disappeared after plan; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                };
+                outcomes.push(ApplyOutcome {
+                    filename: item.filename.clone(),
+                    action: "error".to_string(),
+                    detail,
+                    ok: false,
+                });
+                return;
+            };
+            if Some(&hash) != item.canonical_hash.as_ref() {
+                outcomes.push(ApplyOutcome {
+                    filename: item.filename.clone(),
+                    action: "error".to_string(),
+                    detail: format!(
+                        "{} changed since plan; refresh and retry",
+                        item.canonical_path.display()
+                    ),
+                    ok: false,
+                });
+                return;
+            }
+            match &snapshot.target_state {
+                TargetState::Regular { hash: current } => {
+                    if Some(current) != item.target_hash.as_ref() {
+                        outcomes.push(ApplyOutcome {
+                            filename: item.filename.clone(),
+                            action: "error".to_string(),
+                            detail: format!(
+                                "{} changed since plan; refresh to re-plan",
+                                item.target_path.display()
+                            ),
+                            ok: false,
+                        });
+                        return;
+                    }
+                }
+                TargetState::NotRegular => {
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} is not a regular file; refresh to re-plan",
+                            item.target_path.display()
+                        ),
+                        ok: false,
+                    });
+                    return;
+                }
+                TargetState::Absent => {
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} vanished after plan; refresh to re-plan",
+                            item.target_path.display()
+                        ),
+                        ok: false,
+                    });
+                    return;
+                }
+            }
+            // Manifest already agrees with the snapshot
+            // (drift check above). Re-insert the verified
+            // source hash so a tampered manifest snapshot
+            // gets corrected to the live canonical.
+            state
+                .installed_mut(item.target)
+                .insert(item.filename.clone(), hash);
+            outcomes.push(ApplyOutcome {
+                filename: item.filename.clone(),
+                action: "kept".to_string(),
+                detail: "already in sync".to_string(),
+                ok: true,
+            });
+        }
+        SyncStatus::Remove => {
+            // `Remove` requires (a) verified canonical
+            // absence (or non-regular source we refuse to
+            // trust), AND (b) a live target whose hash
+            // matches the snapshot's `target_hash` AND the
+            // manifest's owned hash. A stale Remove must
+            // never overwrite or delete a target that has
+            // since been externally modified or vanished.
+            match snapshot.canonical_state {
+                CanonicalState::Absent => {}
+                CanonicalState::PresentNotRegular => {
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} is not a regular file; refresh to re-plan",
+                            item.canonical_path.display()
+                        ),
+                        ok: false,
+                    });
+                    return;
+                }
+                CanonicalState::PresentRegular => {
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} reappeared after plan; refresh to re-plan",
+                            item.canonical_path.display()
+                        ),
+                        ok: false,
+                    });
+                    return;
+                }
+            }
+            match &snapshot.target_state {
+                TargetState::Absent => {
+                    state.installed_mut(item.target).remove(&item.filename);
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "removed".to_string(),
+                        detail: format!("already absent: {}", item.target_path.display()),
+                        ok: true,
+                    });
+                }
+                TargetState::NotRegular => {
+                    outcomes.push(ApplyOutcome {
+                        filename: item.filename.clone(),
+                        action: "error".to_string(),
+                        detail: format!(
+                            "{} is not a regular file; refresh to re-plan",
+                            item.target_path.display()
+                        ),
+                        ok: false,
+                    });
+                }
+                TargetState::Regular { hash: current } => {
+                    if Some(current) != item.target_hash.as_ref() {
+                        outcomes.push(ApplyOutcome {
+                            filename: item.filename.clone(),
+                            action: "error".to_string(),
+                            detail: format!(
+                                "{} changed since plan; refresh to re-plan",
+                                item.target_path.display()
+                            ),
+                            ok: false,
+                        });
+                        return;
+                    }
+                    if Some(current) != item.last_installed_hash.as_ref() {
+                        outcomes.push(ApplyOutcome {
+                            filename: item.filename.clone(),
+                            action: "error".to_string(),
+                            detail: format!(
+                                "{} was modified externally; refusing to remove",
+                                item.target_path.display()
+                            ),
+                            ok: false,
+                        });
+                        return;
+                    }
+                    match fs::remove_file(&item.target_path) {
+                        Ok(()) => {
+                            state.installed_mut(item.target).remove(&item.filename);
+                            outcomes.push(ApplyOutcome {
+                                filename: item.filename.clone(),
+                                action: "removed".to_string(),
+                                detail: format!("removed {}", item.target_path.display()),
+                                ok: true,
+                            });
+                        }
+                        Err(e) => outcomes.push(ApplyOutcome {
+                            filename: item.filename.clone(),
+                            action: "error".to_string(),
+                            detail: format!("remove {}: {}", item.target_path.display(), e),
+                            ok: false,
+                        }),
+                    }
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
 }
 
 /// Per-item live snapshot. Holds exactly the verified observations

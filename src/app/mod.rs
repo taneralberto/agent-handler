@@ -1802,7 +1802,14 @@ mod tests {
                 assert!(state.gated, "recovery must remain gated");
                 assert!(state.path_editing, "recovery must open the editor");
                 assert_eq!(state.recovery_error.as_deref(), Some(banner.as_str()));
-                assert_eq!(state.path_input.error.as_deref(), Some(banner.as_str()));
+                // The banner is the single source of truth on open;
+                // `path_input.error` is reserved for post-Enter validation
+                // messages and must NOT mirror the recovery banner
+                // (otherwise the renderer would display the banner twice).
+                assert!(
+                    state.path_input.error.is_none(),
+                    "recovery banner must not be mirrored into path_input.error"
+                );
             }
             screen => panic!("expected Settings screen, got {screen:?}"),
         }
@@ -1818,6 +1825,33 @@ mod tests {
             }
             _ => unreachable!(),
         }
+
+        // Submitting an invalid (non-absolute) path surfaces a
+        // validation message into `path_input.error` while the
+        // recovery banner stays put — the banner must NOT be
+        // duplicated into the new error.
+        for c in "relative/path".chars() {
+            let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        match &app.screen {
+            Screen::Settings { state } => {
+                assert_eq!(state.recovery_error.as_deref(), Some(banner.as_str()));
+                let validation = state
+                    .path_input
+                    .error
+                    .as_deref()
+                    .expect("validation error must land in path_input.error after Enter");
+                assert!(
+                    !validation.contains(&banner),
+                    "the validation message must not re-state the recovery banner"
+                );
+            }
+            _ => panic!("expected Settings screen"),
+        }
+
+        // Clear the bogus buffer before typing the valid path.
+        let _ = app.handle_settings_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
 
         // Typing a valid path and applying drops the banner and
         // clears the editor.
@@ -1976,9 +2010,14 @@ mod tests {
                     stale.to_string_lossy().into_owned(),
                     "recovery must restore the stored invalid path into the buffer"
                 );
-                // The banner is the visible error.
+                // The banner is the visible error and is the single
+                // source of truth on open; `path_input.error` stays
+                // None so the renderer does not display the banner twice.
                 assert_eq!(state.recovery_error.as_deref(), Some(banner.as_str()));
-                assert_eq!(state.path_input.error.as_deref(), Some(banner.as_str()));
+                assert!(
+                    state.path_input.error.is_none(),
+                    "recovery banner must not be mirrored into path_input.error"
+                );
                 // Esc on the editor in recovery mode keeps the
                 // banner and stays in edit mode; the user must
                 // pick a real path before leaving.

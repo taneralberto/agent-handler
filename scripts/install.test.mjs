@@ -10,7 +10,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -75,6 +75,26 @@ async function runMain({ repo, argv = [], runner, platformName, env = {} } = {})
     repoRootAbs: repo ?? fakeRepo(),
   });
 }
+
+test("root npm install:global delegates to the paired installer with force and forwarded root", async (t) => {
+  const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(manifest.scripts["install:global"], "node scripts/install.mjs --force");
+  assert.equal(manifest.private, true);
+  const repo = fakeRepo();
+  t.after(() => rmSync(repo, { recursive: true, force: true }));
+  const root = join(repo, "portable root");
+  const argv = [...manifest.scripts["install:global"].split(" ").slice(2), "--root", root];
+  assert.deepEqual(parseArgs(argv), { help: false, force: true, root });
+  const runner = capturingRunner();
+  assert.equal(await runMain({ repo, argv, runner, env: { CARGO_INSTALL_ROOT: "/ignored" } }), 0);
+  const installs = runner.records.filter((record) => record.cmd === "cargo" && record.npmArgv[0] === "install");
+  assert.equal(installs.length, 2);
+  for (const install of installs) {
+    assert.equal(install.npmArgv[install.npmArgv.indexOf("--root") + 1], root);
+    assert.ok(install.npmArgv.includes("--force"));
+  }
+  assert.ok(installs[1].npmArgv.includes("custom-protocol"));
+});
 
 // ---------- parser ----------
 

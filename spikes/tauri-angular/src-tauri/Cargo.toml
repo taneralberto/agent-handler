@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "D1 spike: Tauri v2 + Angular prototype that depends on the agenthd library by path."
 authors = ["agenthd spike"]
 edition = "2021"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -48,6 +49,20 @@ agenthd = { path = "../../.." }
 # for the read-only commands below (no fs / no shell / no
 # dialog / no opener). Anything that would mutate the host
 # filesystem or spawn processes is intentionally absent.
+#
+# D3 long-job surface (2026-10-04 block): the new
+# `agenthd-operation` event is delivered through the
+# built-in `core:default` permission (the v2 runtime's
+# `listen` / `unlisten`); no extra plugin permission
+# is required and no new Tauri dependency is added.
+# The registry / `OperationRequest` / `CurrentView`
+# types live in `src/jobs.rs` and the lib re-export
+# is unchanged. The `Arc<OperationRegistry>` is
+# threaded through `tauri::Builder::manage(...)` and
+# pulled back via `app.state::<Arc<OperationRegistry>>()`
+# from each command; the worker threads use
+# `std::thread::Builder::spawn`, not a Tauri-managed
+# task, so the runtime is not extended either.
 tauri = { version = "2", features = [] }
 
 # We re-export a few agenthd types to the frontend via serde.

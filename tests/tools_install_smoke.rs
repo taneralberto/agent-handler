@@ -21,6 +21,8 @@
 
 #[path = "../src/agent.rs"]
 mod agent;
+#[path = "../src/operation.rs"]
+mod operation;
 #[path = "../src/store/mod.rs"]
 mod store;
 #[path = "../src/tools/mod.rs"]

@@ -27,6 +27,7 @@
 pub mod agent;
 pub mod launcher;
 pub mod models;
+pub mod operation;
 pub mod store;
 pub mod tools;
 pub mod workflows;

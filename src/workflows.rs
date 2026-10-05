@@ -76,10 +76,12 @@
 //!    with `"save: "`, matching the inline TUI text exactly.
 
 use crate::agent::Agent;
+use crate::operation::{CancelToken, Finish, OperationReport, Progress};
 use crate::store::{
-    apply_safe, apply_skills, canonical_dir_from, hash_file, load_canonical, load_settings,
-    plan_for, plan_skills, rename_canonical, save_canonical, save_settings, validate_checkout_path,
-    ApplyOutcome, Paths, Settings, SkillOutcome, State, SyncTarget,
+    apply_safe, apply_safe_controlled, apply_skills, apply_skills_controlled, canonical_dir_from,
+    hash_file, load_canonical, load_settings, plan_for, plan_skills, rename_canonical,
+    save_canonical, save_settings, validate_checkout_path, ApplyOutcome, Paths, Settings,
+    SkillOutcome, State, SyncTarget,
 };
 use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
@@ -342,6 +344,146 @@ pub fn plan_then_apply_agents_safe(
     }
     let (new_state, outcomes) = apply_safe(paths, state, plan)?;
     Ok(Some((new_state, outcomes)))
+}
+
+/// Per-target safe-install orchestration with cooperative
+/// cancellation and progress reporting.
+///
+/// Three checkpoints, in order:
+///
+/// 1. **Initial checkpoint** — fires before any source/target
+///    read. A cancel here is honored before any disk IO and
+///    returns `Finish::Cancelled` with the unchanged freshly-loaded
+///    `State`. This is the GUI's chance to abort a queued run
+///    without ever touching the source tree.
+/// 2. **Existing canonical validation + replan** — the same
+///    `load_canonical` + `plan_for` chain
+///    [`plan_then_apply_agents_safe`] uses; this is a
+///    **non-cancellable** unit by contract (planning/reading the
+///    tree is cheap and atomic enough that introducing a cancel
+///    seam here would just race with the tree walk itself). A
+///    failure here returns `Finish::Failed` with the partial
+///    state.
+/// 3. **Apply controlled** — [`apply_safe_controlled`] handles
+///    the per-row cancel checks. An empty plan short-circuits
+///    between checkpoints 2 and 3 with `Finish::Completed` and no
+///    disk write.
+///
+/// Returns an [`OperationReport`] whose `partial` is the fresh
+/// `(State, Vec<ApplyOutcome>)` pair. On `Finish::Failed` or
+/// `Finish::Cancelled` the caller is expected to keep the partial
+/// state and refresh its UI; the workflow does not roll back or
+/// surface legacy-style `Result::Err` for cooperative cancellation.
+pub fn plan_then_apply_agents_safe_controlled(
+    paths: &Paths,
+    state: State,
+    target: SyncTarget,
+    token: &CancelToken,
+    sink: &mut dyn FnMut(Progress),
+) -> OperationReport<(State, Vec<ApplyOutcome>)> {
+    // Initial checkpoint.
+    if token.is_requested() {
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (state, Vec::new()),
+            error: Some("cancelled before plan".to_string()),
+        };
+    }
+    sink(Progress {
+        stage: "agents: plan",
+        item: None,
+        processed: 0,
+        total: None,
+    });
+    // Fail closed on the canonical source BEFORE any target-side
+    // read. The configured checkout has to be a real directory
+    // with parseable agent files; without that guard the planner
+    // could otherwise produce a `Remove` row that `apply_safe`
+    // would later honor (silently deleting an installed target)
+    // even though the source has vanished.
+    if let Err(e) = load_canonical(paths) {
+        return OperationReport {
+            finish: Finish::Failed,
+            partial: (state, Vec::new()),
+            error: Some(e.to_string()),
+        };
+    }
+    // Replan from disk before deciding whether to apply.
+    let plan = match plan_for(paths, &state, target) {
+        Ok(p) => p,
+        Err(e) => {
+            return OperationReport {
+                finish: Finish::Failed,
+                partial: (state, Vec::new()),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+    if plan.is_empty() {
+        sink(Progress {
+            stage: "agents: plan",
+            item: None,
+            processed: 0,
+            total: Some(0),
+        });
+        return OperationReport {
+            finish: Finish::Completed,
+            partial: (state, Vec::new()),
+            error: None,
+        };
+    }
+    apply_safe_controlled(paths, state, plan, token, sink)
+}
+
+/// Skills-install orchestration with cooperative cancellation and
+/// progress reporting. Mirrors [`plan_then_apply_agents_safe_controlled`]:
+/// initial checkpoint → canonical validation + replan →
+/// apply_controlled. Planning/reading the skills tree is a
+/// non-cancellable unit by contract; the row cancel seam lives in
+/// [`apply_skills_controlled`].
+pub fn plan_then_apply_skills_controlled(
+    paths: &Paths,
+    state: State,
+    token: &CancelToken,
+    sink: &mut dyn FnMut(Progress),
+) -> OperationReport<(State, Vec<SkillOutcome>)> {
+    if token.is_requested() {
+        return OperationReport {
+            finish: Finish::Cancelled,
+            partial: (state, Vec::new()),
+            error: Some("cancelled before plan".to_string()),
+        };
+    }
+    sink(Progress {
+        stage: "skills: plan",
+        item: None,
+        processed: 0,
+        total: None,
+    });
+    let plan = match plan_skills(paths, &state) {
+        Ok(p) => p,
+        Err(e) => {
+            return OperationReport {
+                finish: Finish::Failed,
+                partial: (state, Vec::new()),
+                error: Some(e.to_string()),
+            };
+        }
+    };
+    if plan.is_empty() {
+        sink(Progress {
+            stage: "skills: plan",
+            item: None,
+            processed: 0,
+            total: Some(0),
+        });
+        return OperationReport {
+            finish: Finish::Completed,
+            partial: (state, Vec::new()),
+            error: None,
+        };
+    }
+    apply_skills_controlled(paths, state, plan, token, sink)
 }
 
 /// Save an agent, performing a rename first if the name changed.
@@ -1342,5 +1484,205 @@ mod tests {
             ..paths
         };
         (paths, checkout)
+    }
+
+    // ---------- D3 cooperative-cancellation tests (workflows) ----------
+    //
+    // Each test exercises one slice of the contract:
+    // - initial checkpoint cancels BEFORE any IO,
+    // - canonical validation/planning is non-cancellable
+    //   (the contract says "Planning/read-tree unit
+    //   NON-interruptible explicitly allowed"),
+    // - empty plan returns Completed with no disk writes,
+    // - controlled apply delegates cancel handling to the
+    //   store layer.
+
+    use crate::operation::{CancelToken, Finish, Progress};
+
+    fn capture_progress() -> (
+        std::rc::Rc<std::cell::RefCell<Vec<Progress>>>,
+        impl FnMut(Progress),
+    ) {
+        let captured: std::rc::Rc<std::cell::RefCell<Vec<Progress>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink_captured = captured.clone();
+        let sink = move |p: Progress| sink_captured.borrow_mut().push(p);
+        (captured, sink)
+    }
+
+    /// Initial checkpoint: a cancel requested before the
+    /// workflow reads the source tree is honored as
+    /// `Finish::Cancelled` with the unchanged freshly-loaded
+    /// state and an empty outcome list.
+    #[test]
+    fn plan_then_apply_agents_safe_controlled_pre_cancel_is_pure() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let state = State::default();
+        // Plant a sentinel in the opencode target dir; the
+        // cancel-before-plan must not touch it.
+        fs::create_dir_all(&paths.target_dir).unwrap();
+        let sentinel = paths.target_dir.join("sentinel.md");
+        fs::write(&sentinel, b"sentinel").unwrap();
+        let token = CancelToken::default();
+        token.request();
+        let (_captured, mut sink) = capture_progress();
+        let report = plan_then_apply_agents_safe_controlled(
+            &paths,
+            state,
+            SyncTarget::OpenCode,
+            &token,
+            &mut sink,
+        );
+        assert_eq!(report.finish, Finish::Cancelled);
+        let (state_after, outcomes) = report.partial;
+        assert!(outcomes.is_empty());
+        assert!(state_after.installed.is_empty());
+        assert_eq!(
+            fs::read(&sentinel).unwrap(),
+            b"sentinel",
+            "sentinel target file must be untouched after pre-cancel"
+        );
+    }
+
+    /// Empty plan returns `Finish::Completed` with no disk
+    /// writes and no state mutation.
+    #[test]
+    fn plan_then_apply_agents_safe_controlled_empty_plan_completes() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        // Build a checkout with an `agents/` directory but no
+        // starter agents — plan is empty.
+        let mut paths = setup_paths(&dir);
+        paths.canonical_dir = dir.path().join("checkout").join("agents");
+        let checkout = paths.canonical_dir.parent().unwrap();
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        let state = State::default();
+        let token = CancelToken::default();
+        let (_captured, mut sink) = capture_progress();
+        let report = plan_then_apply_agents_safe_controlled(
+            &paths,
+            state,
+            SyncTarget::OpenCode,
+            &token,
+            &mut sink,
+        );
+        assert_eq!(report.finish, Finish::Completed);
+        let (state_after, outcomes) = report.partial;
+        assert!(outcomes.is_empty());
+        assert!(state_after.installed.is_empty());
+    }
+
+    /// Full run delegates to `apply_safe_controlled`. With no
+    /// cancel, the workflow reports Completed and the
+    /// canonical bytes are now published to the opencode
+    /// target dir.
+    #[test]
+    fn plan_then_apply_agents_safe_controlled_full_run_publishes() {
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(checkout.join("agents")).unwrap();
+        paths.canonical_dir = checkout.join("agents");
+        write_canonical_agent(&paths.canonical_dir, "foo", "source body");
+        let state = State::default();
+        let token = CancelToken::default();
+        let (_captured, mut sink) = capture_progress();
+        let report = plan_then_apply_agents_safe_controlled(
+            &paths,
+            state,
+            SyncTarget::OpenCode,
+            &token,
+            &mut sink,
+        );
+        assert_eq!(report.finish, Finish::Completed);
+        let (_state_after, outcomes) = report.partial;
+        assert!(!outcomes.is_empty());
+        // At least one outcome must have landed its target.
+        let any_written = outcomes
+            .iter()
+            .any(|o| !o.action.is_empty() && paths.target_dir.join(&o.filename).is_file());
+        assert!(
+            any_written,
+            "at least one outcome must correspond to a written target file"
+        );
+    }
+
+    /// Same trio for the skills workflow: pre-cancel, empty
+    /// plan, full run.
+    #[test]
+    fn plan_then_apply_skills_controlled_pre_cancel_is_pure() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        // Plant a sentinel skill under skills_dir; cancel-
+        // before-plan must not touch it.
+        fs::create_dir_all(&paths.skills_dir).unwrap();
+        let sentinel = paths.skills_dir.join("sentinel");
+        fs::create_dir_all(&sentinel).unwrap();
+        fs::write(sentinel.join("SKILL.md"), b"sentinel").unwrap();
+        let state = State::default();
+        let token = CancelToken::default();
+        token.request();
+        let (_captured, mut sink) = capture_progress();
+        let report = plan_then_apply_skills_controlled(&paths, state, &token, &mut sink);
+        assert_eq!(report.finish, Finish::Cancelled);
+        let (state_after, outcomes) = report.partial;
+        assert!(outcomes.is_empty());
+        assert!(state_after.installed_skills.is_empty());
+        assert!(sentinel.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn plan_then_apply_skills_controlled_empty_plan_completes() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        paths.canonical_dir = dir.path().join("checkout").join("agents");
+        let checkout = paths.canonical_dir.parent().unwrap();
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        fs::create_dir_all(checkout.join("skills")).unwrap();
+        let state = State::default();
+        let token = CancelToken::default();
+        let (_captured, mut sink) = capture_progress();
+        let report = plan_then_apply_skills_controlled(&paths, state, &token, &mut sink);
+        assert_eq!(report.finish, Finish::Completed);
+        let (state_after, outcomes) = report.partial;
+        assert!(outcomes.is_empty());
+        assert!(state_after.installed_skills.is_empty());
+    }
+
+    #[test]
+    fn plan_then_apply_skills_controlled_full_run_publishes() {
+        use std::fs;
+        let dir = TempDir::new().unwrap();
+        let mut paths = setup_paths(&dir);
+        paths.canonical_dir = dir.path().join("checkout").join("agents");
+        let checkout = paths.canonical_dir.parent().unwrap();
+        fs::create_dir_all(checkout.join("agents")).unwrap();
+        let skills_src = checkout.join("skills");
+        fs::create_dir_all(&skills_src).unwrap();
+        // Drop a single skill into the source tree.
+        let skill = skills_src.join("alpha");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            b"---\nname: alpha\ndescription: x\n---\nbody\n",
+        )
+        .unwrap();
+        let state = State::default();
+        let token = CancelToken::default();
+        let (_captured, mut sink) = capture_progress();
+        let report = plan_then_apply_skills_controlled(&paths, state, &token, &mut sink);
+        assert_eq!(report.finish, Finish::Completed);
+        let (_state_after, outcomes) = report.partial;
+        assert_eq!(outcomes.len(), 1);
+        assert!(
+            outcomes[0].ok,
+            "skill install must succeed: {:?}",
+            outcomes[0].detail
+        );
+        assert!(paths.skills_dir.join("alpha").join("SKILL.md").is_file());
     }
 }

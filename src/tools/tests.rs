@@ -16,6 +16,7 @@
 //! file.
 
 use super::*;
+use crate::operation::{CancelToken, Finish, Progress};
 use crate::store::Paths;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -2905,4 +2906,742 @@ fn no_spawn_uses_shell_or_interpolation() {
             spec.args
         );
     }
+}
+
+// ---------- D3 cooperative-cancellation tests (tools) ----------
+//
+// The contract for `install_tool_at_controlled`:
+// - cancel BEFORE preflight is honored as Cancelled, the
+//   destination is untouched, no spawn ran.
+// - cancel AFTER `stage` succeeds cleans up the staging
+//   directory the installer itself created; a preexisting
+//   sibling at the staging path is left untouched.
+// - cancel mid-npm-ci cleans the staging dir and reports
+//   Cancelled with the residual path in `partial.1`.
+// - cancel right before the publish rename cleans up
+//   staging and reports Cancelled; the destination is
+//   not touched.
+// - the publish rename itself is atomic — a successful
+//   rename is reported as `Finish::Completed` regardless
+//   of any cancel request observed before the publish
+//   began (the pre-publish checkpoint would have honored
+//   the cancel and returned Cancelled there, so we never
+//   reach the rename in that case).
+// - cleanup failure surfaces a residual path in both
+//   `partial.1` and `OperationReport::error`.
+//
+// Tests use the `recorded_with` mock so the spawn argv
+// stays exactly as the contract documents. The
+// `install_tool_at` legacy path stays covered by the
+// existing seam tests; these new tests only exercise the
+// controlled wrapper.
+
+fn cancellation_after_stage_setup() -> (TempDir, Paths, &'static ToolCatalogEntry, PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let paths = setup_paths(&dir);
+    let entry = pi_psql_entry();
+    let staging = deterministic_staging(&paths, entry);
+    (dir, paths, entry, staging)
+}
+
+#[test]
+fn install_tool_at_controlled_cancel_before_preflight_writes_nothing() {
+    let _seam_guard = fake_npm_cli_guard();
+    let (_dir, paths, entry, staging) = cancellation_after_stage_setup();
+    let runs: Rc<RefCell<Vec<SpawnSpec>>> = Rc::new(RefCell::new(Vec::new()));
+    let responses: Rc<RefCell<VecDeque<SpawnOutput>>> = Rc::new(RefCell::new(VecDeque::new()));
+    let mut runner = recorded_with(runs.clone(), responses.clone());
+    let mut rename = rename_ok;
+    let token = CancelToken::default();
+    token.request();
+    let progress: Rc<RefCell<Vec<Progress>>> = Rc::new(RefCell::new(Vec::new()));
+    let progress_sink = progress.clone();
+    let mut sink = move |p: Progress| progress_sink.borrow_mut().push(p);
+    let report = install_tool_at_controlled(
+        &staging,
+        &paths,
+        entry,
+        &mut runner,
+        &mut rename,
+        &token,
+        &mut sink,
+    );
+    assert_eq!(report.finish, Finish::Cancelled);
+    assert!(
+        report.partial.1.is_none(),
+        "cancel before preflight has no owned staging"
+    );
+    assert!(
+        runs.borrow().is_empty(),
+        "cancel before preflight must not spawn anything"
+    );
+    assert!(!staging.exists(), "no staging dir may have been created");
+    let _ = paths; // silence unused
+}
+
+#[test]
+fn install_tool_at_controlled_cancel_after_stage_cleans_owned_dir() {
+    let _seam_guard = fake_npm_cli_guard();
+    let (_dir, paths, entry, staging) = cancellation_after_stage_setup();
+    let runs: Rc<RefCell<Vec<SpawnSpec>>> = Rc::new(RefCell::new(Vec::new()));
+    // Preflight (3) + ls-remote (2) + stage (4 git spawns) —
+    // total 9 successful outputs. We cancel BEFORE verify_pinned_sha,
+    // so we only need 9 successful responses.
+    let responses = Rc::new(RefCell::new(VecDeque::from(vec![
+        // preflight: git, node, npm
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"git version 2.43.0".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"v22.12.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"10.9.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        // ls-remote peeled
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_two_lines_annotated().into_bytes(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_peeled_only().into_bytes(),
+            stderr: Vec::new(),
+        },
+        // stage: init, remote add, fetch, checkout
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+    ])));
+    let mut runner = recorded_with(runs.clone(), responses.clone());
+    let mut rename = rename_ok;
+    // Hook: cancel exactly when the controlled pipeline reaches
+    // the pre-verify_pinned_sha checkpoint (counting each stage's
+    // pre-checkpoint emission as one sink call).
+    let token = CancelToken::default();
+    let counter = std::cell::Cell::new(0usize);
+    let mut hooked_sink = |_p: Progress| {
+        counter.set(counter.get() + 1);
+        if counter.get() == 3 {
+            // Cancel observed at the start of stage 4's
+            // checkpoint (the cancel check runs BEFORE the
+            // 4th sink emission). Flipping here means the
+            // next iteration sees is_requested() == true
+            // and returns Cancelled.
+            token.request();
+        }
+    };
+    let report = install_tool_at_controlled(
+        &staging,
+        &paths,
+        entry,
+        &mut runner,
+        &mut rename,
+        &token,
+        &mut hooked_sink,
+    );
+    // Cancel observed between stage and verify_pinned_sha:
+    // a pre-stage-of-progress cancel. The seam reports
+    // Cancelled + NotInstalled (the install did not start
+    // toward completion yet).
+    assert_eq!(report.finish, Finish::Cancelled);
+    assert_eq!(report.partial.0.status, ToolStatus::NotInstalled);
+    assert!(
+        report.partial.1.is_none(),
+        "cleanup must have succeeded; residual path should be None"
+    );
+    // Stage directory was created (owned) and now cleaned up.
+    assert!(
+        !staging.exists(),
+        "cancel-after-stage must remove staging dir"
+    );
+    // Destination never touched.
+    assert!(!destination_for(&paths, entry).exists());
+    let _ = paths; // silence unused
+}
+
+#[test]
+fn install_tool_at_controlled_cancel_after_preexisting_staging_is_preserved() {
+    let _seam_guard = fake_npm_cli_guard();
+    let (dir, paths, entry, staging) = cancellation_after_stage_setup();
+    // Plant a sentinel directory at the staging path BEFORE
+    // the install runs. `stage` bails on AlreadyExists, the
+    // cancel path then sees `owned=false` and MUST NOT
+    // touch the sentinel.
+    let sentinel = b"unrelated user data\n";
+    fs::create_dir_all(&staging).unwrap();
+    fs::write(staging.join("user.md"), sentinel).unwrap();
+    let runs: Rc<RefCell<Vec<SpawnSpec>>> = Rc::new(RefCell::new(Vec::new()));
+    let responses = Rc::new(RefCell::new(VecDeque::from(vec![
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"git version 2.43.0".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"v22.12.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"10.9.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_two_lines_annotated().into_bytes(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_peeled_only().into_bytes(),
+            stderr: Vec::new(),
+        },
+    ])));
+    let mut runner = recorded_with(runs.clone(), responses.clone());
+    let mut rename = rename_ok;
+    let token = CancelToken::default();
+    token.request();
+    let mut sink = |_p: Progress| {};
+    let report = install_tool_at_controlled(
+        &staging,
+        &paths,
+        entry,
+        &mut runner,
+        &mut rename,
+        &token,
+        &mut sink,
+    );
+    // stage bailed (AlreadyExists) → report is Failed with
+    // InstallFailed, not Cancelled. But the cancel-before-
+    // preflight branch fires first (cancel was requested
+    // BEFORE the install started), so we observe
+    // `cancelled before preflight`. Either way the sentinel
+    // must remain intact.
+    assert!(matches!(report.finish, Finish::Cancelled | Finish::Failed));
+    assert!(
+        staging.is_dir(),
+        "preexisting staging directory must be preserved"
+    );
+    assert_eq!(
+        fs::read(staging.join("user.md")).unwrap(),
+        sentinel,
+        "preexisting sentinel must be byte-identical"
+    );
+    let _ = dir;
+    let _ = paths; // silence unused
+}
+
+#[test]
+fn install_tool_at_controlled_cancel_before_publish_cleans_owned_dir() {
+    let _seam_guard = fake_npm_cli_guard();
+    let (_dir, paths, entry, staging) = cancellation_after_stage_setup();
+    let runs: Rc<RefCell<Vec<SpawnSpec>>> = Rc::new(RefCell::new(Vec::new()));
+    // The pipeline order is preflight(3) → ls-remote(2) → stage(4)
+    // → verify_pinned_sha(1) → identity_check(0) → publish(5).
+    // We cancel at the start of stage 7's checkpoint, so we
+    // need preflight + ls-remote + stage + verify_pinned_sha
+    // responses. Identity check does not spawn.
+    let responses = Rc::new(RefCell::new(VecDeque::from(vec![
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"git version 2.43.0".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"v22.12.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"10.9.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_two_lines_annotated().into_bytes(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_peeled_only().into_bytes(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        rev_parse_ok(pi_psql_entry().expected_sha),
+    ])));
+    // Use the SKILL.md materializing mock so the identity check
+    // has a SKILL.md to validate.
+    let skill_body = format!(
+        "---\nname: {}\ndescription: x\n---\nbody\n",
+        entry.skill_name
+    );
+    let mut runner = mock_runner_with_skill_md(runs.clone(), responses.clone(), skill_body);
+    let mut rename = rename_ok;
+    // Hook the cancel at the start of stage 7 (publish) — the
+    // 6th sink emission is for `tools: publish`. We flip the
+    // token on the 6th sink call so the next pre-publish
+    // checkpoint sees it.
+    let token = CancelToken::default();
+    let counter = std::cell::Cell::new(0usize);
+    let mut hooked_sink = |_p: Progress| {
+        counter.set(counter.get() + 1);
+        if counter.get() == 6 {
+            token.request();
+        }
+    };
+    let report = install_tool_at_controlled(
+        &staging,
+        &paths,
+        entry,
+        &mut runner,
+        &mut rename,
+        &token,
+        &mut hooked_sink,
+    );
+    // The seam reports `Finish::Cancelled` + `ToolStatus::NotInstalled`
+    // when cancel is observed after a clean staged tree (the
+    // same semantics as every other cancel checkpoint). `Conflict`
+    // is reserved for actual existing-destination collisions
+    // surfaced by the rename's EEXIST / ERROR_ALREADY_EXISTS error.
+    assert_eq!(report.finish, Finish::Cancelled);
+    assert_eq!(report.partial.0.status, ToolStatus::NotInstalled);
+    assert!(
+        report.partial.1.is_none(),
+        "cleanup must have succeeded; residual path should be None"
+    );
+    // Staging was owned (stage ran) and is now removed by the
+    // cancel handler.
+    assert!(
+        !staging.exists(),
+        "staging must be removed by cancel cleanup"
+    );
+    // Destination must not be touched (publish never ran).
+    assert!(!destination_for(&paths, entry).exists());
+}
+
+/// Tool rename success + late token request. The contract:
+/// a successful OS-no-replace rename is reported as
+/// `Finish::Completed` + `ToolStatus::Installed`, regardless
+/// of any token request observed before the publish began.
+/// The cancel token flips inside the rename mock (after the
+/// installer has already called `rename(staging, dest)`).
+/// We assert the report is `Completed`, the destination is
+/// present, and the staging directory was consumed by the
+/// rename.
+#[test]
+fn install_tool_at_controlled_rename_success_overrides_late_cancel() {
+    let _seam_guard = fake_npm_cli_guard();
+    let (_dir, paths, entry, staging) = cancellation_after_stage_setup();
+    let runs: Rc<RefCell<Vec<SpawnSpec>>> = Rc::new(RefCell::new(Vec::new()));
+    // Full run, identical to the existing full-publish flow.
+    let responses = Rc::new(RefCell::new(VecDeque::from(vec![
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"git version 2.43.0".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"v22.12.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"10.9.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_two_lines_annotated().into_bytes(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_peeled_only().into_bytes(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        rev_parse_ok(pi_psql_entry().expected_sha),
+    ])));
+    let skill_body = format!(
+        "---\nname: {}\ndescription: x\n---\nbody\n",
+        entry.skill_name
+    );
+    let mut runner = mock_runner_with_skill_md(runs.clone(), responses.clone(), skill_body);
+    let token = CancelToken::default();
+    // Wrap the rename so we can flip the token during the
+    // rename itself — AFTER the seam has decided to publish
+    // and called `rename(staging, dest)`. The rename
+    // succeeds; the report must be Completed/Installed.
+    let rename_target = destination_for(&paths, entry);
+    let cancel_token = token.clone();
+    let mut rename_with_late_cancel = move |src: &Path, dst: &Path| -> Result<(), i32> {
+        // Simulate the rename succeeding (atomic on the
+        // OS) and the token being requested mid-rename.
+        cancel_token.request();
+        // `std::fs::rename` is atomic on the same filesystem
+        // on Linux; on Windows it overwrites, which is also
+        // OK here because the destination is absent at this
+        // point (no conflict was reached). The point of the
+        // mock is to prove the seam honors the rename
+        // success regardless of the late token.
+        match std::fs::rename(src, dst) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.raw_os_error().unwrap_or(0)),
+        }
+    };
+    let mut sink = |_p: Progress| {};
+    let report = install_tool_at_controlled(
+        &staging,
+        &paths,
+        entry,
+        &mut runner,
+        &mut rename_with_late_cancel,
+        &token,
+        &mut sink,
+    );
+    assert_eq!(
+        report.finish,
+        Finish::Completed,
+        "rename success must beat a late token request"
+    );
+    assert_eq!(report.partial.0.status, ToolStatus::Installed);
+    assert!(report.partial.1.is_none(), "no residual on success");
+    assert!(
+        rename_target.is_dir(),
+        "destination must be installed on rename success"
+    );
+    assert!(
+        !staging.exists(),
+        "staging must be consumed by the rename on success"
+    );
+}
+
+/// Tool cancel mid-`npm_ci`: the seam must clean up the owned
+/// staging directory, NOT touch the destination, and report
+/// `Finish::Cancelled` + `ToolStatus::NotInstalled` (the same
+/// semantics as every other cancel checkpoint — the npm_ci
+/// spawn completes successfully and the cancel token flips, so
+/// the next pre-publish checkpoint honors the cooperative
+/// cancel signal). The publish rename never ran.
+#[test]
+fn install_tool_at_controlled_cancel_during_npm_ci_reports_cancelled() {
+    let _seam_guard = fake_npm_cli_guard();
+    let (_dir, paths, entry, staging) = cancellation_after_stage_setup();
+    let runs: Rc<RefCell<Vec<SpawnSpec>>> = Rc::new(RefCell::new(Vec::new()));
+    // Preflight + ls-remote + stage + verify_pinned_sha run
+    // successfully. Then npm_ci runs and is hooked to flip
+    // the token. The seam must cancel BEFORE publish.
+    let responses = Rc::new(RefCell::new(VecDeque::from(vec![
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"git version 2.43.0".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"v22.12.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: b"10.9.0\n".to_vec(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_two_lines_annotated().into_bytes(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: ls_remote_peeled_only().into_bytes(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        SpawnOutput {
+            success: true,
+            code: Some(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        },
+        rev_parse_ok(pi_psql_entry().expected_sha),
+    ])));
+    let skill_body = format!(
+        "---\nname: {}\ndescription: x\n---\nbody\n",
+        entry.skill_name
+    );
+    // Combine the SKILL.md materializing mock with the
+    // npm_ci-cancel hook: non-npm_ci spawns go through
+    // mock_runner_with_skill_md (so identity_check
+    // finds SKILL.md on disk), npm_ci flips the token.
+    let token = CancelToken::default();
+    let token_for_hook = token.clone();
+    let mut mocked = mock_runner_with_skill_md(runs.clone(), responses.clone(), skill_body);
+    let npm_ci_idx = Rc::new(RefCell::new(false));
+    let mut hooked_runner = move |spec: &SpawnSpec| -> Result<SpawnOutput> {
+        let is_npm_ci = spec.program == npm_program() && spec.args.iter().any(|a| a == "ci");
+        if is_npm_ci {
+            token_for_hook.request();
+            *npm_ci_idx.borrow_mut() = true;
+            // Drain the queued response so the seam
+            // thinks npm_ci succeeded.
+            return Ok(responses.borrow_mut().pop_front().unwrap_or(SpawnOutput {
+                success: true,
+                code: Some(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            }));
+        }
+        mocked(spec)
+    };
+    let mut rename = rename_ok;
+    let mut sink = |_p: Progress| {};
+    let report = install_tool_at_controlled(
+        &staging,
+        &paths,
+        entry,
+        &mut hooked_runner,
+        &mut rename,
+        &token,
+        &mut sink,
+    );
+    assert_eq!(
+        report.finish,
+        Finish::Cancelled,
+        "cancel after npm_ci must produce Cancelled, not Failed/Conflict"
+    );
+    assert_eq!(
+        report.partial.0.status,
+        ToolStatus::NotInstalled,
+        "cancel after npm_ci surfaces as NotInstalled (the cooperative cancel signal)"
+    );
+    // staging was owned (stage ran) and is now cleaned up.
+    assert!(
+        !staging.exists(),
+        "cancel after stage must remove the owned staging dir"
+    );
+    // Destination never touched.
+    assert!(!destination_for(&paths, entry).exists());
+}
+
+/// `cancel_owned_staging` is the cleanup primitive that
+/// `install_tool_at_controlled` calls after the installer has
+/// taken ownership of `staging` (i.e. the `stage` step's
+/// `create_dir` succeeded). When `owned=true` the function
+/// must call `fs::remove_dir_all`; when that call itself fails
+/// — for example because the path is a *regular file*, not a
+/// directory — the function returns `Some(staging)` so the
+/// caller can surface a residual-path error message. This is
+/// the path that keeps the cooperative-cancel contract honest
+/// when cleanup itself cannot proceed.
+///
+/// The test is deliberately direct: it plants a regular FILE
+/// at a known path inside a fresh `TempDir` and invokes
+/// `cancel_owned_staging(staging, true)` with that exact
+/// path. No fixture mount, no chmod, no readonly fs — the
+/// ENOTDIR-on-`remove_dir_all`-of-a-file outcome is
+/// deterministic on POSIX without any of those
+/// non-portable knobs (and the function under test only
+/// inspects `.is_ok()`, so the precise OS error code is
+/// irrelevant to the contract). Asserts:
+///
+/// 1. The helper returns `Some(staging)`.
+/// 2. The file is left intact on disk and byte-equal to
+///    its pre-call state.
+/// 3. `residual_error_message` builds an `error` string
+///    that names the residual path so the surrounding
+///    `OperationReport::error` is actionable.
+///
+/// Bounded to the helper itself; the rest of the
+/// `install_tool_at_controlled` pipeline is not exercised
+/// here, so a regression in `cancel_owned_staging` is
+/// caught at the smallest testable surface.
+#[test]
+fn cancel_owned_staging_returns_residual_when_path_is_regular_file() {
+    let dir = TempDir::new().unwrap();
+    // Deterministic, per-pid path inside a fresh TempDir.
+    // A regular file at this path is the failure surface we
+    // need: `fs::remove_dir_all` cannot remove a non-directory
+    // (ENOTDIR on Linux), so the helper sees an Err and
+    // returns Some(staging) by contract.
+    let staging = dir.path().join(format!(
+        "regular-file-staging-{}-{}",
+        std::process::id(),
+        0xC0FFEEu64
+    ));
+    let sentinel = b"unrelated user data at the staging path\n";
+    fs::write(&staging, sentinel).expect("write regular file at staging path");
+    // Sanity: the helper should refuse to do anything when
+    // owned=false (a preexisting sibling is not the
+    // installer's to clean up). That guard is the reason
+    // `owned` is a parameter at all.
+    let residual_unowned = cancel_owned_staging(&staging, false);
+    assert!(
+        residual_unowned.is_none(),
+        "owned=false must short-circuit; got {:?}",
+        residual_unowned
+    );
+    assert_eq!(
+        fs::read(&staging).unwrap(),
+        sentinel,
+        "owned=false must not touch the file"
+    );
+
+    // owned=true: the helper tries to remove_dir_all and
+    // must surface the failure as a residual path.
+    let residual = cancel_owned_staging(&staging, true);
+    let residual = residual.expect("owned=true on a regular file must yield Some(residual)");
+    assert_eq!(
+        residual, staging,
+        "residual must be the exact staging path so the caller can include it in the error"
+    );
+    // File is unchanged. The helper must NEVER clobber a
+    // path it cannot remove — the path the user owns is
+    // preserved byte-for-byte.
+    assert!(
+        staging.is_file(),
+        "staging path must remain a regular file after a failed cleanup"
+    );
+    assert_eq!(
+        fs::read(&staging).unwrap(),
+        sentinel,
+        "sentinel bytes must be preserved on cleanup failure"
+    );
+    // residual_error_message is the helper the controlled
+    // pipeline uses to build OperationReport::error; its
+    // output must name the residual path verbatim so the
+    // surrounding `cancelled` / `verify_pinned_sha failed` /
+    // `publish failed` prefix is actionable.
+    let msg = residual_error_message(Some(&residual), "cancelled");
+    let msg = msg.expect("residual_error_message must be Some when a residual exists");
+    assert!(
+        msg.contains("cancelled"),
+        "residual_error_message must keep the prefix the pipeline passed in: got `{}`",
+        msg
+    );
+    assert!(
+        msg.contains(staging.to_string_lossy().as_ref()),
+        "residual_error_message must include the residual path verbatim; got `{}`",
+        msg
+    );
 }

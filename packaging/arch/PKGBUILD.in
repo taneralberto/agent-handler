@@ -1,0 +1,40 @@
+# Local source snapshot only; generate PKGBUILD with scripts/package-arch.mjs.
+pkgname=agenthd
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Agent definitions manager: CLI and companion GUI'
+arch=('x86_64')
+license=('MIT')
+depends=('gtk3' 'webkit2gtk-4.1' 'dbus' 'glibc' 'gcc-libs')
+makedepends=('cargo' 'nodejs' 'npm' 'pkgconf')
+source=("agenthd-${pkgver}.tar.gz")
+sha256sums=('@SOURCE_SHA256@')
+
+build() {
+  export CARGO_TARGET_DIR="$srcdir/cargo-target"
+  # Cargo's encoded flags keep the remap a single argument even with spaces.
+  # Encoded caller flags take precedence over RUSTFLAGS, as they do in Cargo.
+  local -a rustflags
+  if [[ ! ${CARGO_ENCODED_RUSTFLAGS+x} ]]; then
+    read -r -a rustflags <<< "${RUSTFLAGS//$'\n'/ }"
+    local IFS=$'\x1f'
+    CARGO_ENCODED_RUSTFLAGS="${rustflags[*]}"
+  fi
+  export CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS:+${CARGO_ENCODED_RUSTFLAGS}$'\x1f'}--remap-path-prefix=$srcdir=/usr/src/debug/$pkgname"
+  cd "$srcdir/agenthd-$pkgver/spikes/tauri-angular"
+  npm ci --include=dev
+  npm run build
+  test -f dist/agenthd-tauri-angular-spike/browser/index.html
+
+  cd "$srcdir/agenthd-$pkgver"
+  cargo build --release --locked --bin agenthd
+  cargo build --release --locked \
+    --manifest-path spikes/tauri-angular/src-tauri/Cargo.toml \
+    --bin agenthd-gui --features custom-protocol
+}
+
+package() {
+  install -Dm755 "$srcdir/cargo-target/release/agenthd" "$pkgdir/usr/bin/agenthd"
+  install -Dm755 "$srcdir/cargo-target/release/agenthd-gui" "$pkgdir/usr/bin/agenthd-gui"
+  install -Dm644 "$srcdir/agenthd-$pkgver/LICENSE" "$pkgdir/usr/share/licenses/agenthd/LICENSE"
+}

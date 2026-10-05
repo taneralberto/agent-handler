@@ -2,12 +2,14 @@
   "name": "agenthd-tauri-angular-spike",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "scripts": {
     "ng": "ng",
     "start": "ng serve",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:unit": "node --experimental-strip-types --no-warnings --test editor-dto.test.mjs app-component.test.mjs"
   },
   "dependencies": {
     "@angular/common": "^22.0.1",

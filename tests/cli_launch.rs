@@ -56,7 +56,42 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use tempfile::TempDir;
+
+/// Global mutex that serialises the copy-out of the cargo-built
+/// `agenthd` binary AND every subsequent child spawn (including the
+/// fake-companion writes that `land_fake_companion` performs inside
+/// the same `TempDir`).
+///
+/// Why: parallel tests can otherwise trip a race on POSIX `execve`.
+/// One test (A) opens the built binary with `O_RDONLY` while
+/// `Command::output` reads it to spawn the child; a concurrent test
+/// (B) running in another thread then `std::fs::copy`s the *same*
+/// source path over the top. On Linux, the kernel keeps the inode
+/// alive for A as long as A's file descriptor is open, but `execve`
+/// later re-opens the destination — and the *destination inode* is
+/// the one A inherited through B's copy, which B may have already
+/// truncated. The result is `ETXTBSY` ("Executable file busy") at
+/// A's `execve` step. The reliable cure is a single process-wide
+/// `Mutex<()>` held by the *caller* (the test body) across the
+/// whole copy-then-spawn-then-reap sequence; that makes the
+/// "copy, then run" critical section atomic from the test
+/// harness's perspective and is the only change required. No
+/// production retry / sleep / launcher change is involved.
+///
+/// The mutex is held by the *test* (not by `isolated_binary` alone):
+/// returning the guard from `isolated_binary` and binding it to a
+/// `_fixture_guard` local in the test body extends the critical
+/// section across the fake-companion write inside
+/// `land_fake_companion`, the `Command::output` spawn, the child
+/// reaping, and every assertion that touches the tempdir. Drop on
+/// test exit releases the lock for the next test.
+static COPY_AND_SPAWN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn copy_and_spawn_lock() -> &'static Mutex<()> {
+    COPY_AND_SPAWN_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Path to the `agenthd` binary Cargo built for this test crate.
 fn cargo_built_binary() -> &'static Path {
@@ -74,20 +109,38 @@ fn companion_filename() -> &'static str {
 }
 
 /// Copy the built `agenthd(.exe)` into an isolated `TempDir` and
-/// return `(tempdir, copied_binary_path)`. The companion
-/// lookup inspects the directory of the current executable, so
-/// running the copy from this `TempDir` guarantees no real
-/// companion is found unless the test installs one explicitly.
-/// The `TempDir` must be held alive for the duration of the
-/// assertions so filesystem state is observable.
-fn isolated_binary() -> (TempDir, PathBuf) {
+/// return `(mutex_guard, tempdir, copied_binary_path)`. The
+/// returned guard pins the global copy-and-spawn lock for the
+/// rest of the test's lifetime; the test must keep the guard
+/// alive across every spawn (including the fake-companion write
+/// inside `land_fake_companion`) so the copy-then-spawn sequence
+/// stays serialised against parallel tests that would otherwise
+/// race the destination inode.
+///
+/// The companion lookup inspects the directory of the current
+/// executable, so running the copy from this `TempDir` guarantees
+/// no real companion is found unless the test installs one
+/// explicitly. The `TempDir` must be held alive for the duration
+/// of the assertions so filesystem state is observable.
+fn isolated_binary() -> (MutexGuard<'static, ()>, TempDir, PathBuf) {
+    // Acquire the lock FIRST so the copy and every downstream
+    // spawn share a single critical section. A previous
+    // implementation locked around only the copy and released
+    // immediately — that left a window in which Thread B's copy
+    // could overwrite Thread A's destination inode while A's
+    // inherited write fd was still open, producing ETXTBSY at
+    // A's execve. Holding the guard until the test finishes is
+    // the only reliable cure.
+    let guard = copy_and_spawn_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let dir = tempfile::tempdir().expect("tempdir");
     let src = cargo_built_binary();
     let dst = dir
         .path()
         .join(src.file_name().expect("built binary filename"));
     std::fs::copy(src, &dst).expect("copy built agenthd into isolated TempDir");
-    (dir, dst)
+    (guard, dir, dst)
 }
 
 /// Drop a fake companion binary next to `bin`. On Unix this is
@@ -126,6 +179,13 @@ fn land_fake_companion(bin_dir: &Path) -> PathBuf {
 /// dropping them deletes the trees and turns the "must NOT
 /// exist" checks into vacuous passes. Holding them in the
 /// returned tuple pins their lifetime to the caller's scope.
+///
+/// The caller MUST also keep the `MutexGuard` returned by
+/// `isolated_binary` alive until after this function returns,
+/// so the global copy-and-spawn lock covers the entire
+/// `Command::output` invocation (acquire, fork, execve,
+/// reap) — releasing it before the child has been reaped opens
+/// the same `ETXTBSY` window the lock exists to close.
 fn run_isolated(
     bin: &Path,
     args: &[&str],
@@ -169,7 +229,7 @@ fn home_entries(home: &Path) -> Vec<std::ffi::OsString> {
 /// touching the filesystem.
 #[test]
 fn agenthd_gui_rejects_with_clear_error_and_no_side_effects() {
-    let (bin_dir, bin) = isolated_binary();
+    let (_fixture_guard, bin_dir, bin) = isolated_binary();
     let (status, stderr, home, xdg, _env_dir) = run_isolated(&bin, &["gui"]);
 
     assert!(
@@ -252,7 +312,7 @@ fn agenthd_gui_with_repo_rejects_without_writing_settings() {
         .expect("create checkout agents subdir");
     let would_be_checkout_str = would_be_checkout.to_string_lossy().into_owned();
 
-    let (bin_dir, bin) = isolated_binary();
+    let (_fixture_guard, bin_dir, bin) = isolated_binary();
     let (status, stderr, home, _xdg, _env_dir) =
         run_isolated(&bin, &["gui", "--repo", &would_be_checkout_str]);
 
@@ -323,7 +383,7 @@ fn agenthd_gui_with_companion_present_persists_repo_without_target_writes() {
     std::fs::create_dir_all(checkout.join("agents")).expect("create checkout agents");
     let checkout_str = checkout.to_string_lossy().into_owned();
 
-    let (bin_dir, bin) = isolated_binary();
+    let (_fixture_guard, bin_dir, bin) = isolated_binary();
     land_fake_companion(bin_dir.path());
     let (status, stderr, home, xdg, _env_dir) =
         run_isolated(&bin, &["gui", "--repo", &checkout_str]);
@@ -414,7 +474,7 @@ fn agenthd_gui_with_companion_does_not_rewrite_settings_when_unchanged() {
     std::fs::create_dir_all(checkout.join("agents")).expect("create checkout agents");
     let checkout_str = checkout.to_string_lossy().into_owned();
 
-    let (bin_dir, bin) = isolated_binary();
+    let (_fixture_guard, bin_dir, bin) = isolated_binary();
     land_fake_companion(bin_dir.path());
 
     // Seed settings.json with the compact bytes that
@@ -482,7 +542,7 @@ fn agenthd_gui_with_companion_present_and_invalid_repo_fails_closed() {
         (path, dir)
     };
 
-    let (bin_dir, bin) = isolated_binary();
+    let (_fixture_guard, bin_dir, bin) = isolated_binary();
     land_fake_companion(bin_dir.path());
 
     let missing_str = missing.0.to_string_lossy().into_owned();
