@@ -12,7 +12,7 @@ use crate::store::{
 use crate::tools::ToolItem;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use editor::{AgentDraft, EditorField, EditorMode};
+use editor::{picker_list_height, AgentDraft, EditorField, EditorMode, DEFAULT_PICKER_VIEWPORT};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -166,6 +166,11 @@ enum Screen {
         discovery: Discovery,
         manual: String,
         selected: usize,
+        /// First visible row of the model list. The catalog can
+        /// be far taller than the screen (a model plus its
+        /// variants), so the list scrolls and the offset keeps
+        /// the selected row inside the viewport.
+        scroll: usize,
         manual_open: bool,
         status: Option<String>,
     },
@@ -231,6 +236,13 @@ pub struct App {
     /// Passed into `save_canonical` so an external edit made between open and
     /// save is rejected. `None` for new agents.
     editor_prior_hash: Option<String>,
+    /// Number of model rows the picker's viewport showed on the
+    /// last render. The model catalog can be much taller than
+    /// the screen, so the picker scrolls; the key handler needs
+    /// the viewport height to keep the selected row visible.
+    /// Remembered on `App` (not on the screen) because the
+    /// height is only known once the screen has been laid out.
+    picker_viewport: usize,
 }
 
 impl App {
@@ -245,6 +257,7 @@ impl App {
             editor_draft: None,
             editor_original_name: None,
             editor_prior_hash: None,
+            picker_viewport: DEFAULT_PICKER_VIEWPORT,
         }
     }
 
@@ -282,6 +295,12 @@ impl App {
         let status_area = chunks[2];
         let footer_area = chunks[3];
         self.render_header(frame, header_area);
+        // The picker's viewport height is only known after the
+        // layout, so it is remembered for the key handler that
+        // scrolls the model list.
+        if matches!(&self.screen, Screen::ModelPicker { .. }) {
+            self.picker_viewport = picker_list_height(body.height);
+        }
         match &self.screen {
             Screen::Main { selected } => self.render_main(frame, body, *selected),
             Screen::Agents {
@@ -313,6 +332,7 @@ impl App {
                 discovery,
                 manual,
                 selected,
+                scroll,
                 manual_open,
                 status,
             } => self.render_model_picker(
@@ -321,6 +341,7 @@ impl App {
                 discovery,
                 manual,
                 *selected,
+                *scroll,
                 *manual_open,
                 status.as_deref(),
             ),
@@ -767,7 +788,9 @@ mod tests {
     use crate::agent::{Mode, PermissionAction};
     use crate::store::{hash_file, save_canonical, Settings};
     use crate::tools::{ToolItem, ToolStatus, DEFAULT_CATALOG};
-    use editor::{edit_text_field, next_field, prev_field, EditorOp};
+    use editor::{
+        edit_text_field, model_picker_label, next_field, picker_scroll, prev_field, EditorOp,
+    };
     use serde_json;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -1112,7 +1135,10 @@ mod tests {
             status: None,
             confirm_discard: false,
         };
-        app.open_model_picker(Some("openai/gpt-5.4".to_string()));
+        app.open_model_picker_with(
+            Some("openai/gpt-5.4".to_string()),
+            Discovery::Found(vec!["openai/gpt-5.4".to_string()]),
+        );
         assert!(matches!(app.screen, Screen::ModelPicker { .. }));
         app.handle_model_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert!(matches!(app.screen, Screen::Editor { .. }));
@@ -1134,7 +1160,7 @@ mod tests {
             status: None,
             confirm_discard: false,
         };
-        app.open_model_picker(None);
+        app.open_model_picker_with(None, Discovery::Found(vec!["openai/gpt-5.4".to_string()]));
         app.handle_model_picker_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::empty()));
         for c in "openai/gpt-5.4".chars() {
             app.handle_model_picker_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()));
@@ -1152,7 +1178,10 @@ mod tests {
         let mut app = App::new(paths, State::default());
         app.editor_draft = Some(AgentDraft::from_agent(starter_agent(&STARTERS[0])));
         app.editor_original_name = Some(STARTERS[0].name.to_string());
-        app.open_model_picker(Some("openai/gpt-5.4".to_string()));
+        app.open_model_picker_with(
+            Some("openai/gpt-5.4".to_string()),
+            Discovery::Found(vec!["openai/gpt-5.4".to_string()]),
+        );
 
         for key in [KeyCode::Char('x'), KeyCode::Backspace, KeyCode::Tab] {
             app.handle_model_picker_key(KeyEvent::new(key, KeyModifiers::empty()));
@@ -1184,7 +1213,7 @@ mod tests {
             status: None,
             confirm_discard: false,
         };
-        app.open_model_picker(None);
+        app.open_model_picker_with(None, Discovery::Found(vec!["openai/gpt-5.4".to_string()]));
         let initial = match &app.screen {
             Screen::ModelPicker { manual_open, .. } => *manual_open,
             _ => false,
@@ -1204,6 +1233,310 @@ mod tests {
         assert!(!closed);
         app.handle_model_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
         assert!(matches!(app.screen, Screen::Editor { .. }));
+    }
+
+    #[test]
+    fn model_picker_applies_a_variant_selector_to_the_draft() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
+        app.editor_draft = Some(AgentDraft::from_agent(starter_agent(&STARTERS[0])));
+        app.editor_original_name = Some(STARTERS[0].name.to_string());
+        app.screen = Screen::Editor {
+            field: EditorField::Model,
+            mode: EditorMode::Normal,
+            status: None,
+            confirm_discard: false,
+        };
+        app.open_model_picker_with(
+            None,
+            Discovery::Found(vec![
+                "openai/gpt-5.2".to_string(),
+                "openai/gpt-5.2#high".to_string(),
+                "openai/gpt-5.2#low".to_string(),
+            ]),
+        );
+        // Step onto the `#high` variant and apply it.
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        app.handle_model_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(matches!(app.screen, Screen::Editor { .. }));
+        let draft = app.editor_draft.as_ref().expect("draft preserved");
+        assert_eq!(draft.agent.model.as_deref(), Some("openai/gpt-5.2#high"));
+    }
+
+    #[test]
+    fn model_picker_labels_mark_the_base_model_as_default() {
+        let models = vec![
+            "openai/gpt-5.2".to_string(),
+            "openai/gpt-5.2#high".to_string(),
+            "openai/gpt-5.2#low".to_string(),
+            "anthropic/claude-3".to_string(),
+        ];
+        // A base selector whose model also offers variants is
+        // the default choice for that model.
+        assert_eq!(
+            model_picker_label("openai/gpt-5.2", &models),
+            "  openai/gpt-5.2 (default)"
+        );
+        // A model without variants keeps the plain label.
+        assert_eq!(
+            model_picker_label("anthropic/claude-3", &models),
+            "  anthropic/claude-3"
+        );
+        // Variants are indented under their base entry and
+        // keep the selector that gets saved.
+        assert_eq!(
+            model_picker_label("openai/gpt-5.2#high", &models),
+            "    openai/gpt-5.2#high"
+        );
+    }
+
+    #[test]
+    fn agent_with_a_variant_selector_saves_and_reads_back() {
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths.clone(), State::default());
+        app.open_agents();
+        let summary = match &app.screen {
+            Screen::Agents { agents, .. } => agents
+                .iter()
+                .find(|a| a.name == STARTERS[0].name)
+                .cloned()
+                .expect("scout in agents list"),
+            _ => panic!("expected agents screen"),
+        };
+        app.open_editor_existing(&summary);
+        let original_name = app.editor_original_name.clone();
+        let material = {
+            let draft = app.editor_draft.as_mut().expect("draft present");
+            draft.agent.model = Some("openai/gpt-5.2#high".to_string());
+            draft.materialize()
+        };
+        app.apply_editor_op(EditorOp::Save {
+            original_name: original_name.clone(),
+            material,
+        });
+        let saved = std::fs::read_to_string(paths.canonical_dir.join("scout.md")).unwrap();
+        assert!(
+            saved.contains("model: \"openai/gpt-5.2#high\""),
+            "saved frontmatter: {saved}"
+        );
+        let reread = crate::agent::Agent::read(&paths.canonical_dir.join("scout.md")).unwrap();
+        assert_eq!(reread.model.as_deref(), Some("openai/gpt-5.2#high"));
+    }
+
+    #[test]
+    fn variant_selector_is_picked_and_saved_for_primary_and_subagent_agents() {
+        // The model field is mode-independent: the picker
+        // writes the chosen selector verbatim and the save
+        // keeps it next to the agent's mode.
+        for mode in [Mode::primary, Mode::subagent] {
+            let dir = TempDir::new().unwrap();
+            let (paths, _checkout) = setup_paths_with_checkout(&dir);
+            let mut app = App::new(paths.clone(), State::default());
+            app.open_editor_new();
+            let original_name = app.editor_original_name.clone();
+            {
+                let draft = app.editor_draft.as_mut().expect("draft present");
+                draft.agent.mode = mode;
+                draft.agent.description = "variant test".to_string();
+                draft.prompt = "body".to_string();
+            }
+            app.open_model_picker_with(
+                None,
+                Discovery::Found(vec![
+                    "openai/gpt-5.2".to_string(),
+                    "openai/gpt-5.2#high".to_string(),
+                ]),
+            );
+            // Step onto the `#high` variant and apply it.
+            app.handle_model_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+            app.handle_model_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+            let material = {
+                let draft = app.editor_draft.as_ref().expect("draft present");
+                draft.materialize()
+            };
+            assert_eq!(material.model.as_deref(), Some("openai/gpt-5.2#high"));
+            app.apply_editor_op(EditorOp::Save {
+                original_name,
+                material,
+            });
+            let saved = std::fs::read_to_string(paths.canonical_dir.join("agent-1.md")).unwrap();
+            assert!(
+                saved.contains("model: \"openai/gpt-5.2#high\""),
+                "saved frontmatter: {saved}"
+            );
+            assert!(
+                saved.contains(&format!("mode: {}", mode.as_str())),
+                "saved frontmatter: {saved}"
+            );
+        }
+    }
+
+    #[test]
+    fn picker_scroll_keeps_the_selection_visible() {
+        // The offset follows the selection.
+        assert_eq!(picker_scroll(0, 0, 5, 20), 0);
+        assert_eq!(picker_scroll(4, 0, 5, 20), 0);
+        assert_eq!(picker_scroll(5, 0, 5, 20), 1);
+        assert_eq!(picker_scroll(2, 8, 5, 20), 2);
+        // The offset never scrolls past the end of the list.
+        assert_eq!(picker_scroll(19, 0, 5, 20), 15);
+        assert_eq!(picker_scroll(19, 15, 5, 20), 15);
+        // A degenerate viewport shows nothing.
+        assert_eq!(picker_scroll(3, 0, 0, 20), 0);
+        assert_eq!(picker_scroll(3, 0, 5, 0), 0);
+    }
+
+    #[test]
+    fn model_picker_scrolls_a_catalog_larger_than_the_viewport() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
+        app.editor_draft = Some(AgentDraft::from_agent(starter_agent(&STARTERS[0])));
+        app.editor_original_name = Some(STARTERS[0].name.to_string());
+        let models: Vec<String> = (0..50).map(|i| format!("prov/model-{:02}", i)).collect();
+        app.open_model_picker_with(None, Discovery::Found(models));
+        // A short terminal: the catalog does not fit on screen.
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        // Move the selection far below the viewport.
+        for _ in 0..40 {
+            app.handle_model_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        match &app.screen {
+            Screen::ModelPicker {
+                selected, scroll, ..
+            } => {
+                assert_eq!(*selected, 40);
+                assert!(*scroll > 0, "the list must scroll to the selection");
+            }
+            other => panic!("unexpected screen: {other:?}"),
+        }
+        assert!(
+            rendered.contains("prov/model-40"),
+            "the selected row must stay visible:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("prov/model-00"),
+            "the rows above the viewport must be scrolled away:\n{rendered}"
+        );
+        // Back at the top the first row is visible again.
+        for _ in 0..40 {
+            app.handle_model_picker_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        }
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = render_to_string(&terminal);
+        assert!(
+            rendered.contains("prov/model-00"),
+            "the first row must be visible again:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("prov/model-40"),
+            "the rows below the viewport must be scrolled away:\n{rendered}"
+        );
+    }
+
+    /// Render the terminal's buffer as plain text, one string
+    /// per row.
+    fn render_to_string(terminal: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn model_picker_truncates_long_rows_and_keeps_the_selection_visible() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let dir = TempDir::new().unwrap();
+        let (paths, _checkout) = setup_paths_with_checkout(&dir);
+        let mut app = App::new(paths, State::default());
+        app.editor_draft = Some(AgentDraft::from_agent(starter_agent(&STARTERS[0])));
+        app.editor_original_name = Some(STARTERS[0].name.to_string());
+        // Identifiers longer than the screen: a wrapped row
+        // would take several lines and hide the selection.
+        let models: Vec<String> = (0..50)
+            .map(|i| format!("prov/very-long-model-identifier-{i:02}-padding-padding"))
+            .collect();
+        app.open_model_picker_with(None, Discovery::Found(models));
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        for _ in 0..40 {
+            app.handle_model_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        }
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // The selected entry is on screen, on ONE row, and that
+        // row carries the selection highlight.
+        let marker = "prov/very-long-model-identifier-40";
+        let row = row_containing(buffer, marker).expect("the selected row must be visible");
+        assert!(
+            row_containing(buffer, "prov/very-long-model-identifier-00").is_none(),
+            "the rows above the viewport must be scrolled away"
+        );
+        // The highlight covers the visible part of the row.
+        let highlighted = (0..buffer.area.width).any(|x| {
+            buffer
+                .cell((x, row))
+                .map(|cell| cell.bg == ACCENT)
+                .unwrap_or(false)
+        });
+        assert!(
+            highlighted,
+            "the selected row must carry the selection highlight"
+        );
+        // The entry takes a single row: the next entry starts on
+        // the row below, not further down.
+        let next = row_containing(buffer, "prov/very-long-model-identifier-39")
+            .or_else(|| row_containing(buffer, "prov/very-long-model-identifier-41"));
+        assert!(
+            next.map(|r| r.abs_diff(row) <= 1).unwrap_or(false),
+            "each entry must occupy exactly one row"
+        );
+        // Back at the top the first entry is visible again.
+        for _ in 0..40 {
+            app.handle_model_picker_key(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()));
+        }
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = row_containing(buffer, "prov/very-long-model-identifier-00")
+            .expect("the first row must be visible again");
+        let highlighted = (0..buffer.area.width).any(|x| {
+            buffer
+                .cell((x, row))
+                .map(|cell| cell.bg == ACCENT)
+                .unwrap_or(false)
+        });
+        assert!(
+            highlighted,
+            "the first row must carry the selection highlight again"
+        );
+    }
+
+    /// Row of the rendered buffer that contains `marker`, if any.
+    fn row_containing(buffer: &ratatui::buffer::Buffer, marker: &str) -> Option<u16> {
+        (0..buffer.area.height).find(|y| {
+            let row: String = (0..buffer.area.width)
+                .map(|x| {
+                    buffer
+                        .cell((x, *y))
+                        .map(|cell| cell.symbol())
+                        .unwrap_or(" ")
+                })
+                .collect();
+            row.contains(marker)
+        })
     }
 
     #[test]

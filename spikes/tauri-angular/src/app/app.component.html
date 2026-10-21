@@ -439,7 +439,7 @@
             </p>
             @if (discoveredModelList().length > 0) {
               <p class="meta-text">
-                {{ discoveredModelList().length }} model(s) discovered.
+                {{ discoveredModelSummary() }}
                 Click to apply to the open editor.
               </p>
               <ul class="discovered">
@@ -451,7 +451,7 @@
                       (click)="applyDiscoveredModel(m)"
                       [disabled]="!mutationsEnabled() || busy() || activeJob() || startPending() || editing() === null"
                       [title]="editing() === null ? 'Open an agent to apply' : 'Apply to the editor draft'"
-                    >{{ m }}</button>
+                    >{{ modelSelectorLabel(m) }}</button>
                   </li>
                 }
               </ul>
@@ -467,6 +467,10 @@
               <code>permission_keys</code> catalogue is
               backend-authoritative, but the editor's
               <code>model</code> accepts any free-text value.
+              An entry ending in <code>#variant</code> selects a
+              named variant of that model; the plain
+              <code>provider/model</code> entry is the default
+              choice for the model.
             </p>
           </div>
         </div>
@@ -1002,6 +1006,9 @@
                   loaded canonical agents. Discovery runs only on Load models — it does
                   not run automatically when the editor opens. Unknown ids you type
                   here are preserved verbatim and submitted as-is.
+                  An entry ending in <code>#variant</code> selects a named variant of
+                  that model; the plain <code>provider/model</code> entry is the
+                  default choice for the model.
                 </p>
                 <div class="model-actions">
                   <button

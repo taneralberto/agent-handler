@@ -697,6 +697,33 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_preserves_a_variant_selector() {
+        // The canonical `model` field carries an OpenCode model
+        // selector: `provider/model` with an optional
+        // `#variant` suffix. The round-trip must keep the
+        // suffix verbatim.
+        let mut agent = starter_agent(&STARTERS[0]);
+        agent.model = Some("openai/gpt-5.2#high".to_string());
+        let text = agent.render();
+        assert!(
+            text.contains("model: \"openai/gpt-5.2#high\""),
+            "rendered text:\n{text}"
+        );
+        let parsed = Agent::parse(&agent.name, &text).unwrap();
+        assert_eq!(parsed.model.as_deref(), Some("openai/gpt-5.2#high"));
+        assert_eq!(parsed, agent);
+    }
+
+    #[test]
+    fn accepts_a_variant_selector_as_a_model() {
+        // The variant form is part of the model identifier, so
+        // it must pass the existing `provider/model` validation
+        // unchanged.
+        Agent::validate_model("openai/gpt-5.2#high").unwrap();
+        Agent::validate_model("openrouter/anthropic/claude-sonnet-4.5#high").unwrap();
+    }
+
+    #[test]
     fn rejects_invalid_name() {
         for bad in [
             "",

@@ -333,6 +333,7 @@ impl App {
         discovery: &Discovery,
         manual: &str,
         selected: usize,
+        scroll: usize,
         manual_open: bool,
         status: Option<&str>,
     ) {
@@ -343,8 +344,16 @@ impl App {
         );
         lines.push(Line::from(""));
         if let Discovery::Found(models) = discovery {
-            for (i, m) in models.iter().enumerate() {
-                let line = Line::from(format!("  {}", m));
+            // The catalog can be much taller than the screen (a
+            // model plus its variants), so only the visible
+            // window is drawn and the window always contains the
+            // selected row.
+            let height = picker_list_height(area.height);
+            let offset = picker_scroll(selected, scroll, height, models.len());
+            let start = offset.min(models.len());
+            let end = (start + height).min(models.len());
+            for (i, m) in models.iter().enumerate().take(end).skip(start) {
+                let line = Line::from(model_picker_label(m, models));
                 lines.push(if i == selected {
                     line.style(selected_style())
                 } else {
@@ -358,15 +367,19 @@ impl App {
             "Model picker"
         };
         let block = panel(title);
-        let para = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false });
+        // No wrapping here: a selector is longer than the
+        // screen often enough, and a wrapped row would take
+        // several lines and push the selected row out of the
+        // window the scroll offset describes. The rows are
+        // truncated horizontally instead, so one entry is
+        // exactly one row.
+        let para = Paragraph::new(lines).block(block);
         frame.render_widget(para, area);
 
         if manual_open {
             let popup_area = centered_rect(60, 30, area);
             let manual_lines = vec![
-                Line::from("Manual model (`provider/model`, blank = inherit). Tab to apply."),
+                Line::from("Manual model (`provider/model` or `provider/model#variant`, blank = inherit). Tab to apply."),
                 Line::from(""),
                 Line::from(manual),
             ];
@@ -797,12 +810,22 @@ impl App {
 
     pub(super) fn open_model_picker(&mut self, current: Option<String>) {
         let discovery = models::discover_models();
+        self.open_model_picker_with(current, discovery);
+    }
+
+    /// Open the picker with an already-discovered catalog. The
+    /// seam keeps the picker's own tests offline (no `opencode`
+    /// spawn) and lets a caller inject a catalog that carries
+    /// model variants.
+    pub(super) fn open_model_picker_with(&mut self, current: Option<String>, discovery: Discovery) {
         let manual = current.unwrap_or_default();
         self.status_bar = None;
+        self.picker_viewport = DEFAULT_PICKER_VIEWPORT;
         self.screen = Screen::ModelPicker {
             discovery,
             manual,
             selected: 0,
+            scroll: 0,
             manual_open: false,
             status: None,
         };
@@ -824,11 +847,13 @@ impl App {
                 discovery,
                 manual,
                 selected,
+                scroll,
                 manual_open,
                 status,
                 ..
             } = &mut self.screen
             {
+                let viewport = self.picker_viewport;
                 match key.code {
                     KeyCode::Esc => {
                         if *manual_open {
@@ -843,7 +868,7 @@ impl App {
                             if *selected > 0 {
                                 *selected -= 1;
                             }
-                            let _ = models;
+                            *scroll = picker_scroll(*selected, *scroll, viewport, models.len());
                         }
                         Action::None
                     }
@@ -852,6 +877,7 @@ impl App {
                             if *selected + 1 < models.len() {
                                 *selected += 1;
                             }
+                            *scroll = picker_scroll(*selected, *scroll, viewport, models.len());
                         }
                         Action::None
                     }
@@ -951,6 +977,57 @@ impl App {
         });
         self.restore_editor_screen(self.status_bar.clone());
     }
+}
+
+/// Human label for one discovered model selector.
+///
+/// A base selector (`provider/model`) whose model also offers
+/// variants is the default choice for that model, so it is
+/// marked `(default)`; the variant selectors
+/// (`provider/model#variant`) are indented under their base
+/// entry. The selector itself is rendered verbatim so the
+/// value the user picks is the value that gets saved.
+pub(super) fn model_picker_label(selector: &str, models: &[String]) -> String {
+    if selector.contains('#') {
+        return format!("    {}", selector);
+    }
+    let prefix = format!("{}#", selector);
+    if models.iter().any(|m| m.starts_with(&prefix)) {
+        format!("  {} (default)", selector)
+    } else {
+        format!("  {}", selector)
+    }
+}
+
+/// Rows the model picker assumes before the first render has
+/// measured the real viewport. The picker scrolls either way;
+/// this only decides how far the first `Down` moves the
+/// viewport.
+pub(super) const DEFAULT_PICKER_VIEWPORT: usize = 10;
+
+/// Number of model rows the picker can show at once. The panel
+/// border and the status / spacer lines are not part of the
+/// list.
+pub(super) fn picker_list_height(area_height: u16) -> usize {
+    area_height.saturating_sub(4) as usize
+}
+
+/// Scroll offset that keeps `selected` visible inside a
+/// viewport of `height` rows. The offset never scrolls past the
+/// end of the list, so the last page shows the final rows
+/// instead of empty space.
+pub(super) fn picker_scroll(selected: usize, scroll: usize, height: usize, len: usize) -> usize {
+    if height == 0 || len == 0 {
+        return 0;
+    }
+    let max_scroll = len.saturating_sub(height);
+    let mut scroll = scroll.min(max_scroll);
+    if selected < scroll {
+        scroll = selected;
+    } else if selected >= scroll + height {
+        scroll = selected + 1 - height;
+    }
+    scroll.min(max_scroll)
 }
 
 fn edit_prompt_externally(prompt: &str) -> Result<String> {

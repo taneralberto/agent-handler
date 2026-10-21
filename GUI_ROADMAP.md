@@ -126,6 +126,12 @@ Agents vive en la sidebar; New y Edit abren el mismo editor modal. El modelo
 se puede buscar, introducir manualmente o heredar. Modelos discovered son
 advisory, no registro de proveedores. **New crea un agente**: el selector
 no crea providers/models; no hay tarea pendiente de registro de modelos.
+El selector de modelo ofrece el catálogo de OpenCode: cada modelo base
+(`provider/model`) y sus variantes nombradas (`provider/model#variant`). La
+variante es el valor exacto que se guarda; la entrada sin sufijo sigue siendo
+el valor predeterminado del modelo. El catálogo se lee desde
+`opencode api get /api/model` y cae a `opencode models` si no está disponible,
+de modo que los modelos base nunca se pierden.
 
 Activity permanece visible abajo incluso idle e incluye estado de cancelación.
 El modal duplica esa actividad cuando el fondo está inert. ESC, X y click

@@ -145,6 +145,19 @@ aprobados). Todos compuestos sobre el lib `agenthd`
    para que un refresh fallido no pueda enmascarar el
    éxito del save.
 
+**Selector de modelo (catálogo de OpenCode)**: el `select`
+del editor ofrece los selectores de modelo que devuelve el
+catálogo de OpenCode: el modelo base (`provider/model`) y sus
+variantes nombradas (`provider/model#variant`). El valor que
+se guarda es el selector exacto; la entrada sin sufijo sigue
+siendo el valor predeterminado del modelo y se marca
+`(default)`, con sus variantes debajo. El backend lee el
+catálogo con `opencode api get /api/model` y cae a
+`opencode models` cuando el catálogo no está disponible, así
+que los modelos base nunca se pierden. La entrada manual
+sigue aceptando cualquier selector y el catálogo nunca es
+obligatorio para guardar.
+
 **Lo que NO hace el prototipo** (decisiones explícitas):
 
 - No expone `prompt` ni `permissions` en la proyección
@@ -362,16 +375,20 @@ del D3, sin DOM / sin Angular runtime / sin IPC real):
 ```bash
 cd spikes/tauri-angular
 npm run test:unit
-# 36/36 OK (21 DTO tests previos + 15 component tests
-# nuevos que cubren subscribe-before-current /
+# 139 tests (21 DTO + 118 component). Los 3 asserts
+# static-template que buscan un salto de línea LF fallan
+# en un checkout CRLF (Windows con `core.autocrlf=true`):
+# son pre-existentes y no dependen del modelo.
+# Cubren subscribe-before-current /
 # event-before-start-reply / terminal-before-old-running /
 # new-event-before-old-null / old-job-after-new-job /
 # registration-fail-then-retry / destruction-late-cleanup /
 # uncertain-start-cancel-reconcile / gate-all-mutations /
 # dirty-draft-list-empty / editor-save-error /
 # discovered-models-don't-overwrite-model /
-# terminal-dupe-one-refresh + static-template
-# editor-hoisted assert).
+# terminal-dupe-one-refresh / model-option-labels +
+# model-variant-select + static-template editor-hoisted
+# assert.
 ```
 
 Los tests usan `tempfile::TempDir` para construir `Paths`

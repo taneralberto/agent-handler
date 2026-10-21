@@ -613,6 +613,17 @@ Permissions: `Space` cycles `inherit → allow → ask → deny → inherit`.
 Model picker: `Up/Down`, `Enter` apply, `m` manual (blank = inherit),
 `r` rerun discovery, `Esc` cancel.
 
+The picker lists OpenCode model selectors: `provider/model` for the
+base model and `provider/model#variant` for a named variant of it
+(`low`, `high`, ...). The list comes from the OpenCode model catalog
+(`opencode api get /api/model`); when the catalog is unavailable the
+discovery falls back to the `opencode models` listing, so the base
+models are never lost. The plain `provider/model` entry is the default
+choice for its model and is marked `(default)`; its variants are
+indented under it. The manual entry still accepts any free-text
+selector, and a model can also be typed by hand — the catalog is never
+required to save an agent.
+
 Install/Update: opens the **harness selector** on entry. `↑/↓` or
 `j/k` pick OpenCode, Pi, or Skills; `Enter` opens the per-file list
 scoped to that target only. On the OpenCode/Pi list, `i` applies all

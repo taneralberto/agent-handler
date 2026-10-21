@@ -2055,16 +2055,35 @@ export class AppComponent implements OnInit, OnDestroy {
     return matches;
   }
 
-  /** Display label for a model option. Real model
-   *  ids render verbatim; the current draft model
-   *  (when the filter would otherwise drop it)
-   *  gets a "(selected)" suffix so the user can
-   *  see the selection even when it is not in
-   *  the filtered list. */
+  /** Display label for a model option in the editor's select.
+   *  The selector itself is rendered verbatim — it is the value
+   *  that gets saved — and the label adds the `(selected)`
+   *  marker for the current draft model on top of
+   *  [`modelSelectorLabel`]. */
   modelOptionLabel(m: string): string {
+    const label = this.modelSelectorLabel(m);
     const current = this.editDraft()?.model;
-    if (m === current) return `${m} (selected)`;
-    return m;
+    if (m === current) return `${label} (selected)`;
+    return label;
+  }
+
+  /** Label for a model selector: the selector verbatim plus the
+   *  `(default)` marker for a base selector whose model also
+   *  offers named variants. The plain `provider/model` entry is
+   *  the default choice for that model. */
+  modelSelectorLabel(m: string): string {
+    return this.modelHasVariants(m) ? `${m} (default)` : m;
+  }
+
+  /** True when `selector` is a base selector whose model also
+   *  offers named variants. The rule is derived from the option
+   *  list itself: a `provider/model#variant` entry implies its
+   *  base `provider/model` entry has variants. No provider or
+   *  variant name is hardcoded. */
+  private modelHasVariants(selector: string): boolean {
+    if (selector.includes("#")) return false;
+    const prefix = `${selector}#`;
+    return this.modelOptions().some((m) => m.startsWith(prefix));
   }
 
   /** True when the filtered list is empty. The
@@ -3105,6 +3124,22 @@ export class AppComponent implements OnInit, OnDestroy {
    *  click an item to apply it. */
   discoveredModelList(): string[] {
     return this.discoveredModels();
+  }
+
+  /** Discovery summary for the MODELS view. The list mixes
+   *  base models and their named variants
+   *  (`provider/model#variant`), so the label counts both —
+   *  the same wording the lib's `Discovery::status_text`
+   *  uses. */
+  discoveredModelSummary(): string {
+    const total = this.discoveredModelList().length;
+    const variants = this.discoveredModelList().filter((m) =>
+      m.includes("#"),
+    ).length;
+    const base = total - variants;
+    return variants === 0
+      ? `${base} model(s) discovered.`
+      : `${base} model(s), ${variants} variant(s) discovered.`;
   }
 
   /** View helpers for the template. */

@@ -61,13 +61,13 @@ another unit's test, or not at all.
 | `PermissionAction::parse` | `fn(&str) -> Result<Self>` | covered | `rejects_invalid_mode_and_action` |
 | `Agent` | struct (name/description/mode/model/prompt/permissions) | covered | every render / parse / validate test below |
 | `Agent::validate_name` | `fn(&str) -> Result<()>` | covered | `rejects_invalid_name`, `accepts_kebab_case_names` |
-| `Agent::validate_model` | `fn(&str) -> Result<()>` | covered | `rejects_invalid_model` |
+| `Agent::validate_model` | `fn(&str) -> Result<()>` | covered | `rejects_invalid_model`, `accepts_a_variant_selector_as_a_model` |
 | `Agent::validate_model_opt` | `fn(&Option<String>) -> Result<()>` | partial | exercised only indirectly via `apply_model_value` from `apply_model_validates_value` *(app/mod.rs)*; only the `Some(_)` arms (invalid + valid) are exercised, the `None` arm is not |
 | `Agent::new_default` | `fn(String) -> Result<Self>` | covered | `new_default_user_agent_has_safe_defaults` *(store/tests.rs)* |
 | `Agent::validate` | `fn(&self) -> Result<()>` | partial | covered transitively by save flows; no single-fn test |
-| `Agent::render` | `fn(&self) -> String` | covered | `render_emits_permission_and_omits_tools`, `render_quotes_yaml_unsafe_text`, `round_trip_preserves_all_fields`, `round_trip_with_explicit_model_and_all_modes` |
+| `Agent::render` | `fn(&self) -> String` | covered | `render_emits_permission_and_omits_tools`, `render_quotes_yaml_unsafe_text`, `round_trip_preserves_all_fields`, `round_trip_with_explicit_model_and_all_modes`, `round_trip_preserves_a_variant_selector` |
 | `Agent::render_pi` | `fn(&self) -> String` | covered | `render_pi_uses_pi_frontmatter_and_tools`, `pi_sync_renders_pi_subagents` *(store/tests.rs)* |
-| `Agent::parse` | `fn(name: &str, source: &str) -> Result<Self>` | covered | `round_trip_preserves_all_fields`, `parse_normalizes_crlf_document_endings`, `parse_trims_model_before_storing_it`, `rejects_unknown_frontmatter_field`, `rejects_unknown_permission_key`, `rejects_invalid_mode_and_action`, `rejects_missing_frontmatter` |
+| `Agent::parse` | `fn(name: &str, source: &str) -> Result<Self>` | covered | `round_trip_preserves_all_fields`, `parse_normalizes_crlf_document_endings`, `parse_trims_model_before_storing_it`, `rejects_unknown_frontmatter_field`, `rejects_unknown_permission_key`, `rejects_invalid_mode_and_action`, `rejects_missing_frontmatter`, `round_trip_preserves_a_variant_selector` |
 | `Agent::read` | `fn(&Path) -> Result<Self>` | covered | `apply_safe_update_when_target_matches_last_installed`, `safe_removal_only_when_target_unchanged`, `save_canonical_rejects_collision_when_prior_is_none`, `save_canonical_rejects_stale_write` *(store/tests.rs)* |
 | `canonical_path` | `fn(&Path, &str) -> Result<PathBuf>` | partial | exercised indirectly via `save_canonical` / `delete_canonical` / `rename_canonical` tests; no direct unit test |
 | `STARTERS` (test-only) | `pub use starter_fixture::STARTERS` | covered | every `round_trip_preserves_all_fields`-style test |
@@ -136,10 +136,19 @@ another unit's test, or not at all.
 |---|---|---|---|
 | `Discovery` | enum (Found/Empty/Failed) | covered | `status_text_for_each_variant`, `models_accessor` |
 | `Discovery::models` | `fn(&self) -> &[String]` | covered | `models_accessor` |
-| `Discovery::status_text` | `fn(&self) -> String` | covered | `status_text_for_each_variant` |
-| `discover_models` | `fn() -> Discovery` | untested (spawns `opencode models`) | none — runs an external process; no test injects a runner |
+| `Discovery::status_text` | `fn(&self) -> String` | covered | `status_text_for_each_variant` (the variant-aware label is asserted for the variant-free case; the `model(s), variant(s)` split is derived from the same list) |
+| `discover_models` | `fn() -> Discovery` | untested (spawns `opencode api get /api/model` / `opencode models`) | none — runs an external process; the blocking wrapper itself has no injected runner (the seam below covers the discovery it delegates to) |
+| `discover_models_controlled` | `fn(&CancelToken, &mut dyn FnMut(Progress)) -> OperationReport<Option<Discovery>>` | covered (via the seam) | every `discover_controlled_*` test |
+| `discover_models_controlled_with` | `fn(Duration, usize, F, &CancelToken, &mut dyn FnMut(Progress)) -> OperationReport<Option<Discovery>>` (published single-source seam: ONE command factory, the `opencode models` listing) | covered | `discover_models_controlled_with_keeps_the_cli_only_contract`, `discover_models_controlled_with_keeps_its_published_signature`; the bounded reader underneath is covered by every `discover_controlled_*` test |
+| `discover_model_selectors_controlled_with` | private helper (the two-source flow: catalog API + `opencode models` fallback) | covered | `discover_controlled_reads_catalog_selectors`, `discover_controlled_falls_back_to_the_cli_listing`, `discover_controlled_falls_back_when_the_catalog_payload_is_malformed`, `discover_controlled_reports_both_sources_when_both_fail`, `discover_controlled_applies_no_color_env`, `discover_controlled_pre_cancel_does_not_spawn`, `discover_controlled_runtime_cancel_kills_child`, `discover_controlled_surfaces_stdout_overflow_as_failed`, `discover_controlled_surfaces_stderr_overflow_as_failed`, `discover_controlled_timeout_kills_hung_child`, `discover_controlled_nonzero_exit_reports_stderr`, `discover_controlled_cancel_during_drain_returns_cancelled_promptly`, `discover_controlled_missing_stream_after_normal_exit_reports_failed`, `discover_controlled_drain_deadline_held_pipe`, `discover_controlled_falls_back_to_the_npm_shim_on_windows` *(Windows-only)* |
+| `parse_model_catalog` | `fn(&str) -> Result<Vec<String>>` (catalog payload → `provider/model` + `provider/model#variant` selectors) | covered | `parse_model_catalog_reads_base_models_and_variants`, `parse_model_catalog_skips_disabled_entries`, `parse_model_catalog_deduplicates_repeated_entries`, `parse_model_catalog_skips_malformed_entries`, `parse_model_catalog_rejects_a_payload_that_is_not_a_catalog`, `parse_model_catalog_accepts_a_payload_behind_a_log_line` |
 | `parse_models` | `fn(&str) -> Vec<String>` | covered | `parses_basic_output`, `deduplicates_and_drops_invalid`, `strips_carriage_return`, `ignores_blank_and_comment_lines`, `accepts_punctuation_in_ids`, `empty_input_yields_empty`, `malformed_input_yields_empty` |
-| `validate_identifier` | private helper | partial | exercised transitively by every `parse_models_*` test (the function is called from `parse_models` at `src/models.rs:92`); no focused test asserts the contract directly |
+| `is_model_selector` | private helper | covered | `is_model_selector_accepts_base_and_variant_forms` |
+| `parse_catalog_json` | private helper | partial | exercised transitively by every `parse_model_catalog_*` test; the log-line retry is asserted by `parse_model_catalog_accepts_a_payload_behind_a_log_line`, the invalid-JSON arm by `parse_model_catalog_rejects_a_payload_that_is_not_a_catalog` |
+| `validate_identifier` | private helper | partial | exercised transitively by every `parse_models_*` test (the function is called from `parse_models` at `src/models.rs`); no focused test asserts the contract directly |
+| `run_bounded` | private helper (bounded, cancellable child run) | covered | exercised transitively by every `discover_controlled_*` test |
+| `spawn_child` | private helper (Windows npm-shim fallback; resolves the shim from the PATH configured on the command when the caller set one, and re-spawns it with the original argv / cwd / env) | partial | the fallback itself is asserted by `discover_controlled_falls_back_to_the_npm_shim_on_windows` *(Windows-only)*; on non-Windows hosts the helper only forwards the spawn error |
+| `configured_path` / `spawn_shim` | private helpers (Windows-only) | partial | exercised transitively by `discover_controlled_falls_back_to_the_npm_shim_on_windows` *(Windows-only)*; no focused test |
 
 ## `workflows` — `src/workflows.rs` (UI-independent layer)
 
@@ -199,11 +208,16 @@ Exhaustive list of every `partial` and `untested` row in the matrix above.
 - `ApplyError::message` — partial (only the `Empty` and `NotAbsolute` variants are asserted via `err.message()`; `Invalid`, `Save`, and `Revalidate` reach `err.message()` only in production code at `src/app/settings.rs:428` with no Settings-screen test asserting the displayed string).
 - `require_canonical_source` — partial (exercised transitively through every missing-source safety test via production code in `canonical.rs` / `skills.rs` / `sync.rs`; no focused test calls the function in isolation).
 - `SyncTarget::label` — **untested** (no test asserts the `"OpenCode"` / `"Pi"` return values; only production code calls it).
-- `discover_models` — **untested** (no fake-runner seam for the `opencode models` spawn).
+- `discover_models` — **untested** (no fake-runner seam for the `opencode models` spawn). The blocking wrapper delegates to `discover_models_controlled`, whose seam (`discover_models_controlled_with`) is covered.
+- `parse_catalog_json` — partial (the strict-parse / log-line-retry arms are asserted through `parse_model_catalog`; the helper has no focused test).
+- `spawn_child` — partial (the Windows npm-shim fallback is asserted by `discover_controlled_falls_back_to_the_npm_shim_on_windows`; on non-Windows hosts the helper only forwards the spawn error).
+- `configured_path` / `spawn_shim` — partial (Windows-only helpers, exercised transitively by the npm-shim test; no focused test).
 - `SyncStatus::requires_confirm` — **untested** (the method is `#[allow(dead_code)]` and never called or exercised by any test).
 
 ## Cross-cutting invariants (already pinned by tests, listed for orientation)
 
+- **Model selector round-trip**: `round_trip_preserves_a_variant_selector` *(agent.rs)*, `agent_with_a_variant_selector_saves_and_reads_back` *(app/mod.rs)* — a `provider/model#variant` selector survives render → parse → save → read unchanged.
+- **Model picker viewport**: `picker_scroll_keeps_the_selection_visible`, `model_picker_scrolls_a_catalog_larger_than_the_viewport` *(app/mod.rs)* — a catalog taller than the screen scrolls and the selected row stays visible while navigating models and variants.
 - **Validated-source-at-startup**: `with_settings_rejects_missing_checkout`, `validate_rejects_*`, `load_canonical_rejects_*`, `plan_for_rejects_missing_source`, every `apply_safe_*_after_source_removal` test.
 - **SHA-256 + stale-write guard on `save_canonical`**: `save_canonical_rejects_stale_write`, `save_rejects_external_edit_during_editor_session` *(app/mod.rs)*, `save_rename_rejects_stale_source_without_moving_it` *(app/mod.rs)*.
 - **Per-target sync isolation**: `apply_safe_isolates_failed_rows_per_target`, `sync_targets_opencode_and_pi_with_per_target_ownership` *(app/mod.rs)*.

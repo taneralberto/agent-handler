@@ -5043,6 +5043,86 @@ test("modelOptionLabel: appends (selected) to the current draft model", async ()
   assert.equal(component.modelOptionLabel("prov/a"), "prov/a");
 });
 
+test("modelSelectorLabel: a base model that offers variants is the default", async () => {
+  const harness = await setup();
+  const component = newComponent(harness);
+  component.mutationsEnabled.set(true);
+  // The catalog carries the base model plus its named
+  // variants. The base selector is the default choice for
+  // that model; the variants keep their selector verbatim.
+  component.discoveredModels.set(["prov/a", "prov/a#high", "prov/a#low", "prov/b"]);
+  assert.equal(component.modelSelectorLabel("prov/a"), "prov/a (default)");
+  assert.equal(component.modelSelectorLabel("prov/b"), "prov/b");
+  assert.equal(component.modelSelectorLabel("prov/a#high"), "prov/a#high");
+  assert.equal(component.modelSelectorLabel("prov/a#low"), "prov/a#low");
+  // The editor's option label adds the (selected) marker on
+  // top of the selector label.
+  component.editDraft.set({
+    name: "x", description: "", mode: "subagent", model: "prov/a#high",
+    prompt: "", permissions: {},
+  });
+  assert.equal(component.modelOptionLabel("prov/a#high"), "prov/a#high (selected)");
+  assert.equal(component.modelOptionLabel("prov/a"), "prov/a (default)");
+  assert.equal(component.modelOptionLabel("prov/b"), "prov/b");
+});
+
+test("modelOptions: variant selectors are offered next to their base model", async () => {
+  const harness = await setup();
+  const component = newComponent(harness);
+  component.mutationsEnabled.set(true);
+  const toJSON = (v) => JSON.parse(JSON.stringify(v));
+  component.discoveredModels.set(["prov/a", "prov/a#high", "prov/a#low", "prov/b"]);
+  // Every discovered selector is selectable.
+  assert.deepEqual(
+    toJSON(component.filteredModelOptions()),
+    ["prov/a", "prov/a#high", "prov/a#low", "prov/b"],
+  );
+  // Filtering by the base model keeps its variants visible.
+  component.onModelSearchInput("prov/a");
+  assert.deepEqual(
+    toJSON(component.filteredModelOptions()),
+    ["prov/a", "prov/a#high", "prov/a#low"],
+  );
+});
+
+test("onModelSelectChange: picking a variant writes the raw selector", async () => {
+  const harness = await setup();
+  const component = newComponent(harness);
+  component.mutationsEnabled.set(true);
+  component.discoveredModels.set(["prov/a", "prov/a#high"]);
+  // The model field is mode-independent: the same picker
+  // writes the selector for a primary and for a subagent.
+  for (const mode of ["primary", "subagent"]) {
+    component.editDraft.set({
+      name: "x", description: "", mode, model: "prov/a",
+      prompt: "", permissions: {},
+    });
+    // Picking the variant writes the selector that OpenCode
+    // expects (`provider/model#variant`).
+    component.onModelSelectChange("prov/a#high");
+    assert.equal(component.editDraft().model, "prov/a#high");
+    assert.equal(component.editDraft().mode, mode);
+    // The variant is a known option, so the select stays bound
+    // to the variant id (not the Custom sentinel).
+    assert.equal(component.modelOptionKey(), "prov/a#high");
+    assert.equal(component.isModelCustomActive(), false);
+  }
+});
+
+test("discoveredModelSummary: counts base models and variants separately", async () => {
+  const harness = await setup();
+  const component = newComponent(harness);
+  component.mutationsEnabled.set(true);
+  component.discoveredModels.set(["prov/a", "prov/a#high", "prov/b"]);
+  assert.equal(
+    component.discoveredModelSummary(),
+    "2 model(s), 1 variant(s) discovered.",
+  );
+  // A catalog without variants keeps the plain wording.
+  component.discoveredModels.set(["prov/a", "prov/b"]);
+  assert.equal(component.discoveredModelSummary(), "2 model(s) discovered.");
+});
+
 test("modelSearchTerm: typing does not mutate the draft", async () => {
   const harness = await setup();
   const component = newComponent(harness);
