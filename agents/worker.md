@@ -1,7 +1,7 @@
 ---
 description: "Single-writer implementation agent; plan-aware validation, narrow edits."
 mode: subagent
-model: "openai/gpt-6.1-sol"
+model: "minimax/MiniMax-M3.1-Flash"
 permission:
   bash: allow
   edit: allow
