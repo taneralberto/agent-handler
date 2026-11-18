@@ -1,7 +1,7 @@
 ---
 description: "Read-only web researcher; concise, well-sourced brief with labelled evidence."
 mode: subagent
-model: "openai/gpt-6.1-sol"
+model: "openai/gpt-6.2-sol#high"
 permission:
   bash: allow
   edit: deny

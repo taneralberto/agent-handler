@@ -1,7 +1,7 @@
 ---
 description: "Read-only thinking partner; develops ideas, challenges assumptions, identifies flaws, and proposes practical improvements and solutions."
 mode: subagent
-model: "openai/gpt-6.1-sol"
+model: "openai/gpt-6.2-sol#high"
 permission:
   bash: allow
   edit: deny
