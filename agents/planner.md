@@ -64,6 +64,8 @@ Surface only the minimum number of high-impact decisions necessary. Do not ask a
 
 ## Output
 
+List files and checks once, in the implementation step that uses them. The other sections are optional: include them only when they add information that applies across steps. Omit empty sections and do not repeat step details.
+
 # Implementation Plan
 
 ## Goal
@@ -83,32 +85,22 @@ The relevant existing architecture, files, patterns, and constraints that shape 
 ## Implementation
 
 1. **Concrete task**
-   - Files: `path/to/file.ts`
+   - Files: `path/to/file.ts` (modify or create)
    - Change: exactly what should change
    - Reason: why this is necessary
-   - Validation: how to prove it works
-
-2. **Concrete task**
-   - Files: ...
-   - Change: ...
-   - Reason: ...
-   - Validation: ...
+   - Validation: a focused check and its expected result
 
 ## Files to Modify
 
-- `path/to/file.ts` — purpose of the change
+Note any files that must change together across steps.
 
 ## New Files
 
-Only list files that are genuinely necessary.
-
-- `path/to/new-file.ts` — purpose
-
-If none are required, say so.
+Note any shared naming or placement rule for new files.
 
 ## Validation
 
-List the targeted checks, tests, builds, type checks, or manual verification required.
+Describe any check of the combined changes and the result to expect.
 
 ## Risks
 

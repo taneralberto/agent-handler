@@ -231,27 +231,25 @@ fetch, no commit, no push. Bring your own checkout.
 
 ## Bundled starter roles
 
-`agenthd` ships eight starter roles as tracked Markdown files at the
-repository root under `agents/*.md`: seven subagents and one primary
-coordinator. The .md files are the parseable source-of-truth; tests
-include their bytes via `include_str!` so the fixtures and the repo's
-tracked markdown cannot drift apart. The production binary carries
-zero starter bytes — every starter you see at runtime comes from the
-configured checkout, and `agents/*.md` is the only place starter
-prompts live.
+This checkout has nine starter roles under `agents/*.md`: eight subagents
+and one primary coordinator. The Markdown files are the source of truth.
+The test fixture includes a subset of these files via `include_str!`.
+The production binary carries zero starter bytes — runtime roles come
+from `agents/*.md` in the configured checkout.
 
-| Role | Purpose | Edits? |
+| Role | Purpose | Edit permission |
 | --- | --- | --- |
-| `lukateric` | Primary coordinator; delegates bounded work and keeps user intent, decisions, and acceptance in one place. | Yes |
-| `scout` | Read-only codebase recon; targeted findings and risks. | Yes |
-| `oracle` | Read-only advisor; surface drift, contradictions, narrowest next move. | No |
-| `planner` | Read-only implementation planner; concrete, ordered plans with validation and risk discipline. | No |
-| `reviewer` | Read-only change review; severity-ordered findings with file/line evidence. | No |
-| `researcher` | Read-only web research; concise, well-sourced brief. | No |
-| `delegate` | Lightweight implementation agent that executes an assigned task directly. | Yes |
-| `worker` | Default implementation agent with plan-aware validation. | Yes |
+| `lukateric` | Primary coordinator; delegates bounded work and keeps user intent, decisions, and acceptance in one place. | `allow` |
+| `advisor` | Read-only thinking partner; tests assumptions and compares practical alternatives. | `deny` |
+| `scout` | Read-only codebase recon; targeted findings and risks. | `allow` |
+| `oracle` | Read-only advisor; surfaces drift, contradictions, and the narrowest next move. | `deny` |
+| `planner` | Read-only implementation planner; concrete, ordered plans with validation and risk discipline. | `deny` |
+| `reviewer` | Read-only change review; severity-ordered findings with file/line evidence. | `deny` |
+| `qa` | Scoped functional acceptance checks with reproducible evidence; does not implement fixes. | `deny` |
+| `researcher` | Read-only web research; concise, well-sourced brief. | `deny` |
+| `worker` | Single implementation writer; handles small tasks directly with focused validation and follows the approved plan for planned units. | `allow` |
 
-`lukateric` is `mode: primary`; the other seven are `mode: subagent`.
+`lukateric` is `mode: primary`; the other eight are `mode: subagent`.
 Each starter's frontmatter pins a model and per-permission actions;
 Pi receives equivalent Pi subagent definitions with the appropriate
 Pi tool allowlists.
@@ -558,9 +556,9 @@ shared across the app.
 - `src/store/skills_tests.rs` — skills sync unit tests.
 - `src/store/tests.rs` — store unit tests.
 - `src/agent/starter_fixture/` — `#[cfg(test)]` test-only fixture that
-  parses `agents/*.md` for unit tests. The production binary does not
-  link this module; the runtime reads starter bytes from the configured
-  checkout.
+  parses a subset of `agents/*.md` for unit tests. The production binary
+  does not link this module; the runtime reads starter bytes from the
+  configured checkout.
 
 ## Keys
 

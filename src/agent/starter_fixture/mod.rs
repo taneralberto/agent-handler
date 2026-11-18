@@ -1,6 +1,6 @@
 //! Test-only fixture: a registry of `Starter` definitions sourced
-//! from the tracked `agents/*.md` markdown files at the repository
-//! root. The fixture exists so unit tests have a way to populate a
+//! from a subset of `agents/*.md` at the repository root.
+//! The fixture exists so unit tests have a way to populate a
 //! test checkout without re-rendering markdown by hand; the
 //! production binary never reads it.
 //!
@@ -16,9 +16,8 @@
 
 use crate::agent::Agent;
 
-/// Test-only fixture: one starter definition per tracked
-/// `agents/<name>.md` file. The bytes are `include_str!`'d so the
-/// fixture and the repo's tracked markdown cannot drift apart.
+/// Test-only fixture: each starter definition embeds its
+/// `agents/<name>.md` source via `include_str!`.
 #[derive(Debug, Clone, Copy)]
 pub struct Starter {
     pub name: &'static str,
@@ -32,10 +31,9 @@ pub fn starter_agent(starter: &Starter) -> Agent {
     Agent::parse(starter.name, starter.source).expect("bundled starter markdown must parse")
 }
 
-/// Test-only fixture: the seven tracked subagent starters plus the
-/// `lukateric` primary in the documented order. Tests use this
-/// fixture to populate a tempdir checkout; the production binary
-/// never reads it.
+/// Test-only fixture: six subagent starters plus the `lukateric`
+/// primary in stable order. Tests use this fixture to populate a
+/// tempdir checkout; the production binary never reads it.
 pub const STARTERS: &[Starter] = &[
     Starter {
         name: "scout",
@@ -48,10 +46,6 @@ pub const STARTERS: &[Starter] = &[
     Starter {
         name: "worker",
         source: include_str!("../../../agents/worker.md"),
-    },
-    Starter {
-        name: "delegate",
-        source: include_str!("../../../agents/delegate.md"),
     },
     Starter {
         name: "oracle",
@@ -88,25 +82,22 @@ mod tests {
         out
     }
 
-    /// Pinned SHA-256 baseline captured before the bundled registry
+    /// Pinned SHA-256 hashes, first captured before the bundled registry
     /// moved to the tracked `agents/*.md` markdown files. The .md
-    /// files are the parseable source-of-truth; this table
+    /// files are the parseable source of truth; this table
     /// guarantees that `parse → render` is byte-faithful so the
     /// test fixtures stay observably identical to editing the .md
-    /// directly. Do not regenerate the baseline to make this test
-    /// pass; that would mask a silent byte-level drift.
+    /// directly. Refresh only the rows for intentional profile edits;
+    /// regenerating other rows would mask unrelated byte-level drift.
     ///
-    /// All seven subagent prompt SHAs are preserved from the
-    /// original baseline (the prompt bodies in `agents/*.md` are
-    /// unchanged). The `rendered` SHAs were regenerated because the
-    /// tracked `.md` frontmatter for the seven subagents was
+    /// At that migration, the seven subagent prompt SHAs were preserved
+    /// from the original baseline. The `rendered` SHAs were regenerated
+    /// because the tracked `.md` frontmatter for those subagents was
     /// re-authored (model field populated, permissions re-tuned)
     /// after the original baseline was captured. The `pi` SHA for
     /// `scout` was likewise regenerated because its permission set
     /// changed and the Pi tool list / acceptanceRole now differ.
-    /// `lukateric` is a new primary that replaces the retired
-    /// `orchestrator`; its baseline is computed from the current
-    /// `agents/lukateric.md`.
+    /// `lukateric` replaced the retired `orchestrator`, with a new baseline.
     ///
     /// `rendered` SHAs for `oracle`, `planner`, and `lukateric`
     /// were refreshed once more because their `model` frontmatter
@@ -116,15 +107,17 @@ mod tests {
     /// touched), all 24 prompt/render/pi hashes for the 8 agents
     /// match the prior baseline; prompt and pi SHAs for the 3
     /// affected agents are unchanged because neither surface
-    /// embeds the model. The 5 unaffected agents
-    /// (`scout`, `reviewer`, `worker`, `delegate`, `researcher`)
-    /// are byte-exact against the prior baseline, confirming the
+    /// embeds the model. The 5 other profiles in that registry
+    /// were byte-exact against the prior baseline, confirming the
     /// refresh is scoped to the 3 model-metadata edits.
     ///
     /// On 2026-10-04, the authorized five remaining model pins
     /// changed from `minimax/MiniMax-M3` to `openai/gpt-6.1-sol`.
-    /// Only their rendered SHAs changed; the causal test below
-    /// restores the old model in memory and pins the prior hashes.
+    /// Only their rendered SHAs changed. The causal test below restores
+    /// the old model in memory for the remaining applicable profiles.
+    ///
+    /// The `worker` and `lukateric` rows reflect consolidation of small
+    /// tasks into `worker`, including the local QA rules in `lukateric`.
     const BASELINE: &[(&str, &str, &str, &str)] = &[
         (
             "scout",
@@ -140,15 +133,9 @@ mod tests {
         ),
         (
             "worker",
-            "ccffd9c334e29225eca392ce329683f4052c2cb8aa51bb13b41ba00f6d3a9169",
-            "136e7c64924a3d8e0b09f242233afa9f96b6f284f52702167eb5ee8fcabf4cf4",
-            "79bf3be77e83fa323761ffe44ed4ccf343a17c44752932f1f1ee8baa5125e058",
-        ),
-        (
-            "delegate",
-            "02b3bc732130d9430bab517da9a080773f8c1d46b03dae4d0fa51b1ddad72d64",
-            "b382a8b334865804c73ccc6581eba89396583bf6d880180e8d46ba015de68893",
-            "b88dafad8334fb3a563bc162eab5ffa1436891acd6506bd199bde823879b8b9a",
+            "de0c75377694aca9a20541b43fe3f60bbe2a2b3f1c44fbae5e5c1c6abb0f1849",
+            "e65cbfd9392e222397eff952fcf87c4ecfac09ce252ac532450a38c6891b2655",
+            "2d63f95f038f5fcea15fb88175ebf716c632c3a10edeba100d8b1076a5f674ff",
         ),
         (
             "oracle",
@@ -170,16 +157,18 @@ mod tests {
         ),
         (
             "lukateric",
-            "43e41fb53ba5160d8fb4d493fa8d8ca219b59288c807af81ceaf603cd236e58d",
-            "dfe4fdb527831c8d53d11684906b3a2f4122c8874e9c7bc4fb8c27c606a80a7f",
-            "464399c143e20e52a79ce53d4b8bde577fbd4d26946231d914aa0df117b6ddab",
+            "5ebdac6cb61323ad4d58f29700c93521b4016e1e70eca13d12bf8d01a7d064a0",
+            "3d45e41ca16a6d1163bbc79432a45f4fe2312bafd84a206d6a3cf8134407095d",
+            "c0b5dc0686f6e71b36279e96130eea05dd6e097baad88697b69c8f18ff35193b",
         ),
     ];
 
     #[test]
     fn starter_model_updates_preserve_prior_baseline() {
-        // Authorized on 2026-10-04: these five model pins changed from
+        // Authorized on 2026-10-04: these model pins changed from
         // minimax/MiniMax-M3 to openai/gpt-6.1-sol; no other bytes may drift.
+        // `worker` now uses the current baseline below: reverting only
+        // its model cannot restore the historical render after the prompt edit.
         let prior_rendered = [
             (
                 "scout",
@@ -188,14 +177,6 @@ mod tests {
             (
                 "reviewer",
                 "5882339496d8903bdda05942e2d309a647236941b08ecd28faace92f6fc45b15",
-            ),
-            (
-                "worker",
-                "69d9665c7f84974d2bd84cb9a11a17076b725143329fea60df2635f82e94a5b6",
-            ),
-            (
-                "delegate",
-                "440f4d552978e4f055cd5a3b85be8677307cb05e96bcf5f4118d0711f4c2b147",
             ),
             (
                 "researcher",
@@ -254,7 +235,6 @@ mod tests {
                 "scout",
                 "reviewer",
                 "worker",
-                "delegate",
                 "oracle",
                 "researcher",
                 "planner",
