@@ -13,6 +13,8 @@ Choose the first lookup from the evidence already available:
 
 ## Generate a map
 
+Generate a map only when repository-wide discovery is in scope; for a task limited to a directory, search within that directory instead.
+
 Run from the relevant Git root (`git rev-parse --show-toplevel`). In a multi-repository workspace, start with the repository that owns the behavior.
 
 ```bash

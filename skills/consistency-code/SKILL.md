@@ -7,7 +7,7 @@ description: Preserve consistency with the existing codebase when writing, modif
 
 Code should look like it belongs in the codebase where it is written.
 
-Consistency is more valuable than introducing a locally "better" pattern that makes the project less uniform. Before writing code, inspect nearby and analogous code and follow the conventions already established.
+Consistency is more valuable than introducing a locally "better" pattern that makes the project less uniform.
 
 ## Core rule
 
@@ -17,15 +17,17 @@ When multiple valid implementations exist, prefer the one already used by the co
 
 Do not introduce a new pattern merely because it is cleaner, newer, more elegant, or personally preferred.
 
+Correctness and contracts take precedence over convenience. If a closed union type requires exhaustive handling, update the affected handlers rather than replacing the union with unrestricted strings or a generic list just to touch one fewer file.
+
 If the existing convention is clearly harmful, incorrect, insecure, or causing the problem being solved, do not blindly reproduce it. Explain the inconsistency and use the smallest justified deviation.
 
 ## Inspect before writing
 
-Before implementing something, inspect enough surrounding code to determine how the project normally handles the same kind of concern.
+Start with one example: the closest current implementation that handles the same concern. If it answers the question and satisfies the task requirements and explicit project rules, stop searching and follow its convention.
 
-Look first for the closest analogous implementation rather than inventing one.
+Consult a second example only if the first is unrepresentative, ambiguous, outdated, or at odds with an explicit requirement or rule.
 
-Pay attention to:
+Inspect only the aspects the change affects. The following are examples, not a checklist:
 
 * file and folder organization
 * naming conventions
@@ -87,9 +89,7 @@ Avoid introducing synonyms for concepts that already have established names.
 
 ## Structure
 
-When adding a new implementation, compare it with similar existing implementations.
-
-Match:
+Use the selected example as a reference for the parts of the structure you are changing:
 
 * responsibility boundaries
 * method size and decomposition
@@ -252,13 +252,11 @@ State why the existing pattern should not be followed if the reason is not obvio
 
 ## Final consistency check
 
-Before finishing a code change, compare the new code against the closest existing equivalents.
+Review the diff against the convention you already identified, focusing only on the aspects you changed. Do not repeat the initial inspection.
 
 Ask:
 
 **"Would another developer familiar with this project think this code was written as part of the same system?"**
-
-Check specifically for unnecessary differences in naming, structure, abstractions, contracts, typing, errors, imports, and tests.
 
 If a difference has no meaningful reason, remove it.
 
